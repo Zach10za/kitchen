@@ -5,6 +5,7 @@ import { DiscordAPI } from './discord/api';
 import { runAgent, runDraftFlow, runPantryFlow, executeTool, type ToolCtx } from './agent/loop';
 import { buildSystemPrompt } from './agent/prompts';
 import { renderPlan } from './agent/render';
+import { currentOrNextMondayISO, nextMondayISO, nextDraftTime, mealCookTime } from './util/datetime';
 import OpenAI from 'openai';
 
 /**
@@ -130,9 +131,16 @@ export class KitchenDO extends DurableObject<Env> {
 
     if (url.pathname === '/workflow/save-approved' && request.method === 'POST') {
       const body = (await request.json()) as { week_of: string; meals: any[] };
+      // Idempotent: only stamp approved_at on the first transition, so workflow
+      // retries don't clobber the timestamp. Always update meals_json (it's the
+      // materialized form which the workflow guarantees is correct).
       this.sql.exec(
-        'UPDATE weeks SET status = ?, approved_at = ?, meals_json = ? WHERE week_of = ?',
-        'approved', Date.now(), JSON.stringify(body.meals), body.week_of
+        "UPDATE weeks SET meals_json = ? WHERE week_of = ?",
+        JSON.stringify(body.meals), body.week_of
+      );
+      this.sql.exec(
+        "UPDATE weeks SET status = 'approved', approved_at = ? WHERE week_of = ? AND status != 'approved'",
+        Date.now(), body.week_of
       );
       // Schedule defrost reminders for any freezer-using meals.
       const reminders = this.scheduleDefrostRemindersFromMeals(body.week_of, body.meals);
@@ -231,7 +239,7 @@ export class KitchenDO extends DurableObject<Env> {
    */
   private handleFastRead(interaction: Interaction): string {
     const cmd = interaction.data?.name ?? '';
-    const weekOf = currentOrNextMondayISO();
+    const weekOf = currentOrNextMondayISO(this.env.TIMEZONE);
 
     if (cmd === 'profile') {
       const row = this.sql
@@ -301,18 +309,9 @@ export class KitchenDO extends DurableObject<Env> {
       return `**Upcoming reminders:**\n\n${lines.join('\n')}`;
     }
 
-    if (cmd === 'grocery') {
-      const row = this.sql.exec<{ items_json: string }>('SELECT items_json FROM grocery_lists WHERE week_of = ?', weekOf).toArray()[0];
-      if (!row) return `No grocery list yet for ${weekOf}. Use \`/approve\` to lock the plan and generate one.`;
-      const items = JSON.parse(row.items_json);
-      const grouped: Record<string, string[]> = {};
-      for (const item of items) {
-        (grouped[item.category] ??= []).push(item.qty ? `- ${item.qty} ${item.item}` : `- ${item.item}`);
-      }
-      const order = ['produce', 'protein', 'dairy', 'pantry', 'frozen', 'other'];
-      const sections = order.filter((c) => grouped[c]?.length).map((c) => `**${c.toUpperCase()}**\n${grouped[c]!.join('\n')}`);
-      return `**Grocery list for ${weekOf}**\n\n${sections.join('\n\n')}`;
-    }
+    // /grocery is intentionally NOT a fast-read — its content typically
+    // exceeds Discord's 2000-char limit so it goes through handleGroceryRead
+    // which uses follow-up messages.
 
     return `Unknown fast-read command: ${cmd}`;
   }
@@ -341,7 +340,7 @@ export class KitchenDO extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     try {
-      const weekOf = nextMondayISO();
+      const weekOf = nextMondayISO(this.env.TIMEZONE);
       const result = await runAgent({
         env: this.env,
         sql: this.sql,
@@ -433,14 +432,14 @@ export class KitchenDO extends DurableObject<Env> {
         sql: this.sql,
         discord: this.discord,
         interactionToken: interaction.token,
-        weekOf: nextMondayISO(),
+        weekOf: nextMondayISO(this.env.TIMEZONE),
         notes: optionMap.notes ? String(optionMap.notes) : undefined,
       });
       return;
     }
 
     let userMessage: string;
-    const weekOf = currentOrNextMondayISO();
+    const weekOf = currentOrNextMondayISO(this.env.TIMEZONE);
 
     // /steer runs as a Workflow — each agent loop iteration is its own step
     // with retries, so slow LLM calls don't take down the whole conversation.
@@ -476,12 +475,10 @@ export class KitchenDO extends DurableObject<Env> {
     }
 
     switch (commandName) {
-      case 'plan':
-        userMessage = 'Show the current plan. If there is no draft for this week or next, generate one now.';
-        break;
-      case 'steer':
-        userMessage = String(optionMap.message ?? '');
-        break;
+      // /plan, /grocery, /pantry-no-msg, /reminders, /profile-no-msg are all
+      // routed through the Worker fast-read path. /approve, /steer, /pantry-msg,
+      // /draft, /grocery short-circuit earlier in this method. So the only
+      // commands that reach this switch are: /now, /pantry (write), /profile (write).
       case 'now': {
         const nowLocal = new Date().toLocaleString('en-US', {
           timeZone: this.env.TIMEZONE,
@@ -498,12 +495,6 @@ export class KitchenDO extends DurableObject<Env> {
       }
       case 'pantry':
         userMessage = `Update the pantry: ${optionMap.message}`;
-        break;
-      case 'approve':
-        userMessage = 'Approve the current draft and generate a grocery list.';
-        break;
-      case 'grocery':
-        userMessage = 'Show the grocery list for the approved plan.';
         break;
       case 'profile':
         // Verbatim user input wrapped in delimiters + explicit do-not-summarize directive.
@@ -740,9 +731,6 @@ export class KitchenDO extends DurableObject<Env> {
       .toArray();
     if (freezer.length === 0) return 0;
 
-    const dayOffset: Record<string, number> = {
-      mon: 0, tue: 1, wed: 2, thu: 3, fri: 4, sat: 5, sun: 6,
-    };
     const defrost: Record<string, number> = {
       chicken: 24, beef: 24, pork: 24, lamb: 36, salmon: 12, fish: 12,
       shrimp: 6, turkey: 48, roast: 48,
@@ -753,7 +741,11 @@ export class KitchenDO extends DurableObject<Env> {
       return 12;
     };
 
-    const weekStart = new Date(weekOf + 'T00:00:00Z').getTime();
+    const dayLabel: Record<string, string> = {
+      mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday',
+      thu: 'Thursday', fri: 'Friday', sat: 'Saturday', sun: 'Sunday',
+    };
+
     let count = 0;
     for (const meal of meals) {
       if (meal.status === 'skipped' || meal.status === 'cooked') continue;
@@ -762,10 +754,12 @@ export class KitchenDO extends DurableObject<Env> {
         const ingLower = (ing.item || '').toLowerCase();
         const match = freezer.find((f) => ingLower.includes(f.name) || f.name.includes(ingLower.split(' ').pop() ?? ''));
         if (!match) continue;
-        const cookTime = weekStart + (dayOffset[meal.day] ?? 0) * 86_400_000 + 18 * 3_600_000;
+        // Cook time = 6 PM in user's local timezone on the meal's weekday.
+        // Previously we anchored to UTC midnight which fired ~7h early in PT.
+        const cookTime = mealCookTime(weekOf, meal.day, 18, this.env.TIMEZONE);
         const dueAt = cookTime - pickHours(match.name) * 3_600_000;
         if (dueAt < Date.now()) continue;
-        const message = `🧊 **Defrost reminder**: pull the ${match.name} out of the freezer for ${meal.day.toUpperCase()}'s ${meal.name}.`;
+        const message = `🧊 **Defrost reminder**: pull the ${match.name} out of the freezer for ${dayLabel[meal.day] ?? meal.day}'s ${meal.name}.`;
         this.sql.exec(
           'INSERT INTO reminders (due_at, type, week_of, day, message) VALUES (?, ?, ?, ?, ?)',
           dueAt, 'defrost', weekOf, meal.day, message
@@ -796,33 +790,6 @@ export interface ReminderRow {
   message: string;
   sent_at: number | null;
   [key: string]: SqlStorageValue;
-}
-
-const DAY_INDEX: Record<string, number> = {
-  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
-};
-
-export function nextDraftTime(day: string, hour: number, tz: string): Date {
-  const targetDay = DAY_INDEX[day.toLowerCase()] ?? 5;
-  const now = new Date();
-  const local = new Date(now.toLocaleString('en-US', { timeZone: tz }));
-  const offsetMs = local.getTime() - now.getTime();
-
-  const candidate = new Date(local);
-  candidate.setHours(hour, 0, 0, 0);
-  let daysAhead = (targetDay - candidate.getDay() + 7) % 7;
-  if (daysAhead === 0 && candidate <= local) daysAhead = 7;
-  candidate.setDate(candidate.getDate() + daysAhead);
-
-  return new Date(candidate.getTime() - offsetMs);
-}
-
-export function nextMondayISO(): string {
-  const d = new Date();
-  const day = d.getDay();
-  const daysUntilMon = (1 - day + 7) % 7 || 7;
-  d.setDate(d.getDate() + daysUntilMon);
-  return d.toISOString().slice(0, 10);
 }
 
 /**
@@ -857,16 +824,4 @@ function chunkSections(header: string, sections: string[], limit: number): strin
   }
   if (current.trim().length > 0) chunks.push(current);
   return chunks;
-}
-
-export function currentOrNextMondayISO(): string {
-  const d = new Date();
-  const day = d.getDay();
-  if (day >= 1 && day <= 3) {
-    d.setDate(d.getDate() - (day - 1));
-  } else {
-    const daysUntilMon = (1 - day + 7) % 7 || 7;
-    d.setDate(d.getDate() + daysUntilMon);
-  }
-  return d.toISOString().slice(0, 10);
 }

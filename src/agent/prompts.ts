@@ -15,7 +15,7 @@ export function buildSystemPrompt(args: PromptContext): string {
   const fridge = pantry.filter((p) => p.location === 'fridge');
   const shelf = pantry.filter((p) => !p.location || p.location === 'shelf');
 
-  return `You are Zach's personal meal planning assistant. You collaborate with him through a Discord channel to plan, refine, and cook the week's meals.
+  return `You are the user's personal meal planning assistant. You collaborate with them through a Discord channel to plan, refine, and cook the week's meals.
 
 COOKING PROFILE (stable, declarative — treat hard rules like allergies as inviolable):
 ${profile ?? '(not yet set — if the user gives details about their kitchen / diet / preferences, call update_profile to record them)'}

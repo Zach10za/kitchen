@@ -2,17 +2,15 @@ import OpenAI from 'openai';
 import type { Env } from '../env';
 import type {
   Day,
-  GroceryItem,
   MealSlot,
   MealStub,
   PantryItem,
   PreferenceRow,
-  RecipeDetails,
   WeekState,
 } from './tools';
 import { TOOLS } from './tools';
 import { buildSystemPrompt } from './prompts';
-import { renderPlan, renderRecipe, renderGroceryList } from './render';
+import { renderPlan, renderRecipe } from './render';
 import type { WeekRow } from '../kitchen-do';
 import type { DiscordAPI } from '../discord/api';
 
@@ -30,8 +28,8 @@ export interface AgentResult {
 const MAX_TOOL_ROUNDS = 6;
 
 /**
- * Run one turn of the agent: append user message, loop OpenAI tool calls,
- * persist conversation + tool results, return final assistant text.
+ * Run one turn of the agent: append user message, loop Responses API tool
+ * calls, persist conversation + tool results, return final assistant text.
  */
 export async function runAgent(args: AgentArgs): Promise<AgentResult> {
   const { env, sql, userMessage, weekOf } = args;
@@ -42,26 +40,26 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
     weekOf, 'user', userMessage, Date.now()
   );
 
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  // Responses API input format: array of message + function_call + function_call_output items.
+  let input: any[] = [
     { role: 'system', content: buildSystemPrompt(loadContext(sql, weekOf)) },
     ...recentConversation(sql, weekOf, 30),
     { role: 'user', content: userMessage },
   ];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const completion = await client.chat.completions.create({
+    const response = await client.responses.create({
       model: env.OPENAI_MODEL,
-      messages,
-      tools: TOOLS as unknown as OpenAI.Chat.Completions.ChatCompletionTool[],
+      input,
+      tools: toResponsesTools(TOOLS),
     });
 
-    const choice = completion.choices[0];
-    if (!choice) throw new Error('OpenAI returned no choices');
-    const msg = choice.message;
-    messages.push(msg);
+    const toolCalls = response.output.filter((o: any) => o.type === 'function_call');
+    const messageOutput = response.output.find((o: any) => o.type === 'message');
 
-    if (!msg.tool_calls || msg.tool_calls.length === 0) {
-      const finalText = msg.content ?? '(no text)';
+    if (toolCalls.length === 0) {
+      // No tool calls — final message.
+      const finalText = response.output_text || '(no text)';
       sql.exec(
         'INSERT INTO conversation (week_of, role, content, ts) VALUES (?, ?, ?, ?)',
         weekOf, 'assistant', finalText, Date.now()
@@ -69,30 +67,48 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
       return { summary: finalText };
     }
 
-    for (const toolCall of msg.tool_calls) {
-      if (toolCall.type !== 'function') continue;
+    // Append the model's outputs (message if present, then function calls)
+    // verbatim to the input array so the next round sees them.
+    if (messageOutput) input.push(messageOutput);
+    for (const tc of toolCalls) input.push(tc);
+
+    // Execute each tool and append its function_call_output.
+    for (const toolCall of toolCalls as any[]) {
       const result = await executeTool(
-        toolCall.function.name,
-        JSON.parse(toolCall.function.arguments),
+        toolCall.name,
+        JSON.parse(toolCall.arguments),
         { env, sql, client }
       );
       sql.exec(
         'INSERT INTO conversation (week_of, role, content, tool_call_json, ts) VALUES (?, ?, ?, ?, ?)',
-        weekOf,
-        'tool',
-        result,
-        JSON.stringify({ name: toolCall.function.name, args: toolCall.function.arguments }),
+        weekOf, 'tool', result,
+        JSON.stringify({ name: toolCall.name, args: toolCall.arguments }),
         Date.now()
       );
-      messages.push({
-        role: 'tool',
-        tool_call_id: toolCall.id,
-        content: result,
+      input.push({
+        type: 'function_call_output',
+        call_id: toolCall.call_id,
+        output: result,
       });
     }
   }
 
   return { summary: 'I got stuck in a tool loop. Try again with a simpler request.' };
+}
+
+/**
+ * Convert TOOLS (Chat Completions format) to Responses API format.
+ * Chat:      { type: 'function', function: { name, description, parameters } }
+ * Responses: { type: 'function', name, description, parameters, strict: false }
+ */
+export function toResponsesTools(tools: typeof TOOLS): any[] {
+  return tools.map((t) => ({
+    type: 'function' as const,
+    name: t.function.name,
+    description: t.function.description,
+    parameters: t.function.parameters,
+    strict: false,
+  }));
 }
 
 function makeClient(env: Env): OpenAI {
@@ -194,8 +210,6 @@ export async function executeTool(name: string, args: any, ctx: ToolCtx): Promis
       case 'reschedule_meal':       return toolRescheduleMeal(args, ctx);
       case 'update_pantry':         return toolUpdatePantry(args, ctx);
       case 'record_preference':     return toolRecordPreference(args, ctx);
-      case 'approve_plan':          return await toolApprovePlan(args, ctx);
-      case 'generate_grocery_list': return await toolGenerateGroceryList(args, ctx);
       case 'mark_meal_cooked':      return toolMarkMealCooked(args, ctx);
       case 'mark_meal_skipped':     return toolMarkMealSkipped(args, ctx);
       case 'update_profile':        return toolUpdateProfile(args, ctx);
@@ -242,44 +256,30 @@ const WEEK_STUBS_SCHEMA = {
   additionalProperties: false,
 };
 
-const RECIPE_DETAILS_SCHEMA = {
-  type: 'object',
-  properties: {
-    ingredients: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: { item: { type: 'string' }, qty: { type: 'string' } },
-        required: ['item', 'qty'],
-        additionalProperties: false,
-      },
-    },
-    steps: { type: 'array', items: { type: 'string' } },
-  },
-  required: ['ingredients', 'steps'],
-  additionalProperties: false,
-};
-
 /** One LLM call generates all 7 stubs as a coherent week. */
 async function generateWeekStubs(
   ctx: ToolCtx,
   args: { prefs: PreferenceRow[]; pantry: PantryItem[]; constraints: string[] }
 ): Promise<(MealStub & { day: Day })[]> {
-  const completion = await ctx.client.chat.completions.create({
+  const response = await ctx.client.responses.create({
     model: ctx.env.OPENAI_MODEL,
-    messages: [
+    input: [
       {
         role: 'system',
         content: 'You plan a 7-day dinner menu (Mon-Sun) for two adults. Pick real, well-known dishes. Vary cuisines and proteins across the week. Default to ~30 min weeknights (Mon-Fri) and one ~45-75 min "project" meal on a weekend. Use pantry ingredients when sensible.',
       },
       { role: 'user', content: buildWeekStubPrompt(args) },
     ],
-    response_format: {
-      type: 'json_schema',
-      json_schema: { name: 'week_stubs', schema: WEEK_STUBS_SCHEMA, strict: true },
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'week_stubs',
+        schema: WEEK_STUBS_SCHEMA,
+        strict: true,
+      },
     },
   });
-  const content = completion.choices[0]?.message.content;
+  const content = response.output_text;
   if (!content) throw new Error('Week stub generation returned no content');
   return (JSON.parse(content) as { meals: (MealStub & { day: Day })[] }).meals;
 }
@@ -289,47 +289,24 @@ async function generateMealStub(
   ctx: ToolCtx,
   prompt: string
 ): Promise<MealStub> {
-  const completion = await ctx.client.chat.completions.create({
+  const response = await ctx.client.responses.create({
     model: ctx.env.OPENAI_MODEL,
-    messages: [
+    input: [
       { role: 'system', content: 'You pick one real, well-known dish matching the request.' },
       { role: 'user', content: prompt },
     ],
-    response_format: {
-      type: 'json_schema',
-      json_schema: { name: 'stub', schema: STUB_SCHEMA, strict: true },
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'stub',
+        schema: STUB_SCHEMA,
+        strict: true,
+      },
     },
   });
-  const content = completion.choices[0]?.message.content;
+  const content = response.output_text;
   if (!content) throw new Error('Stub generation returned no content');
   return JSON.parse(content) as MealStub;
-}
-
-/** Materialize ingredients + steps for an already-decided meal. */
-async function materializeRecipe(
-  ctx: ToolCtx,
-  meal: MealSlot
-): Promise<RecipeDetails> {
-  const completion = await ctx.client.chat.completions.create({
-    model: ctx.env.OPENAI_MODEL,
-    messages: [
-      {
-        role: 'system',
-        content: 'Generate the ingredient list and ordered steps for the given dish, scaled to the requested serving count. Concrete quantities. 4-8 steps.',
-      },
-      {
-        role: 'user',
-        content: `Dish: ${meal.name}\nDescription: ${meal.description}\nCuisine: ${meal.cuisine}\nServings: ${meal.servings}\nTotal time target: ${meal.total_minutes} min`,
-      },
-    ],
-    response_format: {
-      type: 'json_schema',
-      json_schema: { name: 'recipe_details', schema: RECIPE_DETAILS_SCHEMA, strict: true },
-    },
-  });
-  const content = completion.choices[0]?.message.content;
-  if (!content) throw new Error('Recipe materialization returned no content');
-  return JSON.parse(content) as RecipeDetails;
 }
 
 async function toolGenerateDraft(
@@ -507,192 +484,6 @@ function toolRecordPreference(
   return `Recorded preference: "${args.insight}" (weight ${args.weight}).`;
 }
 
-async function toolApprovePlan(args: { week_of: string }, ctx: ToolCtx): Promise<string> {
-  const week = loadWeek(ctx.sql, args.week_of);
-  if (!week) return `No plan exists for ${args.week_of}.`;
-
-  // Materialize all 7 full recipes in parallel (only the ones not yet materialized).
-  const materializedMeals = await Promise.all(
-    week.meals.map(async (m) => {
-      if (m.ingredients && m.steps) return m;
-      const details = await materializeRecipe(ctx, m);
-      return { ...m, ingredients: details.ingredients, steps: details.steps };
-    })
-  );
-
-  ctx.sql.exec(
-    'UPDATE weeks SET status = ?, approved_at = ?, meals_json = ? WHERE week_of = ?',
-    'approved', Date.now(), JSON.stringify(materializedMeals), args.week_of
-  );
-
-  // Schedule defrost reminders for any freezer items used by the meals.
-  const remindersScheduled = scheduleDefrostReminders(ctx, args.week_of, materializedMeals);
-
-  return `Approved plan for ${args.week_of} and materialized full recipes. Scheduled ${remindersScheduled} defrost reminder(s). Now call generate_grocery_list.`;
-}
-
-/**
- * For each meal, find ingredients that match a freezer pantry item by fuzzy
- * substring match. Schedule a reminder DEFROST_HOURS_AHEAD before the meal's
- * default cook time (6pm local on that day).
- */
-const DEFROST_DEFAULTS: Record<string, number> = {
-  // hours of advance warning by item keyword
-  'chicken': 24,
-  'beef': 24,
-  'pork': 24,
-  'lamb': 36,
-  'salmon': 12,
-  'fish': 12,
-  'shrimp': 6,
-  'turkey': 48,
-  'roast': 48,
-};
-
-function scheduleDefrostReminders(
-  ctx: ToolCtx,
-  weekOf: string,
-  meals: MealSlot[]
-): number {
-  // Clear any pending reminders for this week first (re-approval should reset).
-  ctx.sql.exec(
-    'DELETE FROM reminders WHERE week_of = ? AND type = ? AND sent_at IS NULL',
-    weekOf, 'defrost'
-  );
-
-  // Load freezer items (lowercased name set).
-  const freezerItems = ctx.sql
-    .exec<PantryItem>("SELECT * FROM pantry WHERE location = 'freezer'")
-    .toArray();
-  if (freezerItems.length === 0) return 0;
-
-  const weekStart = parseWeekOf(weekOf); // Monday at midnight local-ish (ms epoch)
-  const dayOffset: Record<Day, number> = {
-    mon: 0, tue: 1, wed: 2, thu: 3, fri: 4, sat: 5, sun: 6,
-  };
-
-  let count = 0;
-  for (const meal of meals) {
-    if (meal.status === 'skipped' || meal.status === 'cooked') continue;
-    if (!meal.ingredients) continue;
-
-    for (const ing of meal.ingredients) {
-      const ingLower = ing.item.toLowerCase();
-      const match = freezerItems.find((f) => ingLower.includes(f.name) || f.name.includes(ingLower.split(' ').pop() ?? ''));
-      if (!match) continue;
-
-      const hoursAhead = pickDefrostHours(match.name);
-      const cookTime = weekStart + dayOffset[meal.day] * 86_400_000 + 18 * 3_600_000; // 6pm
-      const dueAt = cookTime - hoursAhead * 3_600_000;
-      if (dueAt < Date.now()) continue; // already past — skip silently
-
-      const message = `🧊 **Defrost reminder**: pull the ${match.name} out of the freezer for ${dayLabel(meal.day)}'s ${meal.name} (~${hoursAhead}h before cook time).`;
-      ctx.sql.exec(
-        'INSERT INTO reminders (due_at, type, week_of, day, message) VALUES (?, ?, ?, ?, ?)',
-        dueAt, 'defrost', weekOf, meal.day, message
-      );
-      count++;
-    }
-  }
-  return count;
-}
-
-function pickDefrostHours(itemName: string): number {
-  const lower = itemName.toLowerCase();
-  for (const [keyword, hours] of Object.entries(DEFROST_DEFAULTS)) {
-    if (lower.includes(keyword)) return hours;
-  }
-  return 12; // safe default for "I don't know what this is"
-}
-
-/** Convert a YYYY-MM-DD Monday string to a ms epoch at midnight UTC. */
-function parseWeekOf(weekOf: string): number {
-  return new Date(weekOf + 'T00:00:00Z').getTime();
-}
-
-async function toolGenerateGroceryList(
-  args: { week_of: string },
-  ctx: ToolCtx
-): Promise<string> {
-  const week = loadWeek(ctx.sql, args.week_of);
-  if (!week) return `No plan exists for ${args.week_of}.`;
-
-  // Lazy materialization: if any meals lack full recipes, generate them now.
-  const needsMaterialize = week.meals.some((m) => !m.ingredients || !m.steps);
-  let mealsToUse = week.meals;
-  if (needsMaterialize) {
-    mealsToUse = await Promise.all(
-      week.meals.map(async (m) => {
-        if (m.ingredients && m.steps) return m;
-        const details = await materializeRecipe(ctx, m);
-        return { ...m, ingredients: details.ingredients, steps: details.steps };
-      })
-    );
-    ctx.sql.exec('UPDATE weeks SET meals_json = ? WHERE week_of = ?', JSON.stringify(mealsToUse), args.week_of);
-  }
-
-  const pantry = new Set(loadPantry(ctx.sql).map((p) => p.name.toLowerCase()));
-  const aggregated: { item: string; qty: string; servings: number }[] = [];
-  for (const meal of mealsToUse) {
-    for (const ing of (meal.ingredients ?? [])) {
-      if (pantry.has(ing.item.toLowerCase().trim())) continue;
-      aggregated.push({ item: ing.item, qty: ing.qty, servings: meal.servings });
-    }
-  }
-
-  const items: GroceryItem[] = await categorizeGrocery(ctx, aggregated);
-
-  ctx.sql.exec(
-    'INSERT INTO grocery_lists (week_of, items_json, generated_at) VALUES (?, ?, ?) ON CONFLICT(week_of) DO UPDATE SET items_json=excluded.items_json, generated_at=excluded.generated_at',
-    args.week_of, JSON.stringify(items), Date.now()
-  );
-
-  return `Generated ${items.length} grocery items.\n\n${renderGroceryList(items)}`;
-}
-
-const GROCERY_SCHEMA = {
-  type: 'object',
-  properties: {
-    items: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          item: { type: 'string' },
-          qty: { type: 'string' },
-          category: { type: 'string', enum: ['produce', 'protein', 'dairy', 'pantry', 'frozen', 'other'] },
-        },
-        required: ['item', 'qty', 'category'],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ['items'],
-  additionalProperties: false,
-};
-
-async function categorizeGrocery(
-  ctx: ToolCtx,
-  aggregated: { item: string; qty: string; servings: number }[]
-): Promise<GroceryItem[]> {
-  const completion = await ctx.client.chat.completions.create({
-    model: ctx.env.OPENAI_MODEL,
-    messages: [
-      {
-        role: 'system',
-        content: 'Combine duplicate grocery items, sum sensible quantities, and categorize each. Use the item name as it would appear on a receipt.',
-      },
-      { role: 'user', content: JSON.stringify(aggregated) },
-    ],
-    response_format: {
-      type: 'json_schema',
-      json_schema: { name: 'grocery', schema: GROCERY_SCHEMA, strict: true },
-    },
-  });
-  const content = completion.choices[0]?.message.content;
-  if (!content) throw new Error('Grocery categorization returned no content');
-  return (JSON.parse(content) as { items: GroceryItem[] }).items;
-}
 
 function toolMarkMealCooked(
   args: { week_of: string; day: Day },
@@ -708,26 +499,34 @@ function toolMarkMealCooked(
   );
   ctx.sql.exec('UPDATE weeks SET meals_json = ? WHERE week_of = ?', JSON.stringify(meals), args.week_of);
 
-  // Decrement pantry for items consumed.
+  // Decrement pantry for items consumed. Only operate on pantry rows that
+  // genuinely match the consumed quantity. If the units don't match (e.g.,
+  // pantry has "1.5 lb chicken" and recipe says "3 chicken breasts"), we skip
+  // — DON'T delete the row, since the user clearly has more than what was used.
+  // Only delete when there's no qty info on the pantry row at all (treat it
+  // as a "have/don't have" flag rather than a quantity tracker).
   const consumed: string[] = [];
   for (const ing of (meal.ingredients ?? [])) {
     const itemName = ing.item.toLowerCase().trim();
     const row = ctx.sql.exec<PantryItem>('SELECT * FROM pantry WHERE name = ?', itemName).toArray()[0];
     if (!row) continue;
-    consumed.push(itemName);
-    // Best-effort qty subtraction: if both pantry and ingredient parsed as same unit, subtract.
     const parsed = parseQty(ing.qty);
     if (parsed && row.qty_value != null && row.qty_unit && row.qty_unit === parsed.unit) {
+      // Units match → subtract. Delete if depleted.
       const remaining = row.qty_value - parsed.value;
+      consumed.push(itemName);
       if (remaining <= 0) {
         ctx.sql.exec('DELETE FROM pantry WHERE name = ?', itemName);
       } else {
         ctx.sql.exec('UPDATE pantry SET qty_value = ? WHERE name = ?', remaining, itemName);
       }
-    } else {
-      // No parseable qty match — assume fully consumed (conservative).
+    } else if (row.qty_value == null && row.qty_unit == null) {
+      // Pantry row has no qty (boolean "I have this" tracker) → remove on use.
       ctx.sql.exec('DELETE FROM pantry WHERE name = ?', itemName);
+      consumed.push(itemName);
     }
+    // Otherwise: pantry has qty info but it doesn't match recipe units →
+    // skip silently. Don't delete or modify.
   }
 
   // Cancel any unsent reminders for this meal.
@@ -898,22 +697,26 @@ export async function runPantryFlow(args: {
   const client = makeClient(env);
 
   // Use gpt-5-nano for pure extraction — much faster than mini, no creativity needed.
-  const completion = await client.chat.completions.create({
+  const response = await client.responses.create({
     model: 'gpt-5-nano',
-    messages: [
+    input: [
       {
         role: 'system',
         content: 'You parse natural-language inventory updates into structured items. Default location is shelf unless the user mentions freezer/fridge or the item is obviously a frozen/refrigerated good. Default action is add unless the user says they used/finished/ran out (then remove). Use lowercase singular names. If quantity is unspecified, set qty_value and qty_unit to null. For "2 chicken thighs" use qty_value=2, qty_unit=count. For "1.5 lb ground beef" use qty_value=1.5, qty_unit=lb.',
       },
       { role: 'user', content: userMessage },
     ],
-    response_format: {
-      type: 'json_schema',
-      json_schema: { name: 'pantry_update', schema: PANTRY_PARSE_SCHEMA, strict: true },
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'pantry_update',
+        schema: PANTRY_PARSE_SCHEMA,
+        strict: true,
+      },
     },
   });
 
-  const content = completion.choices[0]?.message.content;
+  const content = response.output_text;
   if (!content) {
     await discord.editOriginal(interactionToken, 'Failed to parse the input. Try again with simpler wording.');
     return;
@@ -963,145 +766,3 @@ export async function runPantryFlow(args: {
   await discord.editOriginal(interactionToken, reply);
 }
 
-/**
- * Direct (non-agent) /approve flow with streaming progress updates.
- *
- * Replaces the agent-driven path: avoids ~3 LLM turns of routing overhead and
- * gives the user live progress in Discord instead of 30s of "Bot is thinking…".
- *
- * Steps:
- *  1. Find most recent draft plan (within 14 days)
- *  2. Edit Discord message: "locking in"
- *  3. Materialize all 7 recipes in parallel (LLM)
- *  4. Edit Discord message: "recipes ready, building grocery list"
- *  5. Schedule defrost reminders (no LLM)
- *  6. Categorize grocery list (LLM)
- *  7. Edit Discord message: final result with plan + grocery list
- */
-export async function runApproveFlow(args: {
-  env: Env;
-  sql: SqlStorage;
-  discord: DiscordAPI;
-  interactionToken: string;
-}): Promise<void> {
-  const { env, sql, discord, interactionToken } = args;
-  const client = makeClient(env);
-  const ctx: ToolCtx = { env, sql, client };
-
-  // Step 1: find the active plan — same logic as /plan fast-read so they
-  // agree on which plan we're operating on.
-  const cutoff = Date.now() - 14 * 86_400_000;
-  const week = sql
-    .exec<WeekRow>(
-      'SELECT * FROM weeks WHERE drafted_at >= ? ORDER BY drafted_at DESC LIMIT 1',
-      cutoff
-    )
-    .toArray()[0];
-
-  if (!week) {
-    await discord.editOriginal(
-      interactionToken,
-      'No plan in the last 14 days. Use `/steer message: make a plan` to create one first.'
-    );
-    return;
-  }
-
-  if (week.status === 'approved') {
-    await discord.editOriginal(
-      interactionToken,
-      `The plan for **${week.week_of}** is already approved. Use \`/grocery\` to see the list, or \`/steer message: regenerate\` to start a new draft.`
-    );
-    return;
-  }
-
-  const weekOf = week.week_of;
-  const meals = JSON.parse(week.meals_json) as MealSlot[];
-
-  // Step 2: announce intent
-  await discord.editOriginal(
-    interactionToken,
-    `🔒 Approving plan for week of **${weekOf}**…\n👨‍🍳 Generating full recipes (7 in parallel) — about 10-15s.`
-  );
-
-  // Step 3: materialize all recipes in parallel
-  const materializedMeals = await Promise.all(
-    meals.map(async (m) => {
-      if (m.ingredients && m.steps) return m;
-      const details = await materializeRecipe(ctx, m);
-      return { ...m, ingredients: details.ingredients, steps: details.steps };
-    })
-  );
-
-  sql.exec(
-    'UPDATE weeks SET status = ?, approved_at = ?, meals_json = ? WHERE week_of = ?',
-    'approved',
-    Date.now(),
-    JSON.stringify(materializedMeals),
-    weekOf
-  );
-
-  const remindersScheduled = scheduleDefrostReminders(ctx, weekOf, materializedMeals);
-
-  // Step 4: progress update
-  await discord.editOriginal(
-    interactionToken,
-    `🔒 Plan approved for **${weekOf}**\n👨‍🍳 ${materializedMeals.length} recipes ready\n🧊 ${remindersScheduled} defrost reminder(s) scheduled\n🛒 Building grocery list…`
-  );
-
-  // Step 5: aggregate ingredients minus pantry
-  const pantryItems = sql
-    .exec<PantryItem>('SELECT * FROM pantry')
-    .toArray();
-  const pantry = new Set(pantryItems.map((p) => p.name.toLowerCase()));
-
-  const aggregated: { item: string; qty: string; servings: number }[] = [];
-  for (const meal of materializedMeals) {
-    for (const ing of meal.ingredients ?? []) {
-      if (pantry.has(ing.item.toLowerCase().trim())) continue;
-      aggregated.push({ item: ing.item, qty: ing.qty, servings: meal.servings });
-    }
-  }
-
-  const items: GroceryItem[] = await categorizeGrocery(ctx, aggregated);
-
-  sql.exec(
-    'INSERT INTO grocery_lists (week_of, items_json, generated_at) VALUES (?, ?, ?) ON CONFLICT(week_of) DO UPDATE SET items_json=excluded.items_json, generated_at=excluded.generated_at',
-    weekOf,
-    JSON.stringify(items),
-    Date.now()
-  );
-
-  // Step 6: final result
-  const planText = renderPlan({ ...week, status: 'approved', meals_json: JSON.stringify(materializedMeals) });
-  const groceryText = renderGroceryList(items);
-
-  const final = [
-    `✅ **Approved plan for week of ${weekOf}**`,
-    '',
-    planText,
-    '',
-    `🧊 ${remindersScheduled} defrost reminder(s) scheduled — you'll get pings in this channel.`,
-    '',
-    '🛒 **Grocery list:**',
-    '',
-    groceryText,
-  ].join('\n');
-
-  // Discord has a 2000-char limit per message. If we're over, truncate the
-  // grocery section and follow up with the rest.
-  if (final.length <= 2000) {
-    await discord.editOriginal(interactionToken, final);
-  } else {
-    const head = [
-      `✅ **Approved plan for week of ${weekOf}**`,
-      '',
-      planText,
-      '',
-      `🧊 ${remindersScheduled} defrost reminder(s) scheduled.`,
-      '',
-      '🛒 Grocery list (in follow-up):',
-    ].join('\n');
-    await discord.editOriginal(interactionToken, head);
-    await discord.followUp(interactionToken, '🛒 **Grocery list:**\n\n' + groceryText.slice(0, 1900));
-  }
-}

@@ -1,18 +1,19 @@
 import type { Env } from './env';
 import { verifyDiscordRequest } from './discord/verify';
 import { InteractionType, InteractionResponseType, type Interaction } from './discord/types';
+import { currentOrNextMondayISO } from './util/datetime';
 
 export { KitchenDO } from './kitchen-do';
 export { ApproveWorkflow } from './workflows/approve';
 export { SteerWorkflow } from './workflows/steer';
 
 export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // Discord posts all interactions to /interactions
     if (url.pathname === '/interactions' && request.method === 'POST') {
-      return handleDiscordInteraction(request, env, _ctx);
+      return handleDiscordInteraction(request, env, ctx);
     }
 
     // Health check
@@ -20,60 +21,77 @@ export default {
       return new Response('ok');
     }
 
-    // Temporary debug endpoint — gated on the bot token to keep it self-only.
-    // Usage: GET /admin/dump?token=<DISCORD_BOT_TOKEN>
-    if (url.pathname === '/admin/dump') {
-      if (url.searchParams.get('token') !== env.DISCORD_BOT_TOKEN) {
+    // Discord Gateway relay (running on Fly.io) forwards plain-text messages
+    // to here via shared-secret HTTPS. We spawn a SteerWorkflow with viaChat=true.
+    if (url.pathname === '/relay/message' && request.method === 'POST') {
+      if (request.headers.get('x-relay-secret') !== env.RELAY_SECRET) {
         return new Response('forbidden', { status: 403 });
       }
-      const stub = getKitchenStub(env);
-      return stub.fetch('https://internal/dump');
+      const body = (await request.json()) as {
+        channelId: string;
+        userMessage: string;
+        author?: string;
+      };
+      if (!body.channelId || !body.userMessage) {
+        return new Response('bad request', { status: 400 });
+      }
+
+      ctx.waitUntil(
+        env.STEER_WORKFLOW.create({
+          params: {
+            weekOf: currentOrNextMondayISO(env.TIMEZONE),
+            channelId: body.channelId,
+            userMessage: body.userMessage,
+            viaChat: true,
+          },
+        })
+      );
+
+      return Response.json({ ok: true });
     }
 
-    // Reset endpoint — clears all tables EXCEPT settings (profile) and
-    // re-arms the alarm. Use with care.
-    // Usage: POST /admin/reset?token=<DISCORD_BOT_TOKEN>
-    if (url.pathname === '/admin/reset' && request.method === 'POST') {
-      if (url.searchParams.get('token') !== env.DISCORD_BOT_TOKEN) {
+    // Admin endpoints. All gated on a separate ADMIN_TOKEN secret (NOT the
+    // bot token, which is a live production credential), supplied via the
+    // Authorization header so it doesn't leak through CDN/proxy access logs.
+    //
+    // Usage:
+    //   curl -H "Authorization: Bearer $ADMIN_TOKEN" https://.../admin/dump
+    //   curl -H "Authorization: Bearer $ADMIN_TOKEN" -X POST https://.../admin/reset
+    if (url.pathname.startsWith('/admin/')) {
+      if (!checkAdmin(request, env)) {
         return new Response('forbidden', { status: 403 });
       }
       const stub = getKitchenStub(env);
-      return stub.fetch('https://internal/reset', { method: 'POST' });
-    }
 
-    // Read the full grocery list JSON for inspection.
-    if (url.pathname === '/admin/grocery') {
-      if (url.searchParams.get('token') !== env.DISCORD_BOT_TOKEN) {
-        return new Response('forbidden', { status: 403 });
+      if (url.pathname === '/admin/dump' && request.method === 'GET') {
+        return stub.fetch('https://internal/dump');
       }
-      const weekOf = url.searchParams.get('week_of');
-      if (!weekOf) return new Response('missing week_of', { status: 400 });
-      const stub = getKitchenStub(env);
-      return stub.fetch(`https://internal/get-grocery?week_of=${weekOf}`);
-    }
-
-    // Drop the grocery list for a given week so /approve will rebuild it.
-    // Usage: POST /admin/clear-grocery?token=...&week_of=2026-05-04
-    if (url.pathname === '/admin/clear-grocery' && request.method === 'POST') {
-      if (url.searchParams.get('token') !== env.DISCORD_BOT_TOKEN) {
-        return new Response('forbidden', { status: 403 });
+      if (url.pathname === '/admin/reset' && request.method === 'POST') {
+        return stub.fetch('https://internal/reset', { method: 'POST' });
       }
-      const weekOf = url.searchParams.get('week_of');
-      if (!weekOf) return new Response('missing week_of', { status: 400 });
-      const stub = getKitchenStub(env);
-      return stub.fetch(`https://internal/clear-grocery?week_of=${weekOf}`, { method: 'POST' });
+      if (url.pathname === '/admin/grocery' && request.method === 'GET') {
+        const weekOf = validateWeekOf(url.searchParams.get('week_of'));
+        if (!weekOf) return new Response('invalid week_of', { status: 400 });
+        return stub.fetch(`https://internal/get-grocery?week_of=${weekOf}`);
+      }
+      if (url.pathname === '/admin/clear-grocery' && request.method === 'POST') {
+        const weekOf = validateWeekOf(url.searchParams.get('week_of'));
+        if (!weekOf) return new Response('invalid week_of', { status: 400 });
+        return stub.fetch(`https://internal/clear-grocery?week_of=${weekOf}`, { method: 'POST' });
+      }
+      return new Response('not found', { status: 404 });
     }
 
     return new Response('not found', { status: 404 });
   },
 
   /**
-   * Cron heartbeat: ensures the DO alarm stays armed AND dispatches any
-   * due reminders (defrost pings, etc.). Runs hourly.
+   * Cron heartbeat: pings KitchenDO (re-arms alarms, dispatches reminders).
+   * Runs hourly. The Discord Gateway connection lives on Fly.io now.
    */
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const stub = getKitchenStub(env);
-    ctx.waitUntil(stub.fetch('https://internal/heartbeat', { method: 'POST' }));
+    const kitchen = getKitchenStub(env);
+    ctx.waitUntil(kitchen.fetch('https://internal/heartbeat', { method: 'POST' }));
   },
 };
 
@@ -156,3 +174,29 @@ function getKitchenStub(env: Env) {
   const id = env.KITCHEN.idFromName('default-household');
   return env.KITCHEN.get(id);
 }
+
+/**
+ * Constant-time-ish admin auth check via Authorization: Bearer <token> header.
+ * Avoids putting secrets in URL query strings (which leak through access logs).
+ */
+function checkAdmin(request: Request, env: Env): boolean {
+  if (!env.ADMIN_TOKEN) return false;
+  const auth = request.headers.get('authorization') ?? '';
+  const match = auth.match(/^Bearer\s+(.+)$/);
+  if (!match) return false;
+  const token = match[1]!.trim();
+  // Length-prefix check so the timing comparison can't leak the right length.
+  if (token.length !== env.ADMIN_TOKEN.length) return false;
+  let result = 0;
+  for (let i = 0; i < token.length; i++) {
+    result |= token.charCodeAt(i) ^ env.ADMIN_TOKEN.charCodeAt(i);
+  }
+  return result === 0;
+}
+
+/** Validate week_of query params before forwarding to the DO. */
+function validateWeekOf(input: string | null): string | null {
+  if (!input) return null;
+  return /^\d{4}-\d{2}-\d{2}$/.test(input) ? input : null;
+}
+

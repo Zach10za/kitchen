@@ -137,30 +137,10 @@ export const TOOLS = [
       },
     },
   },
-  {
-    type: 'function' as const,
-    function: {
-      name: 'approve_plan',
-      description: 'Lock the draft in AND materialize full recipes (ingredients + steps) for the whole week. Takes ~10-15s. ONLY call when user explicitly approves (says "approve", "looks good", "lock it in", or equivalent). After this, also call generate_grocery_list.',
-      parameters: {
-        type: 'object',
-        properties: { week_of: { type: 'string' } },
-        required: ['week_of'],
-      },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
-      name: 'generate_grocery_list',
-      description: 'Build the grocery list for an approved plan, diffed against the pantry.',
-      parameters: {
-        type: 'object',
-        properties: { week_of: { type: 'string' } },
-        required: ['week_of'],
-      },
-    },
-  },
+  // approve_plan and generate_grocery_list intentionally NOT exposed as tools —
+  // those run as Cloudflare Workflows triggered by `/approve`. Doing them
+  // inline from the agent loop would blow the DO request budget on the
+  // 7-recipe materialization.
   {
     type: 'function' as const,
     function: {

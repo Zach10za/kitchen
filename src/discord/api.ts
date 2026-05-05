@@ -34,6 +34,22 @@ export class DiscordAPI {
     if (!res.ok) throw new Error(`Discord followUp failed: ${res.status} ${await res.text()}`);
   }
 
+  /**
+   * Post a typing indicator to a channel. The indicator is ephemeral (~10s)
+   * and ignored if user is already seeing one. Cheap to call repeatedly.
+   */
+  async postTyping(channelId: string): Promise<void> {
+    const res = await fetch(`${DISCORD_API}/channels/${channelId}/typing`, {
+      method: 'POST',
+      headers: this.headers(),
+    });
+    if (!res.ok && res.status !== 429) {
+      // 429 (rate limited) is fine for typing — just stops indicating.
+      // Other errors we'd want to know about but not break the workflow over.
+      console.warn(`postTyping failed: ${res.status}`);
+    }
+  }
+
   /** Edit the deferred response (preferred when the agent finishes within ~15 min). */
   async editOriginal(interactionToken: string, content: string): Promise<void> {
     const res = await fetch(

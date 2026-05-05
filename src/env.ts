@@ -19,4 +19,6 @@ export interface Env {
   DISCORD_CHANNEL_ID: string;
   OPENAI_API_KEY: string;
   AI_GATEWAY_URL: string;
+  RELAY_SECRET: string;
+  ADMIN_TOKEN: string;
 }

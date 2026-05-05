@@ -15,11 +15,20 @@
     ]
   },
 
-  // SQLite-backed DOs need a migration entry
+  // Migrations history. v1 created KitchenDO, v2 added GatewayDO (now removed),
+  // v3 deletes GatewayDO since the gateway connection lives on Fly.io now.
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["KitchenDO"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["GatewayDO"]
+    },
+    {
+      "tag": "v3",
+      "deleted_classes": ["GatewayDO"]
     }
   ],
 
@@ -38,8 +47,7 @@
     }
   ],
 
-  // Cron trigger as a safety net to ensure alarms stay armed even if a deploy
-  // happens to clear them. Runs hourly; the DO no-ops if the alarm is set.
+  // Hourly cron keeps KitchenDO alarms armed and dispatches due reminders.
   "triggers": {
     "crons": ["0 * * * *"]
   },
@@ -66,4 +74,5 @@
   //   DISCORD_CHANNEL_ID      — the channel the bot posts proactive drafts to
   //   OPENAI_API_KEY          — your OpenAI key
   //   AI_GATEWAY_URL          — e.g. https://gateway.ai.cloudflare.com/v1/<acct>/kitchen/openai
+  //   RELAY_SECRET            — shared secret with the Fly.io gateway-relay
 }

@@ -2,12 +2,17 @@ import { WorkflowEntrypoint, type WorkflowStep, type WorkflowEvent } from 'cloud
 import OpenAI from 'openai';
 import type { Env } from '../env';
 import { TOOLS } from '../agent/tools';
+import { toResponsesTools } from '../agent/loop';
 import { DiscordAPI } from '../discord/api';
 
 interface SteerParams {
   weekOf: string;
-  interactionToken: string;
   userMessage: string;
+  // Slash-command path: edit the deferred interaction response.
+  interactionToken?: string;
+  // Chat path (Gateway): post a regular message to this channel instead.
+  channelId?: string;
+  viaChat?: boolean;
 }
 
 const MAX_TOOL_ROUNDS = 6;
@@ -15,8 +20,10 @@ const MAX_TOOL_ROUNDS = 6;
 interface AgentTurnResult {
   type: 'final' | 'continue';
   finalText?: string;
-  assistantMessage: OpenAI.Chat.Completions.ChatCompletionMessage;
-  toolResults: { tool_call_id: string; content: string }[];
+  // Full new input array (Responses API: messages + function_call +
+  // function_call_output items). Returned as the FULL array so workflow
+  // replay sees a self-contained cached result.
+  newMessages: any[];
 }
 
 /**
@@ -33,9 +40,28 @@ interface AgentTurnResult {
  */
 export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
   async run(event: WorkflowEvent<SteerParams>, step: WorkflowStep) {
-    const { weekOf, interactionToken, userMessage } = event.payload;
+    const { weekOf, interactionToken, channelId, viaChat, userMessage } = event.payload;
     const discord = new DiscordAPI(this.env.DISCORD_BOT_TOKEN, this.env.DISCORD_APP_ID);
     const stub = this.kitchen();
+
+    // Helper that posts the final reply via the right Discord channel.
+    const postReply = async (text: string): Promise<void> => {
+      const truncated = text.slice(0, 2000);
+      if (viaChat && channelId) {
+        await discord.postMessage(channelId, truncated);
+      } else if (interactionToken) {
+        await discord.editOriginal(interactionToken, truncated);
+      }
+    };
+
+
+    // Step 0: instant feedback — fire typing indicator immediately so the
+    // user sees the bot is working while load-context + save-turn run.
+    if (viaChat && channelId) {
+      await step.do('initial-typing', async () => {
+        await discord.postTyping(channelId).catch(() => {});
+      });
+    }
 
     // Step 1: load context from DO
     const ctx = await step.do('load-context', async () => {
@@ -54,9 +80,11 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
       });
     });
 
-    // Build the running message list. Updated locally in workflow memory; each
-    // round-N step is fed the current state via closure capture.
-    const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+    // Build the running message list. Each round.do receives the current
+    // messages and returns the FULL new messages array (input + appended).
+    // We assign rather than mutate so workflow replays (which return the
+    // cached step result) don't re-append on top of the same array.
+    let messages: any[] = [
       { role: 'system', content: ctx.systemPrompt },
       ...ctx.history.map((h) => ({ role: h.role, content: h.content })),
       { role: 'user', content: userMessage },
@@ -65,23 +93,25 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
     let finalText: string | null = null;
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const inputMessages = messages;
       const result: AgentTurnResult = await step.do(
         `round-${round}`,
         { retries: { limit: 2, delay: '2 seconds', backoff: 'linear' } },
-        async () => this.runOneRound(messages, weekOf)
+        async () => {
+          // Fire typing indicator at the start of each round (durable; only
+          // runs when the step actually executes, not on replay).
+          if (viaChat && channelId) {
+            await discord.postTyping(channelId).catch(() => {});
+          }
+          return this.runOneRound(inputMessages, weekOf);
+        }
       );
 
-      // Always advance the message list with the assistant's reply.
-      messages.push(result.assistantMessage);
+      messages = result.newMessages;
 
       if (result.type === 'final') {
         finalText = result.finalText ?? '(no text)';
         break;
-      }
-
-      // Append tool results (in same order as the model emitted tool calls).
-      for (const tr of result.toolResults) {
-        messages.push({ role: 'tool', tool_call_id: tr.tool_call_id, content: tr.content });
       }
     }
 
@@ -97,59 +127,58 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
       });
     });
 
-    // Post to Discord.
+    // Post to Discord (either edit the interaction or post to channel).
     await step.do('post-final', async () => {
-      await discord.editOriginal(interactionToken, finalText!.slice(0, 2000));
+      await postReply(finalText!);
     });
   }
 
   /**
-   * One round of the agent loop: call OpenAI once, execute any tool calls in
-   * the response, return results. Designed to be wrapped in step.do for
-   * automatic retries on transient failures.
+   * One round of the agent loop using OpenAI's Responses API.
+   * Designed to be wrapped in step.do for automatic retries on transient failures.
    */
-  private async runOneRound(
-    messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
-    weekOf: string
-  ): Promise<AgentTurnResult> {
+  private async runOneRound(messages: any[], weekOf: string): Promise<AgentTurnResult> {
     const client = this.openai();
     const stub = this.kitchen();
 
-    const completion = await client.chat.completions.create({
+    const response = await client.responses.create({
       model: this.env.OPENAI_MODEL,
-      messages,
-      tools: TOOLS as unknown as OpenAI.Chat.Completions.ChatCompletionTool[],
+      input: messages,
+      tools: toResponsesTools(TOOLS),
     });
 
-    const choice = completion.choices[0];
-    if (!choice) throw new Error('OpenAI returned no choices');
-    const msg = choice.message;
+    const toolCalls = response.output.filter((o: any) => o.type === 'function_call');
+    const messageOutput = response.output.find((o: any) => o.type === 'message');
 
-    if (!msg.tool_calls || msg.tool_calls.length === 0) {
-      return {
-        type: 'final',
-        finalText: msg.content ?? '(no text)',
-        assistantMessage: msg,
-        toolResults: [],
-      };
+    if (toolCalls.length === 0) {
+      const finalText = response.output_text || '(no text)';
+      const newMessages = [...messages];
+      if (messageOutput) newMessages.push(messageOutput);
+      return { type: 'final', finalText, newMessages };
     }
 
-    // Execute tools sequentially via the DO's exec-tool endpoint. Tools
-    // mutate SQL inside the DO so this routes to one consistent state.
-    const toolResults: { tool_call_id: string; content: string }[] = [];
-    for (const toolCall of msg.tool_calls) {
-      if (toolCall.type !== 'function') continue;
-      const args = JSON.parse(toolCall.function.arguments);
-      // Some tools take week_of; default if not provided.
-      if (!('week_of' in args) && needsWeekOf(toolCall.function.name)) {
+    // Append message (if present) + each function_call to the input array,
+    // then execute each tool and append its function_call_output. Tools
+    // mutate SQL inside the DO via /workflow/exec-tool.
+    const newMessages: any[] = [...messages];
+    if (messageOutput) newMessages.push(messageOutput);
+    for (const tc of toolCalls) newMessages.push(tc);
+
+    for (const toolCall of toolCalls as any[]) {
+      const args = JSON.parse(toolCall.arguments);
+      if (!('week_of' in args) && needsWeekOf(toolCall.name)) {
         args.week_of = weekOf;
       }
       const res = await stub.fetch('https://internal/workflow/exec-tool', {
         method: 'POST',
-        body: JSON.stringify({ name: toolCall.function.name, args }),
+        body: JSON.stringify({ name: toolCall.name, args }),
       });
       const content = await res.text();
-      toolResults.push({ tool_call_id: toolCall.id, content });
+      newMessages.push({
+        type: 'function_call_output',
+        call_id: toolCall.call_id,
+        output: content,
+      });
 
       // Persist the tool turn for visibility / debugging in /admin/dump.
       await stub.fetch('https://internal/workflow/save-turn', {
@@ -158,16 +187,12 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
           week_of: weekOf,
           role: 'tool',
           content,
-          tool_call_json: JSON.stringify({ name: toolCall.function.name, args }),
+          tool_call_json: JSON.stringify({ name: toolCall.name, args }),
         }),
       });
     }
 
-    return {
-      type: 'continue',
-      assistantMessage: msg,
-      toolResults,
-    };
+    return { type: 'continue', newMessages };
   }
 
   private kitchen() {
