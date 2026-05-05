@@ -1,0 +1,69 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kitchen",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Durable Object holding household state
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "KITCHEN",
+        "class_name": "KitchenDO"
+      }
+    ]
+  },
+
+  // SQLite-backed DOs need a migration entry
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["KitchenDO"]
+    }
+  ],
+
+  // Workflows for long-running multi-step operations (e.g. /approve).
+  // Each step.do(...) gets its own request lifetime + automatic retries.
+  "workflows": [
+    {
+      "name": "approve-plan",
+      "binding": "APPROVE_WORKFLOW",
+      "class_name": "ApproveWorkflow"
+    },
+    {
+      "name": "steer",
+      "binding": "STEER_WORKFLOW",
+      "class_name": "SteerWorkflow"
+    }
+  ],
+
+  // Cron trigger as a safety net to ensure alarms stay armed even if a deploy
+  // happens to clear them. Runs hourly; the DO no-ops if the alarm is set.
+  "triggers": {
+    "crons": ["0 * * * *"]
+  },
+
+  // AI Gateway binding (set up in Cloudflare dashboard at:
+  //   AI > AI Gateway > create gateway "kitchen")
+  "ai": {
+    "binding": "AI"
+  },
+
+  // Public env (non-secret). Secrets go via `wrangler secret put`.
+  "vars": {
+    "OPENAI_MODEL": "gpt-5-mini",
+    "DRAFT_DAY": "fri",
+    "DRAFT_HOUR_LOCAL": "18",
+    "TIMEZONE": "America/Los_Angeles"
+  }
+
+  // Secrets to set with `wrangler secret put`:
+  //   DISCORD_PUBLIC_KEY      — for verifying interaction signatures
+  //   DISCORD_BOT_TOKEN       — for posting messages via REST
+  //   DISCORD_APP_ID          — for slash command registration
+  //   DISCORD_GUILD_ID        — your server ID (scopes commands to your server)
+  //   DISCORD_CHANNEL_ID      — the channel the bot posts proactive drafts to
+  //   OPENAI_API_KEY          — your OpenAI key
+  //   AI_GATEWAY_URL          — e.g. https://gateway.ai.cloudflare.com/v1/<acct>/kitchen/openai
+}

@@ -1,0 +1,10 @@
+# Copy this to `.dev.vars` for local `wrangler dev`. Never commit `.dev.vars`.
+# In production, set these with `wrangler secret put <NAME>`.
+
+DISCORD_PUBLIC_KEY=
+DISCORD_BOT_TOKEN=
+DISCORD_APP_ID=
+DISCORD_GUILD_ID=
+DISCORD_CHANNEL_ID=
+OPENAI_API_KEY=
+AI_GATEWAY_URL=
