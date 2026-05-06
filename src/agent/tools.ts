@@ -203,6 +203,7 @@ export interface MealSlot {
   // Lazy-materialized — populated on /approve or first /now
   ingredients?: { item: string; qty: string }[];
   steps?: string[];
+  requires_defrost?: { item: string; hours: number }[];
 }
 
 /** Stub form returned by generate_draft / swap_meal. */
@@ -219,6 +220,8 @@ export interface MealStub {
 export interface RecipeDetails {
   ingredients: { item: string; qty: string }[];
   steps: string[];
+  /** Frozen items needing defrost. The model emits these so we don't keyword-match. */
+  requires_defrost: { item: string; hours: number }[];
 }
 
 // Kept for back-compat with renderRecipe; now an alias.
@@ -251,7 +254,7 @@ export interface GroceryItem {
 
 export interface WeekState {
   week_of: string;
-  status: 'draft' | 'approved' | 'in_progress';
+  status: 'draft' | 'approved' | 'in_progress' | 'archived';
   drafted_at: number;
   approved_at: number | null;
   meals: MealSlot[];

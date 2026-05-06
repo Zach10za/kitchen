@@ -3,11 +3,18 @@ import type { Env } from './env';
 import type { Interaction } from './discord/types';
 import { DiscordAPI } from './discord/api';
 import { runAgent, runDraftFlow, runPantryFlow, executeTool, type ToolCtx } from './agent/loop';
-import { buildSystemPrompt } from './agent/prompts';
+import { buildSystemPromptFor, findActiveWeek } from './agent/context';
 import { renderPlan } from './agent/render';
 import { currentOrNextMondayISO, nextMondayISO, nextDraftTime, mealCookTime } from './util/datetime';
 import { captureError } from './error-triage';
 import OpenAI from 'openai';
+
+/** Rolling-window rate limit: forwarded /relay/message calls per channel per hour. */
+const DEFAULT_RELAY_RATE_LIMIT_PER_HOUR = 30;
+/** Keep this many of the most recent conversation rows per week_of when pruning. */
+const CONVERSATION_PRUNE_PER_WEEK = 200;
+/** Run conversation prune at most once per this many ms per DO instance. */
+const CONVERSATION_PRUNE_INTERVAL_MS = 24 * 3600 * 1000;
 
 /**
  * KitchenDO holds all household state. One instance per household
@@ -21,6 +28,7 @@ import OpenAI from 'openai';
 export class KitchenDO extends DurableObject<Env> {
   private sql: SqlStorage;
   private discord: DiscordAPI;
+  private lastConversationPruneAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -63,7 +71,15 @@ export class KitchenDO extends DurableObject<Env> {
     if (url.pathname === '/heartbeat') {
       await this.ensureAlarmSet();
       await this.dispatchDueReminders();
+      this.maybePruneConversation();
       return new Response('ok');
+    }
+
+    if (url.pathname === '/relay-allowed' && request.method === 'POST') {
+      const body = (await request.json()) as { channelId: string };
+      if (!body.channelId) return Response.json({ allowed: false, reason: 'missing channelId' }, { status: 400 });
+      const decision = this.checkRelayRateLimit(body.channelId);
+      return Response.json(decision, { status: decision.allowed ? 200 : 429 });
     }
 
     if (url.pathname === '/fast-read') {
@@ -176,7 +192,7 @@ export class KitchenDO extends DurableObject<Env> {
 
     if (url.pathname === '/workflow/load-context') {
       const weekOf = url.searchParams.get('week_of') ?? '';
-      const systemPrompt = this.buildSystemPromptForWorkflow(weekOf);
+      const systemPrompt = buildSystemPromptFor(this.sql, weekOf);
       const history = this.sql.exec<{ role: string; content: string }>(
         "SELECT role, content FROM conversation WHERE week_of = ? AND role IN ('user', 'assistant') ORDER BY id DESC LIMIT 30",
         weekOf
@@ -248,7 +264,6 @@ export class KitchenDO extends DurableObject<Env> {
    */
   private handleFastRead(interaction: Interaction): string {
     const cmd = interaction.data?.name ?? '';
-    const weekOf = currentOrNextMondayISO(this.env.TIMEZONE);
 
     if (cmd === 'profile') {
       const row = this.sql
@@ -263,13 +278,7 @@ export class KitchenDO extends DurableObject<Env> {
       // Prefer the most recently drafted plan within the last 2 weeks.
       // This handles the common case: user drafted last Sat for "this week",
       // now they're mid-week reading the plan, week_of is in the past.
-      const cutoff = Date.now() - 14 * 86_400_000;
-      const week = this.sql
-        .exec<WeekRow>(
-          'SELECT * FROM weeks WHERE drafted_at >= ? ORDER BY drafted_at DESC LIMIT 1',
-          cutoff
-        )
-        .toArray()[0];
+      const week = findActiveWeek(this.sql);
       if (!week) return `No plan in the last 14 days. Use \`/steer message: make a plan\` to create one.`;
       const meals = JSON.parse(week.meals_json);
       if (meals.length === 0) return `Plan for ${week.week_of} is empty.`;
@@ -387,13 +396,7 @@ export class KitchenDO extends DurableObject<Env> {
     if (commandName === 'approve') {
       // Find the most-recent plan (same logic /plan uses) and pass its week_of
       // to the workflow so they target the same one.
-      const cutoff = Date.now() - 14 * 86_400_000;
-      const week = this.sql
-        .exec<WeekRow>(
-          'SELECT * FROM weeks WHERE drafted_at >= ? ORDER BY drafted_at DESC LIMIT 1',
-          cutoff
-        )
-        .toArray()[0];
+      const week = findActiveWeek(this.sql);
 
       if (!week) {
         await this.discord.editOriginal(
@@ -467,13 +470,7 @@ export class KitchenDO extends DurableObject<Env> {
       }
 
       // Pick the active week (same as /plan + /approve) so they all agree.
-      const cutoff = Date.now() - 14 * 86_400_000;
-      const recent = this.sql
-        .exec<WeekRow>(
-          'SELECT * FROM weeks WHERE drafted_at >= ? ORDER BY drafted_at DESC LIMIT 1',
-          cutoff
-        )
-        .toArray()[0];
+      const recent = findActiveWeek(this.sql);
       const targetWeek = recent?.week_of ?? weekOf;
 
       await this.env.STEER_WORKFLOW.create({
@@ -543,81 +540,138 @@ export class KitchenDO extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(next.getTime());
   }
 
+  /**
+   * Schema migrations. Each entry is run at most once; the highest applied
+   * version is stored in settings.schema_version. Append new entries — never
+   * mutate existing ones, since old DOs may have already applied them.
+   */
+  private static readonly MIGRATIONS: { version: number; up: (sql: SqlStorage) => void }[] = [
+    {
+      version: 1,
+      up: (sql) => {
+        sql.exec(`
+          CREATE TABLE IF NOT EXISTS weeks (
+            week_of TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'draft',
+            meals_json TEXT NOT NULL DEFAULT '[]',
+            constraints_json TEXT NOT NULL DEFAULT '[]',
+            drafted_at INTEGER NOT NULL,
+            approved_at INTEGER
+          );
+          CREATE TABLE IF NOT EXISTS conversation (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            week_of TEXT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tool_call_json TEXT,
+            ts INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS preferences (
+            id TEXT PRIMARY KEY,
+            insight TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            weight INTEGER NOT NULL DEFAULT 5,
+            learned_at INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS pantry (
+            name TEXT PRIMARY KEY,
+            qty TEXT,
+            added_at INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS grocery_lists (
+            week_of TEXT PRIMARY KEY,
+            items_json TEXT NOT NULL,
+            generated_at INTEGER NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            due_at INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            week_of TEXT,
+            day TEXT,
+            message TEXT NOT NULL,
+            sent_at INTEGER
+          );
+          CREATE INDEX IF NOT EXISTS idx_reminders_due
+            ON reminders(due_at) WHERE sent_at IS NULL;
+          CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+          );
+        `);
+      },
+    },
+    {
+      // Freezer-tracking columns on pantry. SQLite has no native
+      // "ADD COLUMN IF NOT EXISTS" so we introspect via pragma_table_info.
+      version: 2,
+      up: (sql) => {
+        const cols = sql
+          .exec<{ name: string }>('SELECT name FROM pragma_table_info(?)', 'pantry')
+          .toArray()
+          .map((r) => r.name);
+        const have = new Set(cols);
+        if (!have.has('location')) {
+          sql.exec("ALTER TABLE pantry ADD COLUMN location TEXT DEFAULT 'shelf'");
+        }
+        if (!have.has('qty_value')) {
+          sql.exec('ALTER TABLE pantry ADD COLUMN qty_value REAL');
+        }
+        if (!have.has('qty_unit')) {
+          sql.exec('ALTER TABLE pantry ADD COLUMN qty_unit TEXT');
+        }
+      },
+    },
+    {
+      // Index for unbounded conversation table + the prune helper that runs hourly.
+      version: 3,
+      up: (sql) => {
+        sql.exec(
+          'CREATE INDEX IF NOT EXISTS idx_conversation_week ON conversation(week_of, id DESC)'
+        );
+      },
+    },
+    {
+      // /relay/message rate-limit hits.
+      version: 4,
+      up: (sql) => {
+        sql.exec(`
+          CREATE TABLE IF NOT EXISTS relay_rate (
+            channel_id TEXT NOT NULL,
+            hit_at INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_relay_rate_channel ON relay_rate(channel_id, hit_at);
+        `);
+      },
+    },
+  ];
+
   private initSchema(): void {
-    const ddl = `
-      CREATE TABLE IF NOT EXISTS weeks (
-        week_of TEXT PRIMARY KEY,
-        status TEXT NOT NULL DEFAULT 'draft',
-        meals_json TEXT NOT NULL DEFAULT '[]',
-        constraints_json TEXT NOT NULL DEFAULT '[]',
-        drafted_at INTEGER NOT NULL,
-        approved_at INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS conversation (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        week_of TEXT,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        tool_call_json TEXT,
-        ts INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS preferences (
-        id TEXT PRIMARY KEY,
-        insight TEXT NOT NULL,
-        rationale TEXT NOT NULL,
-        weight INTEGER NOT NULL DEFAULT 5,
-        learned_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS pantry (
-        name TEXT PRIMARY KEY,
-        qty TEXT,
-        added_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS grocery_lists (
-        week_of TEXT PRIMARY KEY,
-        items_json TEXT NOT NULL,
-        generated_at INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS reminders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        due_at INTEGER NOT NULL,
-        type TEXT NOT NULL,
-        week_of TEXT,
-        day TEXT,
-        message TEXT NOT NULL,
-        sent_at INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS idx_reminders_due
-        ON reminders(due_at) WHERE sent_at IS NULL;
+    // Bootstrap settings table so we have somewhere to record schema_version.
+    // It's also the first table created by migration v1 — guarded by IF NOT EXISTS.
+    this.sql.exec(`
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
-    `;
-    this.sql.exec(ddl);
-    this.migratePantryColumns();
-  }
-
-  /**
-   * Idempotently add freezer-tracking columns to pantry. SQLite has no
-   * native "ADD COLUMN IF NOT EXISTS" so we introspect via pragma_table_info
-   * and only ALTER when missing.
-   */
-  private migratePantryColumns(): void {
-    const cols = this.sql
-      .exec<{ name: string }>('SELECT name FROM pragma_table_info(?)', 'pantry')
-      .toArray()
-      .map((r) => r.name);
-    const have = new Set(cols);
-    if (!have.has('location')) {
-      this.sql.exec("ALTER TABLE pantry ADD COLUMN location TEXT DEFAULT 'shelf'");
+    `);
+    const row = this.sql
+      .exec<{ value: string }>("SELECT value FROM settings WHERE key = 'schema_version'")
+      .toArray()[0];
+    const current = row ? Number(row.value) || 0 : 0;
+    let applied = current;
+    for (const m of KitchenDO.MIGRATIONS) {
+      if (m.version <= current) continue;
+      m.up(this.sql);
+      applied = m.version;
     }
-    if (!have.has('qty_value')) {
-      this.sql.exec('ALTER TABLE pantry ADD COLUMN qty_value REAL');
-    }
-    if (!have.has('qty_unit')) {
-      this.sql.exec('ALTER TABLE pantry ADD COLUMN qty_unit TEXT');
+    if (applied !== current) {
+      this.sql.exec(
+        "INSERT INTO settings (key, value, updated_at) VALUES ('schema_version', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        String(applied), Date.now()
+      );
     }
   }
 
@@ -632,13 +686,7 @@ export class KitchenDO extends DurableObject<Env> {
    */
   private async handleGroceryRead(interactionToken: string): Promise<void> {
     // Find the most-recent week (matches /plan and /approve targeting).
-    const cutoff = Date.now() - 14 * 86_400_000;
-    const week = this.sql
-      .exec<WeekRow>(
-        'SELECT * FROM weeks WHERE drafted_at >= ? ORDER BY drafted_at DESC LIMIT 1',
-        cutoff
-      )
-      .toArray()[0];
+    const week = findActiveWeek(this.sql);
     if (!week) {
       await this.discord.editOriginal(interactionToken, 'No plan in the last 14 days.');
       return;
@@ -678,81 +726,19 @@ export class KitchenDO extends DurableObject<Env> {
     }
   }
 
+  // System-prompt + recent-meals loaders moved to ./agent/context.ts so the
+  // in-process agent and the SteerWorkflow share one source of truth.
+
   /**
-   * Build the system prompt for the SteerWorkflow. Pulls all context from
-   * SQLite directly; same format as runAgent's loadContext.
+   * Used by the approve workflow after meals are materialized. The model
+   * populates `requires_defrost` per recipe during materialization, so we
+   * just schedule a reminder per entry — no keyword matching, no defaults.
    */
-  private buildSystemPromptForWorkflow(weekOf: string): string {
-    const planRow = this.sql
-      .exec<WeekRow>('SELECT * FROM weeks WHERE week_of = ?', weekOf)
-      .toArray()[0];
-    const plan = planRow
-      ? {
-          week_of: planRow.week_of,
-          status: planRow.status,
-          drafted_at: planRow.drafted_at,
-          approved_at: planRow.approved_at,
-          meals: JSON.parse(planRow.meals_json),
-          constraints: JSON.parse(planRow.constraints_json),
-        }
-      : null;
-
-    const preferences = this.sql
-      .exec<any>('SELECT * FROM preferences ORDER BY weight DESC, learned_at DESC LIMIT 25')
-      .toArray();
-    const pantry = this.sql
-      .exec<any>('SELECT * FROM pantry ORDER BY added_at DESC')
-      .toArray();
-    const recentMeals = this.loadRecentMealsForWorkflow(weekOf, 14);
-    const profileRow = this.sql
-      .exec<{ value: string }>("SELECT value FROM settings WHERE key = 'cooking_profile'")
-      .toArray()[0];
-
-    return buildSystemPrompt({
-      plan,
-      preferences,
-      pantry,
-      recentMeals,
-      profile: profileRow?.value ?? null,
-    });
-  }
-
-  private loadRecentMealsForWorkflow(excludeWeekOf: string, daysBack: number) {
-    const cutoff = Date.now() - daysBack * 86_400_000;
-    const rows = this.sql.exec<WeekRow>(
-      "SELECT * FROM weeks WHERE week_of != ? AND drafted_at >= ? AND status IN ('approved', 'in_progress') ORDER BY week_of DESC LIMIT 4",
-      excludeWeekOf, cutoff
-    ).toArray();
-    const out: { weekOf: string; day: string; name: string; cuisine: string }[] = [];
-    for (const row of rows) {
-      const meals = JSON.parse(row.meals_json);
-      for (const m of meals) {
-        out.push({ weekOf: row.week_of, day: m.day, name: m.name, cuisine: m.cuisine });
-      }
-    }
-    return out;
-  }
-
-  /** Used by the approve workflow after meals are materialized. */
   scheduleDefrostRemindersFromMeals(weekOf: string, meals: any[]): number {
     this.sql.exec(
       "DELETE FROM reminders WHERE week_of = ? AND type = 'defrost' AND sent_at IS NULL",
       weekOf
     );
-    const freezer = this.sql
-      .exec<{ name: string }>("SELECT name FROM pantry WHERE location = 'freezer'")
-      .toArray();
-    if (freezer.length === 0) return 0;
-
-    const defrost: Record<string, number> = {
-      chicken: 24, beef: 24, pork: 24, lamb: 36, salmon: 12, fish: 12,
-      shrimp: 6, turkey: 48, roast: 48,
-    };
-    const pickHours = (n: string) => {
-      const lower = n.toLowerCase();
-      for (const [k, h] of Object.entries(defrost)) if (lower.includes(k)) return h;
-      return 12;
-    };
 
     const dayLabel: Record<string, string> = {
       mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday',
@@ -762,17 +748,14 @@ export class KitchenDO extends DurableObject<Env> {
     let count = 0;
     for (const meal of meals) {
       if (meal.status === 'skipped' || meal.status === 'cooked') continue;
-      if (!meal.ingredients) continue;
-      for (const ing of meal.ingredients) {
-        const ingLower = (ing.item || '').toLowerCase();
-        const match = freezer.find((f) => ingLower.includes(f.name) || f.name.includes(ingLower.split(' ').pop() ?? ''));
-        if (!match) continue;
-        // Cook time = 6 PM in user's local timezone on the meal's weekday.
-        // Previously we anchored to UTC midnight which fired ~7h early in PT.
-        const cookTime = mealCookTime(weekOf, meal.day, 18, this.env.TIMEZONE);
-        const dueAt = cookTime - pickHours(match.name) * 3_600_000;
+      const defrostEntries: { item: string; hours: number }[] = meal.requires_defrost ?? [];
+      if (defrostEntries.length === 0) continue;
+      const cookTime = mealCookTime(weekOf, meal.day, 18, this.env.TIMEZONE);
+      for (const entry of defrostEntries) {
+        const hours = Number.isFinite(entry.hours) && entry.hours > 0 ? entry.hours : 12;
+        const dueAt = cookTime - hours * 3_600_000;
         if (dueAt < Date.now()) continue;
-        const message = `🧊 **Defrost reminder**: pull the ${match.name} out of the freezer for ${dayLabel[meal.day] ?? meal.day}'s ${meal.name}.`;
+        const message = `🧊 **Defrost reminder**: pull the ${entry.item} out of the freezer for ${dayLabel[meal.day] ?? meal.day}'s ${meal.name}.`;
         this.sql.exec(
           'INSERT INTO reminders (due_at, type, week_of, day, message) VALUES (?, ?, ?, ?, ?)',
           dueAt, 'defrost', weekOf, meal.day, message
@@ -782,11 +765,53 @@ export class KitchenDO extends DurableObject<Env> {
     }
     return count;
   }
+
+  /**
+   * Per-channel rolling-window rate limit for /relay/message. Stored in a
+   * relay_rate table so it's transactionally safe across DO restarts and
+   * doesn't depend on cf-cache TTLs.
+   */
+  private checkRelayRateLimit(channelId: string): { allowed: boolean; remaining: number; reason?: string } {
+    const limit = Number(this.env.RELAY_RATE_LIMIT_PER_HOUR ?? '') || DEFAULT_RELAY_RATE_LIMIT_PER_HOUR;
+    const now = Date.now();
+    const windowStart = now - 3_600_000;
+    this.sql.exec('DELETE FROM relay_rate WHERE hit_at < ?', windowStart);
+    const count = this.sql
+      .exec<{ n: number }>('SELECT COUNT(*) AS n FROM relay_rate WHERE channel_id = ?', channelId)
+      .toArray()[0]?.n ?? 0;
+    if (count >= limit) {
+      return { allowed: false, remaining: 0, reason: 'rate_limit_exceeded' };
+    }
+    this.sql.exec('INSERT INTO relay_rate (channel_id, hit_at) VALUES (?, ?)', channelId, now);
+    return { allowed: true, remaining: limit - count - 1 };
+  }
+
+  /**
+   * Periodically prune the conversation table so it can't grow unbounded.
+   * Keeps the most recent CONVERSATION_PRUNE_PER_WEEK rows per week_of.
+   * Triggered by the hourly heartbeat; rate-limited so we don't burn every
+   * heartbeat on it.
+   */
+  private maybePruneConversation(): void {
+    const now = Date.now();
+    if (now - this.lastConversationPruneAt < CONVERSATION_PRUNE_INTERVAL_MS) return;
+    this.lastConversationPruneAt = now;
+    this.sql.exec(`
+      DELETE FROM conversation
+      WHERE id NOT IN (
+        SELECT id FROM (
+          SELECT id, ROW_NUMBER() OVER (PARTITION BY week_of ORDER BY id DESC) AS rn
+          FROM conversation
+        )
+        WHERE rn <= ${CONVERSATION_PRUNE_PER_WEEK}
+      )
+    `);
+  }
 }
 
 export interface WeekRow {
   week_of: string;
-  status: 'draft' | 'approved' | 'in_progress';
+  status: 'draft' | 'approved' | 'in_progress' | 'archived';
   meals_json: string;
   constraints_json: string;
   drafted_at: number;

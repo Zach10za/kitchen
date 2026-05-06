@@ -97,6 +97,10 @@ async function triageTitle(env: Env, error: NormalizedError, ctx: CaptureContext
   if (!env.OPENAI_API_KEY) return defaultTitle(error, ctx);
 
   try {
+    // maxRetries: 0 is intentional. captureError runs from the top-level fetch
+    // catch and from the DO's interaction handler — anything that retries here
+    // will compound under load and re-fail in the same way it just failed.
+    // A worse title is fine; a flapping triage path is not.
     const client = new OpenAI({
       apiKey: env.OPENAI_API_KEY,
       baseURL: env.AI_GATEWAY_URL || undefined,
@@ -105,7 +109,7 @@ async function triageTitle(env: Env, error: NormalizedError, ctx: CaptureContext
     });
     const top = error.stack.split('\n').slice(0, 8).join('\n');
     const response = await client.responses.create({
-      model: 'gpt-5-nano',
+      model: env.OPENAI_MODEL_FAST,
       input: [
         {
           role: 'system',

@@ -7,10 +7,16 @@ export interface Env {
 
   // Vars
   OPENAI_MODEL: string;
+  /** Cheap, fast model for one-shot title generation (error triage). */
+  OPENAI_MODEL_FAST: string;
+  /** Cheap, fast model for pure structured extraction (pantry parse, recipe materialize). */
+  OPENAI_MODEL_EXTRACT: string;
   DRAFT_DAY: string;
   DRAFT_HOUR_LOCAL: string;
   TIMEZONE: string;
   GITHUB_REPO: string;
+  /** Per-channel relay rate limit: max forwarded messages per hour (defaults to 30 if unset). */
+  RELAY_RATE_LIMIT_PER_HOUR?: string;
 
   // Secrets
   DISCORD_PUBLIC_KEY: string;

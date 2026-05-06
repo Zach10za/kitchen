@@ -13,8 +13,24 @@ export const RECIPE_DETAILS_SCHEMA = {
       },
     },
     steps: { type: 'array', items: { type: 'string' } },
+    // Frozen items the cook should defrost in advance. Lets us schedule
+    // defrost reminders without keyword-matching ingredient strings.
+    requires_defrost: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          /** The frozen ingredient name (lowercase, normalized to match pantry rows). */
+          item: { type: 'string' },
+          /** Hours of fridge defrost before cook time (≈12 for thin fish, 24 for chicken/beef cuts, 36-48 for larger roasts/turkey). */
+          hours: { type: 'integer' },
+        },
+        required: ['item', 'hours'],
+        additionalProperties: false,
+      },
+    },
   },
-  required: ['ingredients', 'steps'],
+  required: ['ingredients', 'steps', 'requires_defrost'],
   additionalProperties: false,
 } as const;
 

@@ -115,7 +115,14 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       });
     }
 
-    // Steps 2-4: only run if not already materialized
+    // Load pantry up front so materialization can populate requires_defrost
+    // against the actual freezer contents instead of guessing.
+    const pantry = await step.do('load-pantry', async () => {
+      const res = await stub.fetch('https://internal/workflow/get-pantry');
+      return (await res.json()) as { name: string; location?: string }[];
+    });
+    const freezerNames = pantry.filter((p) => p.location === 'freezer').map((p) => p.name);
+
     let materialized: MealSlot[] = draft.meals;
     let remindersScheduled = 0;
 
@@ -135,8 +142,13 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
             { retries: { limit: 2, delay: '2 seconds', backoff: 'linear' } },
             async (): Promise<MealSlot> => {
               if (meal.ingredients && meal.steps) return meal;
-              const details = await this.materializeOne(meal);
-              return { ...meal, ingredients: details.ingredients, steps: details.steps };
+              const details = await this.materializeOne(meal, freezerNames);
+              return {
+                ...meal,
+                ingredients: details.ingredients,
+                steps: details.steps,
+                requires_defrost: details.requires_defrost,
+              };
             }
           )
         )
@@ -158,11 +170,6 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
         interactionToken,
         `🔒 Plan approved for **${weekOf}**\n👨‍🍳 ${materialized.length} recipes ready\n🧊 ${remindersScheduled} defrost reminder(s) scheduled\n🛒 Building grocery list…`
       );
-    });
-
-    const pantry = await step.do('load-pantry', async () => {
-      const res = await stub.fetch('https://internal/workflow/get-pantry');
-      return (await res.json()) as { name: string }[];
     });
 
     // Per-recipe shopping lists in parallel. Wall-clock = max(per-recipe latency).
@@ -238,17 +245,20 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     });
   }
 
-  private async materializeOne(meal: MealSlot): Promise<RecipeDetails> {
+  private async materializeOne(meal: MealSlot, freezerNames: string[]): Promise<RecipeDetails> {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 180_000);
     try {
+      const freezerHint = freezerNames.length > 0
+        ? `\n\nThe user has these items in the freezer: ${freezerNames.join(', ')}. If your recipe uses any of them, list them in requires_defrost with sensible fridge-defrost hours. If none of your ingredients come from the freezer, return requires_defrost: [].`
+        : '\n\nThe user has nothing in the freezer. Return requires_defrost: [].';
       const response = await this.openai().responses.create(
         {
-          model: 'gpt-5-nano',
+          model: this.env.OPENAI_MODEL_EXTRACT,
           input: [
             {
               role: 'system',
-              content: 'Generate the ingredient list and ordered steps for the given dish, scaled to the requested serving count. Concrete quantities. 4-8 steps.',
+              content: `Generate the ingredient list and ordered steps for the given dish, scaled to the requested serving count. Concrete quantities. 4-8 steps. Also identify any ingredients that should be defrosted from frozen ahead of cook time, with realistic fridge-defrost hours (≈12 for thin fish/shrimp, 24 for chicken or beef cuts, 36-48 for larger roasts/turkey).${freezerHint}`,
             },
             {
               role: 'user',
@@ -280,7 +290,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     try {
       const response = await this.openai().responses.create(
         {
-          model: 'gpt-5-mini',
+          model: this.env.OPENAI_MODEL,
           input: [
             { role: 'system', content: SHOP_FOR_RECIPE_PROMPT },
             {
@@ -322,7 +332,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       const flat = lists.flat();
       const response = await this.openai().responses.create(
         {
-          model: 'gpt-5-mini',
+          model: this.env.OPENAI_MODEL,
           input: [
             { role: 'system', content: COMBINE_GROCERY_PROMPT },
             {

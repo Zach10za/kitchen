@@ -6,11 +6,17 @@ import type {
   MealStub,
   PantryItem,
   PreferenceRow,
-  WeekState,
 } from './tools';
 import { TOOLS } from './tools';
-import { buildSystemPrompt } from './prompts';
-import { renderPlan, renderRecipe } from './render';
+import { renderRecipe, renderPlan } from './render';
+import {
+  buildSystemPromptFor,
+  loadPantry,
+  loadPreferences,
+  loadProfile,
+  loadWeek,
+} from './context';
+import { MAX_TOOL_ROUNDS, runAgentRound } from './round';
 import type { WeekRow } from '../kitchen-do';
 import type { DiscordAPI } from '../discord/api';
 
@@ -25,8 +31,6 @@ export interface AgentResult {
   summary: string;
 }
 
-const MAX_TOOL_ROUNDS = 6;
-
 /**
  * Run one turn of the agent: append user message, loop Responses API tool
  * calls, persist conversation + tool results, return final assistant text.
@@ -40,55 +44,40 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
     weekOf, 'user', userMessage, Date.now()
   );
 
-  // Responses API input format: array of message + function_call + function_call_output items.
-  let input: any[] = [
-    { role: 'system', content: buildSystemPrompt(loadContext(sql, weekOf)) },
+  let messages: any[] = [
+    { role: 'system', content: buildSystemPromptFor(sql, weekOf) },
     ...recentConversation(sql, weekOf, 30),
     { role: 'user', content: userMessage },
   ];
 
+  const ctx: ToolCtx = { env, sql, client };
+
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const response = await client.responses.create({
+    const result = await runAgentRound({
+      client,
       model: env.OPENAI_MODEL,
-      input,
-      tools: toResponsesTools(TOOLS),
+      messages,
+      weekOf,
+      executeTool: (name, parsed) => executeTool(name, parsed, ctx),
+      onToolCall: async ({ name, args: parsed, output }) => {
+        sql.exec(
+          'INSERT INTO conversation (week_of, role, content, tool_call_json, ts) VALUES (?, ?, ?, ?, ?)',
+          weekOf, 'tool', output,
+          JSON.stringify({ name, args: parsed }),
+          Date.now()
+        );
+      },
     });
 
-    const toolCalls = response.output.filter((o: any) => o.type === 'function_call');
+    messages = result.newMessages;
 
-    if (toolCalls.length === 0) {
-      const finalText = response.output_text || '(no text)';
+    if (result.type === 'final') {
+      const finalText = result.finalText ?? '(no text)';
       sql.exec(
         'INSERT INTO conversation (week_of, role, content, ts) VALUES (?, ?, ?, ?)',
         weekOf, 'assistant', finalText, Date.now()
       );
       return { summary: finalText };
-    }
-
-    // Echo every output item back in original order. Reasoning items (rs_...)
-    // must accompany their paired function_call items or the next request
-    // 400s with "function_call ... was provided without its required
-    // 'reasoning' item".
-    for (const item of response.output as any[]) input.push(item);
-
-    // Execute each tool and append its function_call_output.
-    for (const toolCall of toolCalls as any[]) {
-      const result = await executeTool(
-        toolCall.name,
-        JSON.parse(toolCall.arguments),
-        { env, sql, client }
-      );
-      sql.exec(
-        'INSERT INTO conversation (week_of, role, content, tool_call_json, ts) VALUES (?, ?, ?, ?, ?)',
-        weekOf, 'tool', result,
-        JSON.stringify({ name: toolCall.name, args: toolCall.arguments }),
-        Date.now()
-      );
-      input.push({
-        type: 'function_call_output',
-        call_id: toolCall.call_id,
-        output: result,
-      });
     }
   }
 
@@ -123,73 +112,12 @@ function makeClient(env: Env): OpenAI {
 
 export interface ToolCtx { env: Env; sql: SqlStorage; client: OpenAI }
 
-function loadContext(sql: SqlStorage, weekOf: string) {
-  return {
-    plan: loadWeek(sql, weekOf),
-    preferences: loadPreferences(sql),
-    pantry: loadPantry(sql),
-    recentMeals: loadRecentMeals(sql, weekOf, 14), // 2 weeks of history
-    profile: loadProfile(sql),
-  };
-}
-
-function loadProfile(sql: SqlStorage): string | null {
-  const row = sql
-    .exec<{ value: string }>("SELECT value FROM settings WHERE key = 'cooking_profile'")
-    .toArray()[0];
-  return row?.value ?? null;
-}
-
-/**
- * Recent meals from prior weeks, used to discourage repetition. Pulls only
- * approved or in-progress weeks; ignores still-draft weeks.
- */
-function loadRecentMeals(
-  sql: SqlStorage,
-  excludeWeekOf: string,
-  daysBack: number
-): { weekOf: string; day: string; name: string; cuisine: string }[] {
-  const cutoff = Date.now() - daysBack * 86_400_000;
-  const rows = sql.exec<WeekRow>(
-    "SELECT * FROM weeks WHERE week_of != ? AND drafted_at >= ? AND status IN ('approved', 'in_progress') ORDER BY week_of DESC LIMIT 4",
-    excludeWeekOf, cutoff
-  ).toArray();
-  const out: { weekOf: string; day: string; name: string; cuisine: string }[] = [];
-  for (const row of rows) {
-    const meals = JSON.parse(row.meals_json) as MealSlot[];
-    for (const m of meals) {
-      out.push({ weekOf: row.week_of, day: m.day, name: m.name, cuisine: m.cuisine });
-    }
-  }
-  return out;
-}
-
-function loadWeek(sql: SqlStorage, weekOf: string): WeekState | null {
-  const row = sql.exec<WeekRow>('SELECT * FROM weeks WHERE week_of = ?', weekOf).toArray()[0];
-  if (!row) return null;
-  return {
-    week_of: row.week_of,
-    status: row.status,
-    drafted_at: row.drafted_at,
-    approved_at: row.approved_at,
-    meals: JSON.parse(row.meals_json) as MealSlot[],
-    constraints: JSON.parse(row.constraints_json) as string[],
-  };
-}
-
-function loadPreferences(sql: SqlStorage): PreferenceRow[] {
-  return sql.exec<PreferenceRow>('SELECT * FROM preferences ORDER BY weight DESC, learned_at DESC LIMIT 25').toArray();
-}
-
-function loadPantry(sql: SqlStorage): PantryItem[] {
-  return sql.exec<PantryItem>('SELECT * FROM pantry ORDER BY added_at DESC').toArray();
-}
-
+/** Conversation history shaped for the Responses API `input` array. */
 function recentConversation(
   sql: SqlStorage,
   weekOf: string,
   limit: number
-): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+): { role: 'user' | 'assistant'; content: string }[] {
   const rows = sql.exec<{ role: string; content: string }>(
     'SELECT role, content FROM conversation WHERE week_of = ? AND role IN (?, ?) ORDER BY id DESC LIMIT ?',
     weekOf, 'user', 'assistant', limit
@@ -558,13 +486,35 @@ function toolMarkMealSkipped(
   return `Marked ${args.day} skipped. Pantry items remain available.`;
 }
 
-/** Parse a quantity string like "1 lb", "2 cups", "8 oz" into structured form. */
-function parseQty(raw: string): { value: number; unit: string } | null {
-  const match = raw.trim().toLowerCase().match(/^([\d.]+)\s*([a-z]+)/);
-  if (!match || !match[1] || !match[2]) return null;
-  const value = parseFloat(match[1]);
-  if (Number.isNaN(value)) return null;
-  return { value, unit: match[2] };
+/**
+ * Parse a quantity string into structured form. Handles:
+ *   "1 lb"        -> { value: 1, unit: 'lb' }
+ *   "1.5 lb"      -> { value: 1.5, unit: 'lb' }
+ *   "1/2 cup"     -> { value: 0.5, unit: 'cup' }
+ *   "1 1/2 cups"  -> { value: 1.5, unit: 'cups' }
+ *   "a pinch"     -> null  (caller treats pantry row as boolean)
+ */
+export function parseQty(raw: string): { value: number; unit: string } | null {
+  const trimmed = raw.trim().toLowerCase();
+  const mixed = trimmed.match(/^(\d+)\s+(\d+)\/(\d+)\s+([a-z]+)/);
+  if (mixed) {
+    const den = Number(mixed[3]);
+    if (den === 0) return null;
+    return { value: Number(mixed[1]) + Number(mixed[2]) / den, unit: mixed[4]! };
+  }
+  const frac = trimmed.match(/^(\d+)\/(\d+)\s+([a-z]+)/);
+  if (frac) {
+    const den = Number(frac[2]);
+    if (den === 0) return null;
+    return { value: Number(frac[1]) / den, unit: frac[3]! };
+  }
+  const decimal = trimmed.match(/^([\d.]+)\s*([a-z]+)/);
+  if (decimal) {
+    const value = parseFloat(decimal[1]!);
+    if (Number.isNaN(value)) return null;
+    return { value, unit: decimal[2]! };
+  }
+  return null;
 }
 
 function toolUpdateProfile(args: { content: string }, ctx: ToolCtx): string {
@@ -617,18 +567,14 @@ export async function runDraftFlow(args: {
   const client = makeClient(env);
   const ctx: ToolCtx = { env, sql, client };
 
-  // Step 1: announce
   await discord.editOriginal(
     interactionToken,
     `📝 Drafting plan for week of **${weekOf}**…\n_(one LLM call to plan all 7 meals — about 10-15s)_`
   );
 
-  // Step 2: generate
   const constraints = notes ? [notes] : [];
   const result = await toolGenerateDraft({ week_of: weekOf, constraints }, ctx);
-  // result string includes the meal list
 
-  // Step 3: render the new plan and reply
   const week = sql
     .exec<WeekRow>('SELECT * FROM weeks WHERE week_of = ?', weekOf)
     .toArray()[0];
@@ -651,8 +597,7 @@ export async function runDraftFlow(args: {
 
 /**
  * Direct (non-agent) /pantry flow. Parses the user's free-text into structured
- * inventory items via one LLM call (json_schema, gpt-5-nano), inserts them,
- * confirms in Discord. ~1-2s vs ~5-10s through the agent.
+ * inventory items via one LLM call, inserts them, confirms in Discord.
  */
 const PANTRY_PARSE_SCHEMA = {
   type: 'object',
@@ -695,9 +640,9 @@ export async function runPantryFlow(args: {
   const { env, sql, discord, interactionToken, userMessage } = args;
   const client = makeClient(env);
 
-  // Use gpt-5-nano for pure extraction — much faster than mini, no creativity needed.
+  // Use the configured extract model — pure structured-output, no creativity needed.
   const response = await client.responses.create({
-    model: 'gpt-5-nano',
+    model: env.OPENAI_MODEL_EXTRACT,
     input: [
       {
         role: 'system',
@@ -741,7 +686,6 @@ export async function runPantryFlow(args: {
     }
   }
 
-  // Build confirmation grouped by action + location.
   const added = parsed.items.filter((i) => i.action === 'add');
   const removed = parsed.items.filter((i) => i.action === 'remove');
   const lines: string[] = [];
@@ -764,4 +708,3 @@ export async function runPantryFlow(args: {
   const reply = lines.length > 0 ? lines.join('\n') : 'No items parsed from that input.';
   await discord.editOriginal(interactionToken, reply);
 }
-

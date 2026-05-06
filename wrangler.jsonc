@@ -69,11 +69,19 @@
 
   // Public env (non-secret). Secrets go via `wrangler secret put`.
   "vars": {
+    // Planner / steering model — strongest reasoning we use.
     "OPENAI_MODEL": "gpt-5-mini",
+    // Pure structured-output extraction (pantry parse, recipe materialize).
+    // Cheap + fast; no creativity needed.
+    "OPENAI_MODEL_EXTRACT": "gpt-5-nano",
+    // Cheap, fast model for one-shot title generation in error triage.
+    "OPENAI_MODEL_FAST": "gpt-5-nano",
     "DRAFT_DAY": "fri",
     "DRAFT_HOUR_LOCAL": "18",
     "TIMEZONE": "America/Los_Angeles",
-    "GITHUB_REPO": "Zach10za/kitchen"
+    "GITHUB_REPO": "Zach10za/kitchen",
+    // Per-channel /relay/message rate limit, in messages per rolling hour.
+    "RELAY_RATE_LIMIT_PER_HOUR": "30"
   }
 
   // Secrets to set with `wrangler secret put`:

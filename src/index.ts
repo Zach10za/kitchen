@@ -45,7 +45,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   // Discord Gateway relay (running on Fly.io) forwards plain-text messages
   // to here via shared-secret HTTPS. We spawn a SteerWorkflow with viaChat=true.
   if (url.pathname === '/relay/message' && request.method === 'POST') {
-    if (request.headers.get('x-relay-secret') !== env.RELAY_SECRET) {
+    if (!relaySecretValid(request, env)) {
       return new Response('forbidden', { status: 403 });
     }
     const body = (await request.json()) as {
@@ -55,6 +55,17 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     };
     if (!body.channelId || !body.userMessage) {
       return new Response('bad request', { status: 400 });
+    }
+
+    // Per-channel hourly rate limit. The DO is the single source of truth for
+    // this, so a compromised relay can't drive unlimited LLM spend.
+    const stub = getKitchenStub(env);
+    const rateRes = await stub.fetch('https://internal/relay-allowed', {
+      method: 'POST',
+      body: JSON.stringify({ channelId: body.channelId }),
+    });
+    if (!rateRes.ok) {
+      return new Response('rate limited', { status: 429 });
     }
 
     ctx.waitUntil(
@@ -209,4 +220,16 @@ function checkAdmin(request: Request, env: Env): boolean {
 function validateWeekOf(input: string | null): string | null {
   if (!input) return null;
   return /^\d{4}-\d{2}-\d{2}$/.test(input) ? input : null;
+}
+
+/** Constant-time-ish check for the shared relay secret. */
+function relaySecretValid(request: Request, env: Env): boolean {
+  const got = request.headers.get('x-relay-secret') ?? '';
+  const expected = env.RELAY_SECRET ?? '';
+  if (!expected || got.length !== expected.length) return false;
+  let result = 0;
+  for (let i = 0; i < got.length; i++) {
+    result |= got.charCodeAt(i) ^ expected.charCodeAt(i);
+  }
+  return result === 0;
 }

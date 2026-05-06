@@ -1,9 +1,8 @@
 import { WorkflowEntrypoint, type WorkflowStep, type WorkflowEvent } from 'cloudflare:workers';
 import OpenAI from 'openai';
 import type { Env } from '../env';
-import { TOOLS } from '../agent/tools';
-import { toResponsesTools } from '../agent/loop';
 import { DiscordAPI } from '../discord/api';
+import { MAX_TOOL_ROUNDS, runAgentRound, type RoundResult } from '../agent/round';
 
 interface SteerParams {
   weekOf: string;
@@ -14,8 +13,6 @@ interface SteerParams {
   channelId?: string;
   viaChat?: boolean;
 }
-
-const MAX_TOOL_ROUNDS = 6;
 
 // Discord's /typing call shows the indicator for ~10s. Refresh well before it
 // expires so the indicator stays continuously visible while real work runs.
@@ -49,14 +46,8 @@ async function withTypingRefresh<T>(
   }
 }
 
-interface AgentTurnResult {
-  type: 'final' | 'continue';
-  finalText?: string;
-  // Full new input array (Responses API: messages + function_call +
-  // function_call_output items). Returned as the FULL array so workflow
-  // replay sees a self-contained cached result.
-  newMessages: any[];
-}
+// RoundResult from agent/round provides the same shape; alias kept for clarity.
+type AgentTurnResult = RoundResult;
 
 /**
  * Durable /steer flow. Each agent loop iteration is its own step with its own
@@ -176,60 +167,38 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
   /**
    * One round of the agent loop using OpenAI's Responses API.
    * Designed to be wrapped in step.do for automatic retries on transient failures.
+   *
+   * Tool execution + per-tool turn persistence both run inside the DO via
+   * /workflow/exec-tool and /workflow/save-turn — that keeps the SQL writes
+   * transactional with the running tool and avoids exposing SqlStorage to
+   * the workflow runtime.
    */
   private async runOneRound(messages: any[], weekOf: string): Promise<AgentTurnResult> {
-    const client = this.openai();
     const stub = this.kitchen();
-
-    const response = await client.responses.create({
+    return runAgentRound({
+      client: this.openai(),
       model: this.env.OPENAI_MODEL,
-      input: messages,
-      tools: toResponsesTools(TOOLS),
+      messages,
+      weekOf,
+      executeTool: async (name, args) => {
+        const res = await stub.fetch('https://internal/workflow/exec-tool', {
+          method: 'POST',
+          body: JSON.stringify({ name, args }),
+        });
+        return await res.text();
+      },
+      onToolCall: async ({ name, args, output }) => {
+        await stub.fetch('https://internal/workflow/save-turn', {
+          method: 'POST',
+          body: JSON.stringify({
+            week_of: weekOf,
+            role: 'tool',
+            content: output,
+            tool_call_json: JSON.stringify({ name, args }),
+          }),
+        });
+      },
     });
-
-    const toolCalls = response.output.filter((o: any) => o.type === 'function_call');
-
-    if (toolCalls.length === 0) {
-      const finalText = response.output_text || '(no text)';
-      const newMessages = [...messages, ...response.output];
-      return { type: 'final', finalText, newMessages };
-    }
-
-    // Echo every output item back in original order. Reasoning items (rs_...)
-    // must accompany their paired function_call items or the next request
-    // 400s with "function_call ... was provided without its required
-    // 'reasoning' item". Then append function_call_outputs from tool execution.
-    const newMessages: any[] = [...messages, ...response.output];
-
-    for (const toolCall of toolCalls as any[]) {
-      const args = JSON.parse(toolCall.arguments);
-      if (!('week_of' in args) && needsWeekOf(toolCall.name)) {
-        args.week_of = weekOf;
-      }
-      const res = await stub.fetch('https://internal/workflow/exec-tool', {
-        method: 'POST',
-        body: JSON.stringify({ name: toolCall.name, args }),
-      });
-      const content = await res.text();
-      newMessages.push({
-        type: 'function_call_output',
-        call_id: toolCall.call_id,
-        output: content,
-      });
-
-      // Persist the tool turn for visibility / debugging in /admin/dump.
-      await stub.fetch('https://internal/workflow/save-turn', {
-        method: 'POST',
-        body: JSON.stringify({
-          week_of: weekOf,
-          role: 'tool',
-          content,
-          tool_call_json: JSON.stringify({ name: toolCall.name, args }),
-        }),
-      });
-    }
-
-    return { type: 'continue', newMessages };
   }
 
   private kitchen() {
@@ -245,18 +214,4 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
       maxRetries: 1,
     });
   }
-}
-
-function needsWeekOf(toolName: string): boolean {
-  return [
-    'generate_draft',
-    'swap_meal',
-    'adjust_servings',
-    'reschedule_meal',
-    'approve_plan',
-    'generate_grocery_list',
-    'mark_meal_cooked',
-    'mark_meal_skipped',
-    'show_state',
-  ].includes(toolName);
 }
