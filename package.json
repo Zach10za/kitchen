@@ -11,12 +11,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "openai": "^6.30.0"
+    "openai": "^6.36.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260430.0",
-    "@types/node": "^22.0.0",
-    "typescript": "^5.7.0",
-    "wrangler": "^4.87.0"
+    "@cloudflare/workers-types": "^4.20260506.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.88.0"
   }
 }
