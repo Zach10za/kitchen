@@ -62,9 +62,18 @@
   // console.* call and uncaught exception. head_sampling_rate=1 keeps 100%
   // of requests; lower it (e.g. 0.1) if volume gets noisy. Free tier retains
   // logs for 7 days.
+  //
+  // Workers Traces — distributed tracing of every request through fetch /
+  // alarm / scheduled handlers, with spans for DO calls, sub-fetches, and
+  // Workflow steps. Currently enabled separately; Cloudflare plans to fold
+  // this into observability.enabled in a future compatibility date.
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1
+    "head_sampling_rate": 1,
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
   },
 
   // Public env (non-secret). Secrets go via `wrangler secret put`.
