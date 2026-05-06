@@ -32,10 +32,9 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 /**
- * Build the plan embed. One embed, seven inline fields (Mon..Sun) — Discord
- * lays inline fields out in rows of 3, so the layout is 3 + 3 + 1 = a clean
- * mini-calendar. Cuisine + time + status live in the field value as a small
- * stat block.
+ * Build the plan embed. One field per day, stacked top-to-bottom as a clear
+ * weekly timeline. Day label + dish name go in the field name; cuisine, time,
+ * effort, description, and per-meal notes live in the value.
  */
 export function planEmbed(week: WeekRow, opts?: { includeFooterHint?: boolean }): Embed {
   const meals = JSON.parse(week.meals_json) as MealSlot[];
@@ -52,7 +51,7 @@ export function planEmbed(week: WeekRow, opts?: { includeFooterHint?: boolean })
           ].filter(Boolean).join('\n'),
           1000
         ),
-        inline: true,
+        inline: false,
       }));
 
   const description = [
