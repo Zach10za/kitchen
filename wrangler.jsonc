@@ -58,6 +58,15 @@
     "binding": "AI"
   },
 
+  // Workers Logs — populates the dashboard's Observability tab with every
+  // console.* call and uncaught exception. head_sampling_rate=1 keeps 100%
+  // of requests; lower it (e.g. 0.1) if volume gets noisy. Free tier retains
+  // logs for 7 days.
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+
   // Public env (non-secret). Secrets go via `wrangler secret put`.
   "vars": {
     "OPENAI_MODEL": "gpt-5-mini",
