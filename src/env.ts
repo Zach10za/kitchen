@@ -10,6 +10,7 @@ export interface Env {
   DRAFT_DAY: string;
   DRAFT_HOUR_LOCAL: string;
   TIMEZONE: string;
+  GITHUB_REPO: string;
 
   // Secrets
   DISCORD_PUBLIC_KEY: string;
@@ -21,4 +22,5 @@ export interface Env {
   AI_GATEWAY_URL: string;
   RELAY_SECRET: string;
   ADMIN_TOKEN: string;
+  GITHUB_TOKEN: string;
 }

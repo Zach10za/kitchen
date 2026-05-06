@@ -6,6 +6,7 @@ import { runAgent, runDraftFlow, runPantryFlow, executeTool, type ToolCtx } from
 import { buildSystemPrompt } from './agent/prompts';
 import { renderPlan } from './agent/render';
 import { currentOrNextMondayISO, nextMondayISO, nextDraftTime, mealCookTime } from './util/datetime';
+import { captureError } from './error-triage';
 import OpenAI from 'openai';
 
 /**
@@ -38,6 +39,14 @@ export class KitchenDO extends DurableObject<Env> {
       this.ctx.waitUntil(
         this.handleInteraction(interaction).catch(async (err) => {
           console.error('handleInteraction failed', err);
+          await captureError(this.env, err, {
+            source: `interaction:${interaction.data?.name ?? 'unknown'}`,
+            tags: {
+              interaction_type: interaction.type,
+              channel_id: interaction.channel_id,
+              guild_id: interaction.guild_id,
+            },
+          });
           await this.discord
             .followUp(interaction.token, `Something broke: ${(err as Error).message}`)
             .catch(() => {});
@@ -333,6 +342,10 @@ export class KitchenDO extends DurableObject<Env> {
         this.sql.exec('UPDATE reminders SET sent_at = ? WHERE id = ?', now, reminder.id);
       } catch (err) {
         console.error('reminder dispatch failed', { id: reminder.id, err });
+        await captureError(this.env, err, {
+          source: 'reminders:dispatch',
+          tags: { reminder_id: reminder.id },
+        });
         // Leave sent_at NULL so we retry on the next heartbeat.
       }
     }

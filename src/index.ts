@@ -2,6 +2,7 @@ import type { Env } from './env';
 import { verifyDiscordRequest } from './discord/verify';
 import { InteractionType, InteractionResponseType, type Interaction } from './discord/types';
 import { currentOrNextMondayISO } from './util/datetime';
+import { captureError } from './error-triage';
 
 export { KitchenDO } from './kitchen-do';
 export { ApproveWorkflow } from './workflows/approve';
@@ -9,91 +10,101 @@ export { SteerWorkflow } from './workflows/steer';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-
-    // Discord posts all interactions to /interactions
-    if (url.pathname === '/interactions' && request.method === 'POST') {
-      return handleDiscordInteraction(request, env, ctx);
+    try {
+      return await route(request, env, ctx);
+    } catch (err) {
+      // Top-level safety net for throws outside the route's explicit handlers.
+      ctx.waitUntil(captureError(env, err, { source: 'fetch:uncaught', tags: { url: request.url } }));
+      throw err;
     }
-
-    // Health check
-    if (url.pathname === '/health') {
-      return new Response('ok');
-    }
-
-    // Discord Gateway relay (running on Fly.io) forwards plain-text messages
-    // to here via shared-secret HTTPS. We spawn a SteerWorkflow with viaChat=true.
-    if (url.pathname === '/relay/message' && request.method === 'POST') {
-      if (request.headers.get('x-relay-secret') !== env.RELAY_SECRET) {
-        return new Response('forbidden', { status: 403 });
-      }
-      const body = (await request.json()) as {
-        channelId: string;
-        userMessage: string;
-        author?: string;
-      };
-      if (!body.channelId || !body.userMessage) {
-        return new Response('bad request', { status: 400 });
-      }
-
-      ctx.waitUntil(
-        env.STEER_WORKFLOW.create({
-          params: {
-            weekOf: currentOrNextMondayISO(env.TIMEZONE),
-            channelId: body.channelId,
-            userMessage: body.userMessage,
-            viaChat: true,
-          },
-        })
-      );
-
-      return Response.json({ ok: true });
-    }
-
-    // Admin endpoints. All gated on a separate ADMIN_TOKEN secret (NOT the
-    // bot token, which is a live production credential), supplied via the
-    // Authorization header so it doesn't leak through CDN/proxy access logs.
-    //
-    // Usage:
-    //   curl -H "Authorization: Bearer $ADMIN_TOKEN" https://.../admin/dump
-    //   curl -H "Authorization: Bearer $ADMIN_TOKEN" -X POST https://.../admin/reset
-    if (url.pathname.startsWith('/admin/')) {
-      if (!checkAdmin(request, env)) {
-        return new Response('forbidden', { status: 403 });
-      }
-      const stub = getKitchenStub(env);
-
-      if (url.pathname === '/admin/dump' && request.method === 'GET') {
-        return stub.fetch('https://internal/dump');
-      }
-      if (url.pathname === '/admin/reset' && request.method === 'POST') {
-        return stub.fetch('https://internal/reset', { method: 'POST' });
-      }
-      if (url.pathname === '/admin/grocery' && request.method === 'GET') {
-        const weekOf = validateWeekOf(url.searchParams.get('week_of'));
-        if (!weekOf) return new Response('invalid week_of', { status: 400 });
-        return stub.fetch(`https://internal/get-grocery?week_of=${weekOf}`);
-      }
-      if (url.pathname === '/admin/clear-grocery' && request.method === 'POST') {
-        const weekOf = validateWeekOf(url.searchParams.get('week_of'));
-        if (!weekOf) return new Response('invalid week_of', { status: 400 });
-        return stub.fetch(`https://internal/clear-grocery?week_of=${weekOf}`, { method: 'POST' });
-      }
-      return new Response('not found', { status: 404 });
-    }
-
-    return new Response('not found', { status: 404 });
   },
 
   /**
    * Cron heartbeat: pings KitchenDO (re-arms alarms, dispatches reminders).
    * Runs hourly. The Discord Gateway connection lives on Fly.io now.
    */
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const kitchen = getKitchenStub(env);
     ctx.waitUntil(kitchen.fetch('https://internal/heartbeat', { method: 'POST' }));
   },
-};
+} satisfies ExportedHandler<Env>;
+
+async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const url = new URL(request.url);
+
+  // Discord posts all interactions to /interactions
+  if (url.pathname === '/interactions' && request.method === 'POST') {
+    return handleDiscordInteraction(request, env, ctx);
+  }
+
+  // Health check
+  if (url.pathname === '/health') {
+    return new Response('ok');
+  }
+
+  // Discord Gateway relay (running on Fly.io) forwards plain-text messages
+  // to here via shared-secret HTTPS. We spawn a SteerWorkflow with viaChat=true.
+  if (url.pathname === '/relay/message' && request.method === 'POST') {
+    if (request.headers.get('x-relay-secret') !== env.RELAY_SECRET) {
+      return new Response('forbidden', { status: 403 });
+    }
+    const body = (await request.json()) as {
+      channelId: string;
+      userMessage: string;
+      author?: string;
+    };
+    if (!body.channelId || !body.userMessage) {
+      return new Response('bad request', { status: 400 });
+    }
+
+    ctx.waitUntil(
+      env.STEER_WORKFLOW.create({
+        params: {
+          weekOf: currentOrNextMondayISO(env.TIMEZONE),
+          channelId: body.channelId,
+          userMessage: body.userMessage,
+          viaChat: true,
+        },
+      })
+    );
+
+    return Response.json({ ok: true });
+  }
+
+  // Admin endpoints. All gated on a separate ADMIN_TOKEN secret (NOT the
+  // bot token, which is a live production credential), supplied via the
+  // Authorization header so it doesn't leak through CDN/proxy access logs.
+  //
+  // Usage:
+  //   curl -H "Authorization: Bearer $ADMIN_TOKEN" https://.../admin/dump
+  //   curl -H "Authorization: Bearer $ADMIN_TOKEN" -X POST https://.../admin/reset
+  if (url.pathname.startsWith('/admin/')) {
+    if (!checkAdmin(request, env)) {
+      return new Response('forbidden', { status: 403 });
+    }
+    const stub = getKitchenStub(env);
+
+    if (url.pathname === '/admin/dump' && request.method === 'GET') {
+      return stub.fetch('https://internal/dump');
+    }
+    if (url.pathname === '/admin/reset' && request.method === 'POST') {
+      return stub.fetch('https://internal/reset', { method: 'POST' });
+    }
+    if (url.pathname === '/admin/grocery' && request.method === 'GET') {
+      const weekOf = validateWeekOf(url.searchParams.get('week_of'));
+      if (!weekOf) return new Response('invalid week_of', { status: 400 });
+      return stub.fetch(`https://internal/get-grocery?week_of=${weekOf}`);
+    }
+    if (url.pathname === '/admin/clear-grocery' && request.method === 'POST') {
+      const weekOf = validateWeekOf(url.searchParams.get('week_of'));
+      if (!weekOf) return new Response('invalid week_of', { status: 400 });
+      return stub.fetch(`https://internal/clear-grocery?week_of=${weekOf}`, { method: 'POST' });
+    }
+    return new Response('not found', { status: 404 });
+  }
+
+  return new Response('not found', { status: 404 });
+}
 
 async function handleDiscordInteraction(
   request: Request,
@@ -199,4 +210,3 @@ function validateWeekOf(input: string | null): string | null {
   if (!input) return null;
   return /^\d{4}-\d{2}-\d{2}$/.test(input) ? input : null;
 }
-

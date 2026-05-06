@@ -1,0 +1,105 @@
+name: Auto-fix issue with Codex
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: auto-fix-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: |
+      (github.event_name == 'issues' && github.event.label.name == 'auto-fix') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && contains(github.event.comment.body, '@codex'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.issue.pull_request && format('refs/pull/{0}/head', github.event.issue.number) || github.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - run: bun install --frozen-lockfile
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Capture issue context to files
+        id: ctx
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          IS_PR_COMMENT: ${{ github.event_name == 'issue_comment' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .codex
+          printf '%s' "$ISSUE_TITLE" > .codex/title.txt
+          printf '%s' "$ISSUE_BODY" > .codex/body.md
+          printf '%s' "$COMMENT_BODY" > .codex/comment.md
+          echo "issue_number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "is_pr=$IS_PR_COMMENT" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git
+        run: |
+          git config user.name 'codex-bot'
+          git config user.email 'codex-bot@users.noreply.github.com'
+
+      - name: Run Codex (initial fix on issue)
+        if: steps.ctx.outputs.is_pr == 'false'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ISSUE_NUMBER: ${{ steps.ctx.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          BRANCH="auto-fix/issue-${ISSUE_NUMBER}"
+          git checkout -b "$BRANCH"
+
+          PROMPT='You are fixing a production bug reported by Sentry. The bug details are in the files .codex/title.txt and .codex/body.md (read them first). Your job: 1) Read the issue title and body. The stack trace is in the body. 2) Locate the root cause in the codebase. 3) Make the minimal correct fix. No surrounding cleanup or refactors. 4) Run `bun run typecheck`. The fix must compile. 5) If the bug needs external API research, fetch relevant docs. 6) Stage and commit with a message describing the fix. Do NOT push — the workflow does that.'
+
+          codex exec --model gpt-5-mini --full-auto --skip-git-repo-check "$PROMPT"
+
+          git push -u origin "$BRANCH"
+
+      - name: Open PR
+        if: steps.ctx.outputs.is_pr == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ steps.ctx.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          BRANCH="auto-fix/issue-${ISSUE_NUMBER}"
+          # Title sourced from a file we wrote with printf — no shell interpolation of untrusted input.
+          TITLE_PREFIX="Auto-fix: "
+          TITLE_REST="$(head -c 80 .codex/title.txt)"
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "${TITLE_PREFIX}${TITLE_REST}" \
+            --body "Automated fix attempt by Codex CLI for issue #${ISSUE_NUMBER}.\n\nReply with \`@codex <feedback>\` on this PR to iterate.\n\nCloses #${ISSUE_NUMBER}"
+
+      - name: Run Codex (iterate on PR feedback)
+        if: steps.ctx.outputs.is_pr == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          PROMPT='A reviewer left feedback on this PR. Their comment is in .codex/comment.md. The original issue context is in .codex/title.txt and .codex/body.md. Read the comment, make the requested change, run `bun run typecheck`, then commit with a message summarizing the change. Do NOT push — the workflow handles that.'
+
+          codex exec --model gpt-5-mini --full-auto --skip-git-repo-check "$PROMPT"
+
+          git push

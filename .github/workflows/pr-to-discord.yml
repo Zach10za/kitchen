@@ -1,0 +1,43 @@
+name: Notify Discord on PR activity
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+      - name: Post to Discord
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_PR_WEBHOOK_URL }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT: ${{ github.event_name }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            HEADER="New PR opened by ${PR_AUTHOR}"
+          else
+            HEADER="Review ${REVIEW_STATE} on PR by ${PR_AUTHOR}"
+          fi
+          # jq -n emits JSON with proper quoting; all untrusted fields are
+          # passed in via --arg and never inlined into the shell command.
+          PAYLOAD=$(jq -nc \
+            --arg header "$HEADER" \
+            --arg title "$PR_TITLE" \
+            --arg url "$PR_URL" \
+            --arg num "#${PR_NUMBER}" \
+            '{content: ($header + "\n" + $num + " " + $title + "\n" + $url)}')
+          curl -fsS -X POST \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD" \
+            "$WEBHOOK_URL"

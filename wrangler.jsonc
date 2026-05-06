@@ -63,7 +63,8 @@
     "OPENAI_MODEL": "gpt-5-mini",
     "DRAFT_DAY": "fri",
     "DRAFT_HOUR_LOCAL": "18",
-    "TIMEZONE": "America/Los_Angeles"
+    "TIMEZONE": "America/Los_Angeles",
+    "GITHUB_REPO": "Zach10za/kitchen"
   }
 
   // Secrets to set with `wrangler secret put`:
@@ -75,4 +76,7 @@
   //   OPENAI_API_KEY          — your OpenAI key
   //   AI_GATEWAY_URL          — e.g. https://gateway.ai.cloudflare.com/v1/<acct>/kitchen/openai
   //   RELAY_SECRET            — shared secret with the Fly.io gateway-relay
+  //   ADMIN_TOKEN             — bearer token for /admin/* endpoints
+  //   GITHUB_TOKEN            — fine-grained PAT with Issues:write on this repo
+  //                             (used by error-triage to file auto-fix issues)
 }
