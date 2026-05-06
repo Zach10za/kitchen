@@ -55,10 +55,8 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
     });
 
     const toolCalls = response.output.filter((o: any) => o.type === 'function_call');
-    const messageOutput = response.output.find((o: any) => o.type === 'message');
 
     if (toolCalls.length === 0) {
-      // No tool calls — final message.
       const finalText = response.output_text || '(no text)';
       sql.exec(
         'INSERT INTO conversation (week_of, role, content, ts) VALUES (?, ?, ?, ?)',
@@ -67,10 +65,11 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
       return { summary: finalText };
     }
 
-    // Append the model's outputs (message if present, then function calls)
-    // verbatim to the input array so the next round sees them.
-    if (messageOutput) input.push(messageOutput);
-    for (const tc of toolCalls) input.push(tc);
+    // Echo every output item back in original order. Reasoning items (rs_...)
+    // must accompany their paired function_call items or the next request
+    // 400s with "function_call ... was provided without its required
+    // 'reasoning' item".
+    for (const item of response.output as any[]) input.push(item);
 
     // Execute each tool and append its function_call_output.
     for (const toolCall of toolCalls as any[]) {

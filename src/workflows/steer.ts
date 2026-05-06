@@ -148,21 +148,18 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
     });
 
     const toolCalls = response.output.filter((o: any) => o.type === 'function_call');
-    const messageOutput = response.output.find((o: any) => o.type === 'message');
 
     if (toolCalls.length === 0) {
       const finalText = response.output_text || '(no text)';
-      const newMessages = [...messages];
-      if (messageOutput) newMessages.push(messageOutput);
+      const newMessages = [...messages, ...response.output];
       return { type: 'final', finalText, newMessages };
     }
 
-    // Append message (if present) + each function_call to the input array,
-    // then execute each tool and append its function_call_output. Tools
-    // mutate SQL inside the DO via /workflow/exec-tool.
-    const newMessages: any[] = [...messages];
-    if (messageOutput) newMessages.push(messageOutput);
-    for (const tc of toolCalls) newMessages.push(tc);
+    // Echo every output item back in original order. Reasoning items (rs_...)
+    // must accompany their paired function_call items or the next request
+    // 400s with "function_call ... was provided without its required
+    // 'reasoning' item". Then append function_call_outputs from tool execution.
+    const newMessages: any[] = [...messages, ...response.output];
 
     for (const toolCall of toolCalls as any[]) {
       const args = JSON.parse(toolCall.arguments);
