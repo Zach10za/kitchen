@@ -77,12 +77,12 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
     const stub = this.kitchen();
 
     // Helper that posts the final reply via the right Discord channel.
+    // DiscordAPI auto-chunks content over the 2000-char limit.
     const postReply = async (text: string): Promise<void> => {
-      const truncated = text.slice(0, 2000);
       if (viaChat && channelId) {
-        await discord.postMessage(channelId, truncated);
+        await discord.postMessage(channelId, text);
       } else if (interactionToken) {
-        await discord.editOriginal(interactionToken, truncated);
+        await discord.editOriginal(interactionToken, text);
       }
     };
 
