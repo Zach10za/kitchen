@@ -140,10 +140,12 @@ async function handleDiscordInteraction(
       method: 'POST',
       body: JSON.stringify(interaction),
     });
-    const content = await res.text();
+    // /fast-read returns a {content?, embeds?} payload as JSON so we can
+    // forward embeds through the immediate Discord interaction response.
+    const payload = (await res.json()) as { content?: string; embeds?: unknown[] };
     return Response.json({
       type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: { content, allowed_mentions: { parse: [] } },
+      data: { ...payload, allowed_mentions: { parse: [] } },
     });
   }
 

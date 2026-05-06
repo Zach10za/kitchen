@@ -4,7 +4,8 @@ import type { Env } from '../env';
 import type { GroceryItem, MealSlot, RecipeDetails } from '../agent/tools';
 import { GROCERY_SCHEMA, RECIPE_DETAILS_SCHEMA } from '../agent/schemas';
 import { DiscordAPI } from '../discord/api';
-import { renderPlan, renderGroceryList } from '../agent/render';
+import { planEmbed, groceryEmbeds } from '../agent/render';
+import { EmbedColor } from '../discord/types';
 
 interface ApproveParams {
   weekOf: string;
@@ -82,10 +83,13 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
 
     if (!draft) {
       await step.do('post-no-draft', async () => {
-        await discord.editOriginal(
-          interactionToken,
-          `No plan found for ${weekOf}. Use \`/draft\` to create one first.`
-        );
+        await discord.editOriginal(interactionToken, {
+          embeds: [{
+            title: '⚠️ No draft to approve',
+            description: `No plan found for **${weekOf}**. Use \`/draft\` to create one first.`,
+            color: EmbedColor.error,
+          }],
+        });
       });
       return;
     }
@@ -99,19 +103,25 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       });
       if (groceryCheck) {
         await step.do('post-already-approved', async () => {
-          await discord.editOriginal(
-            interactionToken,
-            `Plan for **${weekOf}** is already approved with grocery list. Use \`/grocery\` to see it.`
-          );
+          await discord.editOriginal(interactionToken, {
+            embeds: [{
+              title: '✅ Already approved',
+              description: `Plan for **${weekOf}** is already approved with a grocery list. Use \`/grocery\` to see it.`,
+              color: EmbedColor.approved,
+            }],
+          });
         });
         return;
       }
       needsMaterialization = false;
       await step.do('announce-recovery', async () => {
-        await discord.editOriginal(
-          interactionToken,
-          `🔧 Plan for **${weekOf}** is approved but grocery list is missing. Generating it now…`
-        );
+        await discord.editOriginal(interactionToken, {
+          embeds: [{
+            title: '🔧 Recovering grocery list',
+            description: `Plan for **${weekOf}** is approved but the grocery list is missing. Generating it now…`,
+            color: EmbedColor.inProgress,
+          }],
+        });
       });
     }
 
@@ -128,10 +138,13 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
 
     if (needsMaterialization) {
       await step.do('announce', async () => {
-        await discord.editOriginal(
-          interactionToken,
-          `🔒 Approving plan for week of **${weekOf}**…\n👨‍🍳 Generating full recipes (7 in parallel)…`
-        );
+        await discord.editOriginal(interactionToken, {
+          embeds: [{
+            title: `🔒 Approving plan for week of ${weekOf}…`,
+            description: '👨‍🍳 Generating full recipes (7 in parallel)…',
+            color: EmbedColor.inProgress,
+          }],
+        });
       });
 
       // Materialize 7 meals in parallel — each independently retriable.
@@ -166,10 +179,17 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     }
 
     await step.do('progress-grocery', async () => {
-      await discord.editOriginal(
-        interactionToken,
-        `🔒 Plan approved for **${weekOf}**\n👨‍🍳 ${materialized.length} recipes ready\n🧊 ${remindersScheduled} defrost reminder(s) scheduled\n🛒 Building grocery list…`
-      );
+      await discord.editOriginal(interactionToken, {
+        embeds: [{
+          title: `🔒 Plan approved for ${weekOf}`,
+          description: [
+            `👨‍🍳 **${materialized.length}** recipes ready`,
+            `🧊 **${remindersScheduled}** defrost reminder(s) scheduled`,
+            `🛒 Building grocery list…`,
+          ].join('\n'),
+          color: EmbedColor.approved,
+        }],
+      });
     });
 
     // Per-recipe shopping lists in parallel. Wall-clock = max(per-recipe latency).
@@ -203,7 +223,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     });
 
     await step.do('final-post', async () => {
-      const planText = renderPlan({
+      const planE = planEmbed({
         week_of: weekOf,
         status: 'approved',
         meals_json: JSON.stringify(materialized),
@@ -211,22 +231,16 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
         drafted_at: 0,
         approved_at: Date.now(),
       } as any);
-      const groceryText = renderGroceryList(groceryItems);
+      const groceryE = groceryEmbeds(groceryItems, weekOf);
 
-      const head = [
-        `✅ **Approved plan for week of ${weekOf}**`,
-        '',
-        planText,
-        '',
-        `🧊 ${remindersScheduled} defrost reminder(s) scheduled.`,
-        '',
-        '🛒 Grocery list incoming…',
-      ].join('\n');
-
-      await discord.editOriginal(interactionToken, head.slice(0, 2000));
-      const groceryChunks = chunkBy(groceryText, 1900);
-      for (const chunk of groceryChunks) {
-        await discord.followUp(interactionToken, chunk);
+      // Discord allows up to 10 embeds per message. plan + grocery typically
+      // fits; if a huge grocery list pushes over the cap, send the rest as
+      // follow-ups.
+      const allEmbeds = [planE, ...groceryE];
+      const firstBatch = allEmbeds.slice(0, 10);
+      await discord.editOriginal(interactionToken, { embeds: firstBatch });
+      for (let i = 10; i < allEmbeds.length; i += 10) {
+        await discord.followUp(interactionToken, { embeds: allEmbeds.slice(i, i + 10) });
       }
     });
   }
@@ -366,23 +380,3 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
   }
 }
 
-/**
- * Split text into Discord-message-sized chunks (≤2000 chars each), preferring
- * newline boundaries so sections stay grouped.
- */
-function chunkBy(text: string, limit: number): string[] {
-  if (text.length <= limit) return [text];
-  const chunks: string[] = [];
-  const lines = text.split('\n');
-  let current = '';
-  for (const line of lines) {
-    if ((current + '\n' + line).length > limit && current.length > 0) {
-      chunks.push(current);
-      current = line;
-    } else {
-      current = current ? current + '\n' + line : line;
-    }
-  }
-  if (current) chunks.push(current);
-  return chunks;
-}

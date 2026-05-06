@@ -224,9 +224,6 @@ export interface RecipeDetails {
   requires_defrost: { item: string; hours: number }[];
 }
 
-// Kept for back-compat with renderRecipe; now an alias.
-export type GeneratedRecipe = MealStub & RecipeDetails;
-
 export interface PreferenceRow {
   id: string;
   insight: string;

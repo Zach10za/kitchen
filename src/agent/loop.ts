@@ -8,7 +8,8 @@ import type {
   PreferenceRow,
 } from './tools';
 import { TOOLS } from './tools';
-import { renderRecipe, renderPlan } from './render';
+import { planEmbed } from './render';
+import { EmbedColor } from '../discord/types';
 import {
   buildSystemPromptFor,
   loadPantry,
@@ -541,8 +542,6 @@ function toolShowState(args: { week_of: string }, ctx: ToolCtx): string {
   return `Plan for ${args.week_of} (${week.status}):\n${lines.join('\n')}`;
 }
 
-export { renderRecipe };
-
 function dayLabel(day: Day): string {
   return { mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday', sun: 'Sunday' }[day];
 }
@@ -567,10 +566,13 @@ export async function runDraftFlow(args: {
   const client = makeClient(env);
   const ctx: ToolCtx = { env, sql, client };
 
-  await discord.editOriginal(
-    interactionToken,
-    `📝 Drafting plan for week of **${weekOf}**…\n_(one LLM call to plan all 7 meals — about 10-15s)_`
-  );
+  await discord.editOriginal(interactionToken, {
+    embeds: [{
+      title: `📝 Drafting plan for week of ${weekOf}…`,
+      description: '_One LLM call to plan all 7 meals — about 10–15s._',
+      color: EmbedColor.draft,
+    }],
+  });
 
   const constraints = notes ? [notes] : [];
   const result = await toolGenerateDraft({ week_of: weekOf, constraints }, ctx);
@@ -579,20 +581,19 @@ export async function runDraftFlow(args: {
     .exec<WeekRow>('SELECT * FROM weeks WHERE week_of = ?', weekOf)
     .toArray()[0];
   if (!week) {
-    await discord.editOriginal(interactionToken, `Draft generation failed: ${result}`);
+    await discord.editOriginal(interactionToken, {
+      embeds: [{
+        title: '⚠️ Draft generation failed',
+        description: result,
+        color: EmbedColor.error,
+      }],
+    });
     return;
   }
 
-  const planText = renderPlan(week);
-  const reply = [
-    `📋 **Draft for week of ${weekOf}**`,
-    '',
-    planText,
-    '',
-    'Use `/steer` to refine, `/approve` to lock it in.',
-  ].join('\n');
-
-  await discord.editOriginal(interactionToken, reply);
+  await discord.editOriginal(interactionToken, {
+    embeds: [planEmbed(week, { includeFooterHint: true })],
+  });
 }
 
 /**
@@ -662,7 +663,13 @@ export async function runPantryFlow(args: {
 
   const content = response.output_text;
   if (!content) {
-    await discord.editOriginal(interactionToken, 'Failed to parse the input. Try again with simpler wording.');
+    await discord.editOriginal(interactionToken, {
+      embeds: [{
+        title: '🥫 Pantry update failed',
+        description: 'Could not parse the input. Try again with simpler wording.',
+        color: EmbedColor.error,
+      }],
+    });
     return;
   }
 
@@ -688,23 +695,38 @@ export async function runPantryFlow(args: {
 
   const added = parsed.items.filter((i) => i.action === 'add');
   const removed = parsed.items.filter((i) => i.action === 'remove');
-  const lines: string[] = [];
+  const fields: { name: string; value: string; inline?: boolean }[] = [];
   if (added.length > 0) {
     const byLocation: Record<string, string[]> = {};
     for (const item of added) {
       const qty = item.qty_value != null ? `${item.qty_value}${item.qty_unit ? ' ' + item.qty_unit : ''} ` : '';
       (byLocation[item.location] ??= []).push(`${qty}${item.name}`);
     }
-    for (const loc of ['freezer', 'fridge', 'shelf']) {
-      if (byLocation[loc]?.length) {
-        lines.push(`**${loc.toUpperCase()}** (added): ${byLocation[loc]!.join(', ')}`);
-      }
+    for (const loc of ['freezer', 'fridge', 'shelf'] as const) {
+      const list = byLocation[loc];
+      if (!list?.length) continue;
+      fields.push({
+        name: `${loc === 'freezer' ? '🧊' : loc === 'fridge' ? '🧴' : '🥫'} ${loc.toUpperCase()} added`,
+        value: list.map((s) => `• ${s}`).join('\n').slice(0, 1024),
+        inline: true,
+      });
     }
   }
   if (removed.length > 0) {
-    lines.push(`**Removed**: ${removed.map((i) => i.name).join(', ')}`);
+    fields.push({
+      name: '➖ Removed',
+      value: removed.map((i) => `• ${i.name}`).join('\n').slice(0, 1024),
+      inline: false,
+    });
   }
 
-  const reply = lines.length > 0 ? lines.join('\n') : 'No items parsed from that input.';
-  await discord.editOriginal(interactionToken, reply);
+  const description = fields.length === 0 ? 'No items parsed from that input.' : undefined;
+  await discord.editOriginal(interactionToken, {
+    embeds: [{
+      title: '🥫 Pantry updated',
+      ...(description ? { description } : {}),
+      color: fields.length === 0 ? EmbedColor.archived : EmbedColor.inProgress,
+      fields: fields.length > 0 ? fields : undefined,
+    }],
+  });
 }

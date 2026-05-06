@@ -1,10 +1,11 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from './env';
-import type { Interaction } from './discord/types';
+import type { Interaction, MessagePayload } from './discord/types';
+import { EmbedColor } from './discord/types';
 import { DiscordAPI } from './discord/api';
 import { runAgent, runDraftFlow, runPantryFlow, executeTool, type ToolCtx } from './agent/loop';
 import { buildSystemPromptFor, findActiveWeek } from './agent/context';
-import { renderPlan } from './agent/render';
+import { planEmbed, groceryEmbeds, statusEmbed } from './agent/render';
 import { currentOrNextMondayISO, nextMondayISO, nextDraftTime, mealCookTime } from './util/datetime';
 import { captureError } from './error-triage';
 import OpenAI from 'openai';
@@ -84,8 +85,8 @@ export class KitchenDO extends DurableObject<Env> {
 
     if (url.pathname === '/fast-read') {
       const interaction = (await request.json()) as Interaction;
-      const text = this.handleFastRead(interaction);
-      return new Response(text);
+      const payload = this.handleFastRead(interaction);
+      return Response.json(payload);
     }
 
     if (url.pathname === '/get-grocery') {
@@ -258,51 +259,73 @@ export class KitchenDO extends DurableObject<Env> {
   }
 
   /**
-   * Synchronous read-only command handler. Returns rendered Markdown directly.
-   * Bypasses the agent — no LLM calls. Used for /profile, /plan, /pantry, /grocery
-   * when called without modification arguments.
+   * Synchronous read-only command handler. Returns a {content?, embeds?}
+   * payload directly. Bypasses the agent — no LLM calls. Used for /profile,
+   * /plan, /pantry, /reminders when called without modification arguments.
    */
-  private handleFastRead(interaction: Interaction): string {
+  private handleFastRead(interaction: Interaction): MessagePayload {
     const cmd = interaction.data?.name ?? '';
 
     if (cmd === 'profile') {
       const row = this.sql
         .exec<{ value: string }>("SELECT value FROM settings WHERE key = 'cooking_profile'")
         .toArray()[0];
-      return row?.value
-        ? `**Cooking profile:**\n\n${row.value}`
-        : 'No cooking profile set. Use `/profile message: ...` to create one.';
+      if (!row?.value) {
+        return { embeds: [statusEmbed({
+          title: '👤 Cooking profile',
+          description: 'No profile set yet. Use `/profile message: ...` to create one.',
+          color: EmbedColor.archived,
+        })] };
+      }
+      return { embeds: [{
+        title: '👤 Cooking profile',
+        description: row.value.length > 4096 ? row.value.slice(0, 4093) + '…' : row.value,
+        color: EmbedColor.inProgress,
+      }] };
     }
 
     if (cmd === 'plan') {
-      // Prefer the most recently drafted plan within the last 2 weeks.
-      // This handles the common case: user drafted last Sat for "this week",
-      // now they're mid-week reading the plan, week_of is in the past.
       const week = findActiveWeek(this.sql);
-      if (!week) return `No plan in the last 14 days. Use \`/steer message: make a plan\` to create one.`;
-      const meals = JSON.parse(week.meals_json);
-      if (meals.length === 0) return `Plan for ${week.week_of} is empty.`;
-      const lines = meals.map((m: any) => {
-        const noteSuffix = m.notes?.length > 0 ? `  _${m.notes.join('; ')}_` : '';
-        const statusBadge = m.status === 'cooked' ? ' ✅' : m.status === 'skipped' ? ' ⏭️' : '';
-        return `\`${m.day.toUpperCase()}\`${statusBadge}  **${m.name}**  _${m.cuisine}_  (${m.total_minutes}min, ${m.effort})${noteSuffix}\n     ${m.description}`;
-      });
-      return `**Plan for week of ${week.week_of}** _(status: ${week.status})_\n\n${lines.join('\n')}\n\nUse \`/steer\` to change anything${week.status === 'draft' ? ', `/approve` to lock it in' : ''}.`;
+      if (!week) {
+        return { embeds: [statusEmbed({
+          title: '🍴 No active plan',
+          description: 'No plan in the last 14 days. Use `/steer message: make a plan` to create one.',
+          color: EmbedColor.archived,
+        })] };
+      }
+      return { embeds: [planEmbed(week, { includeFooterHint: true })] };
     }
 
     if (cmd === 'pantry') {
-      const items = this.sql.exec<any>('SELECT * FROM pantry ORDER BY location, added_at DESC').toArray();
-      if (items.length === 0) return 'Pantry is empty. Use `/pantry message: I have ...` to add items.';
+      const items = this.sql
+        .exec<any>('SELECT * FROM pantry ORDER BY location, added_at DESC')
+        .toArray();
+      if (items.length === 0) {
+        return { embeds: [statusEmbed({
+          title: '🥫 Pantry',
+          description: 'Pantry is empty. Use `/pantry message: I have ...` to add items.',
+          color: EmbedColor.archived,
+        })] };
+      }
       const grouped: Record<string, string[]> = {};
       for (const item of items) {
         const loc = item.location || 'shelf';
         const qty = item.qty_value != null ? ` (${item.qty_value}${item.qty_unit ? ' ' + item.qty_unit : ''})` : '';
-        (grouped[loc] ??= []).push(`- ${item.name}${qty}`);
+        (grouped[loc] ??= []).push(`• ${item.name}${qty}`);
       }
-      const sections = ['freezer', 'fridge', 'shelf']
+      const fields = (['freezer', 'fridge', 'shelf'] as const)
         .filter((l) => grouped[l]?.length)
-        .map((l) => `**${l.toUpperCase()}**\n${grouped[l]!.join('\n')}`);
-      return sections.join('\n\n');
+        .map((l) => ({
+          name: `${l === 'freezer' ? '🧊' : l === 'fridge' ? '🧴' : '🥫'} ${l.toUpperCase()}`,
+          value: grouped[l]!.join('\n').slice(0, 1024),
+          inline: true,
+        }));
+      return { embeds: [{
+        title: '🥫 Pantry',
+        description: `**${items.length}** items`,
+        color: EmbedColor.inProgress,
+        fields,
+      }] };
     }
 
     if (cmd === 'reminders') {
@@ -311,27 +334,30 @@ export class KitchenDO extends DurableObject<Env> {
         'SELECT * FROM reminders WHERE sent_at IS NULL AND due_at >= ? ORDER BY due_at ASC LIMIT 25',
         now
       ).toArray();
-      if (upcoming.length === 0) return 'No upcoming reminders.';
-
+      if (upcoming.length === 0) {
+        return { embeds: [statusEmbed({
+          title: '⏰ Upcoming reminders',
+          description: 'No upcoming reminders.',
+          color: EmbedColor.archived,
+        })] };
+      }
       const lines = upcoming.map((r) => {
-        const dt = new Date(r.due_at);
-        // Format: "Tue 6:00 PM" relative to today.
-        const dayName = dt.toLocaleDateString('en-US', { weekday: 'short', timeZone: this.env.TIMEZONE });
-        const time = dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: this.env.TIMEZONE });
-        const month = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: this.env.TIMEZONE });
         const icon = r.type === 'defrost' ? '🧊' : r.type === 'prep' ? '🥣' : '⏰';
-        // Show first line only of message (it has Markdown formatting otherwise)
         const preview = r.message.split('\n')[0]!.replace(/\*\*/g, '').slice(0, 100);
-        return `${icon} \`${dayName} ${month} ${time}\`  ${preview}`;
+        // Discord's <t:unix:R> tag renders as a localized relative timestamp client-side.
+        return `${icon} <t:${Math.floor(r.due_at / 1000)}:R> · ${preview}`;
       });
-      return `**Upcoming reminders:**\n\n${lines.join('\n')}`;
+      return { embeds: [{
+        title: '⏰ Upcoming reminders',
+        description: lines.join('\n').slice(0, 4096),
+        color: EmbedColor.reminder,
+      }] };
     }
 
-    // /grocery is intentionally NOT a fast-read — its content typically
-    // exceeds Discord's 2000-char limit so it goes through handleGroceryRead
-    // which uses follow-up messages.
+    // /grocery is intentionally NOT a fast-read — sometimes large enough to
+    // warrant the deferred + follow-up path; goes through handleGroceryRead.
 
-    return `Unknown fast-read command: ${cmd}`;
+    return { content: `Unknown fast-read command: ${cmd}` };
   }
 
   /**
@@ -347,7 +373,23 @@ export class KitchenDO extends DurableObject<Env> {
 
     for (const reminder of due) {
       try {
-        await this.discord.postMessage(this.env.DISCORD_CHANNEL_ID, reminder.message);
+        const title = reminder.type === 'defrost'
+          ? '🧊 Defrost reminder'
+          : reminder.type === 'prep'
+            ? '🥣 Prep reminder'
+            : '⏰ Reminder';
+        // Reminder messages are stored in markdown form — strip the leading
+        // emoji+bold prefix so the embed title carries the kind, body the rest.
+        const body = reminder.message
+          .replace(/^🧊\s*\*\*Defrost reminder\*\*:\s*/i, '')
+          .replace(/^🥣\s*\*\*Prep reminder\*\*:\s*/i, '');
+        await this.discord.postMessage(this.env.DISCORD_CHANNEL_ID, {
+          embeds: [statusEmbed({
+            title,
+            description: body,
+            color: EmbedColor.reminder,
+          })],
+        });
         this.sql.exec('UPDATE reminders SET sent_at = ? WHERE id = ?', now, reminder.id);
       } catch (err) {
         console.error('reminder dispatch failed', { id: reminder.id, err });
@@ -371,11 +413,20 @@ export class KitchenDO extends DurableObject<Env> {
       });
 
       const plan = this.getWeek(weekOf);
-      const message = plan
-        ? `**Draft for week of ${weekOf}**\n\n${renderPlan(plan)}\n\n${result.summary}\n\nReply with /steer to change it, or /approve to lock it in.`
-        : `Draft generation failed: ${result.summary}`;
-
-      await this.discord.postMessage(this.env.DISCORD_CHANNEL_ID, message);
+      if (plan) {
+        await this.discord.postMessage(this.env.DISCORD_CHANNEL_ID, {
+          content: result.summary || undefined,
+          embeds: [planEmbed(plan, { includeFooterHint: true })],
+        });
+      } else {
+        await this.discord.postMessage(this.env.DISCORD_CHANNEL_ID, {
+          embeds: [statusEmbed({
+            title: '⚠️ Draft generation failed',
+            description: result.summary || 'Unknown error.',
+            color: EmbedColor.error,
+          })],
+        });
+      }
     } finally {
       await this.armNextDraft();
     }
@@ -681,14 +732,20 @@ export class KitchenDO extends DurableObject<Env> {
   }
 
   /**
-   * Read the grocery list and post it to Discord, splitting across multiple
-   * messages if it exceeds Discord's 2000-char-per-message limit.
+   * Read the grocery list and post it to Discord. groceryEmbeds returns
+   * one embed when it fits and falls back to multiple embeds for very large
+   * lists; Discord allows up to 10 embeds per message.
    */
   private async handleGroceryRead(interactionToken: string): Promise<void> {
-    // Find the most-recent week (matches /plan and /approve targeting).
     const week = findActiveWeek(this.sql);
     if (!week) {
-      await this.discord.editOriginal(interactionToken, 'No plan in the last 14 days.');
+      await this.discord.editOriginal(interactionToken, {
+        embeds: [statusEmbed({
+          title: '🛒 No grocery list',
+          description: 'No plan in the last 14 days.',
+          color: EmbedColor.archived,
+        })],
+      });
       return;
     }
 
@@ -696,34 +753,20 @@ export class KitchenDO extends DurableObject<Env> {
       .exec<{ items_json: string }>('SELECT items_json FROM grocery_lists WHERE week_of = ?', week.week_of)
       .toArray()[0];
     if (!row) {
-      await this.discord.editOriginal(
-        interactionToken,
-        `No grocery list yet for **${week.week_of}**. Use \`/approve\` to lock the plan and generate one.`
-      );
+      await this.discord.editOriginal(interactionToken, {
+        embeds: [statusEmbed({
+          title: '🛒 No grocery list',
+          description: `No grocery list yet for **${week.week_of}**. Use \`/approve\` to lock the plan and generate one.`,
+          color: EmbedColor.archived,
+        })],
+      });
       return;
     }
 
-    const items = JSON.parse(row.items_json) as { item: string; qty: string; category: string }[];
-    const grouped: Record<string, string[]> = {};
-    for (const item of items) {
-      (grouped[item.category] ??= []).push(`- [ ] ${item.qty} ${item.item}`);
-    }
-    const order = ['produce', 'protein', 'dairy', 'pantry', 'frozen', 'other'];
-    const sections: string[] = [];
-    for (const cat of order) {
-      const list = grouped[cat];
-      if (!list || list.length === 0) continue;
-      sections.push(`**${cat.toUpperCase()}**\n${list.join('\n')}`);
-    }
-
-    const header = `🛒 **Grocery list for ${week.week_of}** _(${items.length} items)_\n\n`;
-    const chunks = chunkSections(header, sections, 1900);
-
-    // First chunk goes via editOriginal; rest as follow-ups.
-    await this.discord.editOriginal(interactionToken, chunks[0]!);
-    for (let i = 1; i < chunks.length; i++) {
-      await this.discord.followUp(interactionToken, chunks[i]!);
-    }
+    const items = JSON.parse(row.items_json) as { item: string; qty: string; category: 'produce' | 'protein' | 'dairy' | 'pantry' | 'frozen' | 'other' }[];
+    await this.discord.editOriginal(interactionToken, {
+      embeds: groceryEmbeds(items, week.week_of),
+    });
   }
 
   // System-prompt + recent-meals loaders moved to ./agent/context.ts so the
@@ -830,36 +873,3 @@ export interface ReminderRow {
   [key: string]: SqlStorageValue;
 }
 
-/**
- * Split header + sections into Discord-message-sized chunks. Sections aren't
- * split mid-line if avoidable; oversized sections fall back to line-by-line.
- */
-function chunkSections(header: string, sections: string[], limit: number): string[] {
-  const chunks: string[] = [];
-  let current = header;
-  for (const section of sections) {
-    const candidate = current === header ? current + section : current + '\n\n' + section;
-    if (candidate.length <= limit) {
-      current = candidate;
-      continue;
-    }
-    if (current.trim().length > 0 && current !== header) chunks.push(current);
-    if (section.length <= limit) {
-      current = section;
-    } else {
-      const lines = section.split('\n');
-      let buf = '';
-      for (const line of lines) {
-        if ((buf + '\n' + line).length > limit) {
-          chunks.push(buf);
-          buf = line;
-        } else {
-          buf = buf ? buf + '\n' + line : line;
-        }
-      }
-      if (buf) current = buf;
-    }
-  }
-  if (current.trim().length > 0) chunks.push(current);
-  return chunks;
-}

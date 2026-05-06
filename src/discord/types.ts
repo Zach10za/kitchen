@@ -42,3 +42,36 @@ export interface Interaction {
     options?: CommandOption[];
   };
 }
+
+/** Subset of Discord's embed object we use. See https://discord.com/developers/docs/resources/message#embed-object */
+export interface Embed {
+  title?: string;
+  description?: string;
+  /** RGB packed integer, e.g. 0x57F287 for Discord green. */
+  color?: number;
+  url?: string;
+  timestamp?: string;
+  footer?: { text: string; icon_url?: string };
+  author?: { name: string; icon_url?: string; url?: string };
+  thumbnail?: { url: string };
+  image?: { url: string };
+  fields?: { name: string; value: string; inline?: boolean }[];
+}
+
+/** What we send to Discord — content, embeds, or both. */
+export interface MessagePayload {
+  content?: string;
+  embeds?: Embed[];
+}
+
+/** Status colors used for plan / grocery / reminder embeds. */
+export const EmbedColor = {
+  draft: 0xfaa61a,        // amber
+  approved: 0x57f287,     // Discord green
+  inProgress: 0x5865f2,   // blurple
+  archived: 0x747f8d,     // gray
+  reminder: 0x3498db,     // blue
+  grocery: 0xfee75c,      // yellow
+  recipe: 0xeb459e,       // pink
+  error: 0xed4245,        // Discord red
+} as const;
