@@ -17,6 +17,38 @@ interface SteerParams {
 
 const MAX_TOOL_ROUNDS = 6;
 
+// Discord's /typing call shows the indicator for ~10s. Refresh well before it
+// expires so the indicator stays continuously visible while real work runs.
+// If the workflow crashes, the loop stops and the indicator dies ~10s later
+// with no message — that absence is the user-visible failure signal.
+const TYPING_REFRESH_MS = 7_000;
+
+async function withTypingRefresh<T>(
+  discord: DiscordAPI,
+  channelId: string | undefined,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!channelId) return fn();
+
+  let stopped = false;
+  const refresh = (async () => {
+    while (!stopped) {
+      await discord.postTyping(channelId).catch(() => {});
+      const start = Date.now();
+      while (!stopped && Date.now() - start < TYPING_REFRESH_MS) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+  })();
+
+  try {
+    return await fn();
+  } finally {
+    stopped = true;
+    await refresh.catch(() => {});
+  }
+}
+
 interface AgentTurnResult {
   type: 'final' | 'continue';
   finalText?: string;
@@ -98,12 +130,13 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
         `round-${round}`,
         { retries: { limit: 2, delay: '2 seconds', backoff: 'linear' } },
         async () => {
-          // Fire typing indicator at the start of each round (durable; only
-          // runs when the step actually executes, not on replay).
-          if (viaChat && channelId) {
-            await discord.postTyping(channelId).catch(() => {});
-          }
-          return this.runOneRound(inputMessages, weekOf);
+          // Keep typing live for the whole round — LLM + tool execution can
+          // easily exceed Discord's ~10s indicator timeout.
+          return withTypingRefresh(
+            discord,
+            viaChat && channelId ? channelId : undefined,
+            () => this.runOneRound(inputMessages, weekOf),
+          );
         }
       );
 
@@ -119,8 +152,12 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
       finalText = 'I got stuck in a tool loop. Try again with a simpler request.';
     }
 
-    // Persist the assistant's final text.
+    // Persist the assistant's final text. Re-fire typing so the indicator
+    // bridges any inter-step gap between the last round and the post below.
     await step.do('save-assistant', async () => {
+      if (viaChat && channelId) {
+        await discord.postTyping(channelId).catch(() => {});
+      }
       await stub.fetch('https://internal/workflow/save-turn', {
         method: 'POST',
         body: JSON.stringify({ week_of: weekOf, role: 'assistant', content: finalText }),
@@ -129,6 +166,9 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
 
     // Post to Discord (either edit the interaction or post to channel).
     await step.do('post-final', async () => {
+      if (viaChat && channelId) {
+        await discord.postTyping(channelId).catch(() => {});
+      }
       await postReply(finalText!);
     });
   }
