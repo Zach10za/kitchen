@@ -69,7 +69,7 @@ jobs:
           BRANCH="auto-fix/issue-${ISSUE_NUMBER}"
           git checkout -b "$BRANCH"
 
-          PROMPT='You are fixing a production bug reported by Sentry. The bug details are in the files .codex/title.txt and .codex/body.md (read them first). Your job: 1) Read the issue title and body. The stack trace is in the body. 2) Locate the root cause in the codebase. 3) Make the minimal correct fix. No surrounding cleanup or refactors. 4) Run `bun run typecheck`. The fix must compile. 5) If the bug needs external API research, fetch relevant docs. 6) Stage and commit with a message describing the fix. Do NOT push — the workflow does that.'
+          PROMPT='You are fixing a production bug captured by the in-process error tracker (src/error-triage.ts) and filed as a GitHub issue. The bug details are in the files .codex/title.txt and .codex/body.md (read them first). Your job: 1) Read the issue title and body. The stack trace is in the body. 2) Locate the root cause in the codebase. 3) Make the minimal correct fix. No surrounding cleanup or refactors. 4) Run `bun run typecheck`. The fix must compile. 5) If the bug needs external API research, fetch relevant docs. 6) Stage and commit with a message describing the fix. Do NOT push — the workflow does that.'
 
           codex exec --model gpt-5-mini --full-auto --skip-git-repo-check "$PROMPT"
 

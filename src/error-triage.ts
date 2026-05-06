@@ -6,9 +6,9 @@ import type { Env } from './env';
  * write a sharper one-line title, and files (or updates) a GitHub issue with
  * label `auto-fix`. The auto-fix Action picks it up from there.
  *
- * Replaces a separate hosted error tracker (Sentry/GlitchTip) — for low volume
- * the only piece worth keeping is "capture + dedupe + open issue", and that's
- * trivial to do directly.
+ * Avoids a separate hosted error tracker — for low volume the only piece
+ * worth keeping is "capture + dedupe + open issue", and that's trivial to
+ * do directly.
  */
 export interface CaptureContext {
   /** Where the error happened — e.g. "interaction:profile" or "alarm:reminder". */
