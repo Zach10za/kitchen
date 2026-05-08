@@ -558,15 +558,15 @@ export async function runDraftFlow(args: {
   env: Env;
   sql: SqlStorage;
   discord: DiscordAPI;
-  interactionToken: string;
+  replyChannelId: string;
   weekOf: string;
   notes?: string;
 }): Promise<void> {
-  const { env, sql, discord, interactionToken, weekOf, notes } = args;
+  const { env, sql, discord, replyChannelId, weekOf, notes } = args;
   const client = makeClient(env);
   const ctx: ToolCtx = { env, sql, client };
 
-  await discord.editOriginal(interactionToken, {
+  await discord.postMessage(replyChannelId, {
     embeds: [{
       title: `📝 Drafting plan for week of ${weekOf}…`,
       description: '_One LLM call to plan all 7 meals — about 10–15s._',
@@ -581,7 +581,7 @@ export async function runDraftFlow(args: {
     .exec<WeekRow>('SELECT * FROM weeks WHERE week_of = ?', weekOf)
     .toArray()[0];
   if (!week) {
-    await discord.editOriginal(interactionToken, {
+    await discord.postMessage(replyChannelId, {
       embeds: [{
         title: '⚠️ Draft generation failed',
         description: result,
@@ -591,7 +591,7 @@ export async function runDraftFlow(args: {
     return;
   }
 
-  await discord.editOriginal(interactionToken, {
+  await discord.postMessage(replyChannelId, {
     embeds: [planEmbed(week, { includeFooterHint: true })],
   });
 }
@@ -635,10 +635,10 @@ export async function runPantryFlow(args: {
   env: Env;
   sql: SqlStorage;
   discord: DiscordAPI;
-  interactionToken: string;
+  replyChannelId: string;
   userMessage: string;
 }): Promise<void> {
-  const { env, sql, discord, interactionToken, userMessage } = args;
+  const { env, sql, discord, replyChannelId, userMessage } = args;
   const client = makeClient(env);
 
   // Use the configured extract model — pure structured-output, no creativity needed.
@@ -663,7 +663,7 @@ export async function runPantryFlow(args: {
 
   const content = response.output_text;
   if (!content) {
-    await discord.editOriginal(interactionToken, {
+    await discord.postMessage(replyChannelId, {
       embeds: [{
         title: '🥫 Pantry update failed',
         description: 'Could not parse the input. Try again with simpler wording.',
@@ -721,7 +721,7 @@ export async function runPantryFlow(args: {
   }
 
   const description = fields.length === 0 ? 'No items parsed from that input.' : undefined;
-  await discord.editOriginal(interactionToken, {
+  await discord.postMessage(replyChannelId, {
     embeds: [{
       title: '🥫 Pantry updated',
       ...(description ? { description } : {}),

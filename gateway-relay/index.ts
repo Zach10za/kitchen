@@ -202,6 +202,7 @@ async function forwardMessage(msg: any): Promise<void> {
       },
       body: JSON.stringify({
         channelId: msg.channel_id,
+        messageId: msg.id,
         author: msg.author?.username,
         userMessage: content,
       }),

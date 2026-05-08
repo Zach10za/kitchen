@@ -1,6 +1,8 @@
 import type { Env } from './env';
 import { verifyDiscordRequest } from './discord/verify';
 import { InteractionType, InteractionResponseType, type Interaction } from './discord/types';
+import { DiscordAPI } from './discord/api';
+import { prepareChatThread } from './discord/thread';
 import { currentOrNextMondayISO } from './util/datetime';
 import { captureError } from './error-triage';
 
@@ -43,17 +45,19 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   // Discord Gateway relay (running on Fly.io) forwards plain-text messages
-  // to here via shared-secret HTTPS. We spawn a SteerWorkflow with viaChat=true.
+  // here via shared-secret HTTPS. We anchor a thread to the user's message
+  // and run the SteerWorkflow with that thread as its replyChannelId.
   if (url.pathname === '/relay/message' && request.method === 'POST') {
     if (!relaySecretValid(request, env)) {
       return new Response('forbidden', { status: 403 });
     }
     const body = (await request.json()) as {
       channelId: string;
+      messageId?: string;
       userMessage: string;
       author?: string;
     };
-    if (!body.channelId || !body.userMessage) {
+    if (!body.channelId || !body.messageId || !body.userMessage) {
       return new Response('bad request', { status: 400 });
     }
 
@@ -68,13 +72,30 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       return new Response('rate limited', { status: 429 });
     }
 
+    // Anchor a thread to the user's own message and reply inside it. Done
+    // here (not inside the workflow) because thread creation is non-idempotent
+    // and workflow steps re-run on retry.
+    const discord = new DiscordAPI(env.DISCORD_BOT_TOKEN, env.DISCORD_APP_ID);
+    let replyChannelId: string;
+    try {
+      replyChannelId = await prepareChatThread({
+        discord,
+        env,
+        channelId: body.channelId,
+        parentMessageId: body.messageId,
+        titleSeed: body.userMessage,
+      });
+    } catch (err) {
+      ctx.waitUntil(captureError(env, err, { source: 'relay:thread-create' }));
+      return new Response('thread create failed', { status: 502 });
+    }
+
     ctx.waitUntil(
       env.STEER_WORKFLOW.create({
         params: {
           weekOf: currentOrNextMondayISO(env.TIMEZONE),
-          channelId: body.channelId,
+          replyChannelId,
           userMessage: body.userMessage,
-          viaChat: true,
         },
       })
     );

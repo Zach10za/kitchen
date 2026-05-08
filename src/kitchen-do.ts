@@ -3,6 +3,7 @@ import type { Env } from './env';
 import type { Interaction, MessagePayload } from './discord/types';
 import { EmbedColor } from './discord/types';
 import { DiscordAPI } from './discord/api';
+import { prepareInteractionThread } from './discord/thread';
 import { runAgent, runDraftFlow, runPantryFlow, executeTool, type ToolCtx } from './agent/loop';
 import { buildSystemPromptFor, findActiveWeek } from './agent/context';
 import { planEmbed, groceryEmbeds, statusEmbed } from './agent/render';
@@ -57,7 +58,7 @@ export class KitchenDO extends DurableObject<Env> {
             },
           });
           await this.discord
-            .followUp(interaction.token, `Something broke: ${(err as Error).message}`)
+            .editOriginal(interaction.token, `Something broke: ${(err as Error).message}`)
             .catch(() => {});
         })
       );
@@ -457,49 +458,61 @@ export class KitchenDO extends DurableObject<Env> {
         return;
       }
 
-      await this.env.APPROVE_WORKFLOW.create({
-        params: {
-          weekOf: week.week_of,
-          interactionToken: interaction.token,
-        },
-      });
-      // Initial Discord ack — the workflow's first step will overwrite this.
-      await this.discord.editOriginal(
-        interaction.token,
+      const replyChannelId = await this.openReplyThread(
+        interaction,
+        `approve plan ${week.week_of}`
+      );
+      // Post the kickoff line BEFORE creating the workflow so it can't get
+      // interleaved with the workflow's own first-step post.
+      await this.discord.postMessage(
+        replyChannelId,
         `🚀 Approval workflow started for **${week.week_of}**…`
       );
+      await this.env.APPROVE_WORKFLOW.create({
+        params: { weekOf: week.week_of, replyChannelId },
+      });
       return;
     }
 
     // Direct write path for /pantry with a message — single LLM extraction
     // call instead of full agent loop. ~1-2s vs ~5-10s.
     if (commandName === 'pantry' && optionMap.message) {
+      const replyChannelId = await this.openReplyThread(
+        interaction,
+        `pantry: ${optionMap.message}`
+      );
       await runPantryFlow({
         env: this.env,
         sql: this.sql,
         discord: this.discord,
-        interactionToken: interaction.token,
+        replyChannelId,
         userMessage: String(optionMap.message),
       });
       return;
     }
 
-    // /grocery direct path — reads from SQL but uses follow-up messages when
-    // the list exceeds Discord's 2000-char-per-message limit (it usually does).
+    // /grocery direct path — reads from SQL but uses additional thread messages
+    // when the list exceeds Discord's 10-embed-per-message limit.
     if (commandName === 'grocery') {
-      await this.handleGroceryRead(interaction.token);
+      const replyChannelId = await this.openReplyThread(interaction, 'grocery list');
+      await this.handleGroceryRead(replyChannelId);
       return;
     }
 
     // Direct write path for /draft — bypass agent for plan generation since
     // this routinely exceeds the agent's combined budget on slow LLM responses.
     if (commandName === 'draft') {
+      const weekOfNext = nextMondayISO(this.env.TIMEZONE);
+      const seed = optionMap.notes
+        ? `draft ${weekOfNext}: ${optionMap.notes}`
+        : `draft ${weekOfNext}`;
+      const replyChannelId = await this.openReplyThread(interaction, seed);
       await runDraftFlow({
         env: this.env,
         sql: this.sql,
         discord: this.discord,
-        interactionToken: interaction.token,
-        weekOf: nextMondayISO(this.env.TIMEZONE),
+        replyChannelId,
+        weekOf: weekOfNext,
         notes: optionMap.notes ? String(optionMap.notes) : undefined,
       });
       return;
@@ -524,17 +537,14 @@ export class KitchenDO extends DurableObject<Env> {
       const recent = findActiveWeek(this.sql);
       const targetWeek = recent?.week_of ?? weekOf;
 
+      const replyChannelId = await this.openReplyThread(interaction, userMsg);
       await this.env.STEER_WORKFLOW.create({
-        params: {
-          weekOf: targetWeek,
-          interactionToken: interaction.token,
-          userMessage: userMsg,
-        },
+        params: { weekOf: targetWeek, replyChannelId, userMessage: userMsg },
       });
-      await this.discord.editOriginal(interaction.token, '🤔 Working on it…');
       return;
     }
 
+    let titleSeed: string;
     switch (commandName) {
       // /plan, /grocery, /pantry-no-msg, /reminders, /profile-no-msg are all
       // routed through the Worker fast-read path. /approve, /steer, /pantry-msg,
@@ -552,18 +562,24 @@ export class KitchenDO extends DurableObject<Env> {
           hour12: true,
         });
         userMessage = `Right now it is **${nowLocal}** (${this.env.TIMEZONE}). Based on the current time, today's planned meal, and my cooking profile (especially any dinner time I've set), tell me concretely what I should be doing in the kitchen right now. Don't give "if it's morning, do X" branches — you know exactly what time it is. If it's still hours before dinner, tell me when to start cooking and what (if anything) to prep now. If it's close to dinner time, walk me through the next step.`;
+        titleSeed = 'what to cook now';
         break;
       }
       case 'pantry':
         userMessage = `Update the pantry: ${optionMap.message}`;
+        titleSeed = `pantry: ${optionMap.message}`;
         break;
       case 'profile':
         // Verbatim user input wrapped in delimiters + explicit do-not-summarize directive.
         userMessage = `The user is updating their cooking profile. Their input, VERBATIM:\n\n"""\n${optionMap.message}\n"""\n\nCall update_profile. Preserve every detail and the user's wording. If a profile already exists, merge intelligently — never drop information. Organize into clear Markdown sections (## Equipment, ## Dietary, ## Cuisines, ## Style, ## Time, etc.). Do not paraphrase or summarize.`;
+        titleSeed = `profile: ${optionMap.message}`;
         break;
       default:
         userMessage = `Unknown command: ${commandName}`;
+        titleSeed = `/${commandName}`;
     }
+
+    const replyChannelId = await this.openReplyThread(interaction, titleSeed);
 
     const result = await runAgent({
       env: this.env,
@@ -572,7 +588,21 @@ export class KitchenDO extends DurableObject<Env> {
       weekOf,
     });
 
-    await this.discord.editOriginal(interaction.token, result.summary || '(no response)');
+    await this.discord.postMessage(replyChannelId, result.summary || '(no response)');
+  }
+
+  /**
+   * Set the deferred response's content to a generated title and start a
+   * thread anchored to that message. Returns the thread's channel id, into
+   * which all subsequent reply messages should be posted.
+   */
+  private async openReplyThread(interaction: Interaction, titleSeed: string): Promise<string> {
+    return prepareInteractionThread({
+      discord: this.discord,
+      env: this.env,
+      interactionToken: interaction.token,
+      titleSeed,
+    });
   }
 
   async ensureAlarmSet(): Promise<void> {
@@ -732,14 +762,14 @@ export class KitchenDO extends DurableObject<Env> {
   }
 
   /**
-   * Read the grocery list and post it to Discord. groceryEmbeds returns
-   * one embed when it fits and falls back to multiple embeds for very large
+   * Read the grocery list and post it into the reply thread. groceryEmbeds
+   * returns one embed when it fits and falls back to multiple for very large
    * lists; Discord allows up to 10 embeds per message.
    */
-  private async handleGroceryRead(interactionToken: string): Promise<void> {
+  private async handleGroceryRead(replyChannelId: string): Promise<void> {
     const week = findActiveWeek(this.sql);
     if (!week) {
-      await this.discord.editOriginal(interactionToken, {
+      await this.discord.postMessage(replyChannelId, {
         embeds: [statusEmbed({
           title: '🛒 No grocery list',
           description: 'No plan in the last 14 days.',
@@ -753,7 +783,7 @@ export class KitchenDO extends DurableObject<Env> {
       .exec<{ items_json: string }>('SELECT items_json FROM grocery_lists WHERE week_of = ?', week.week_of)
       .toArray()[0];
     if (!row) {
-      await this.discord.editOriginal(interactionToken, {
+      await this.discord.postMessage(replyChannelId, {
         embeds: [statusEmbed({
           title: '🛒 No grocery list',
           description: `No grocery list yet for **${week.week_of}**. Use \`/approve\` to lock the plan and generate one.`,
@@ -764,9 +794,10 @@ export class KitchenDO extends DurableObject<Env> {
     }
 
     const items = JSON.parse(row.items_json) as { item: string; qty: string; category: 'produce' | 'protein' | 'dairy' | 'pantry' | 'frozen' | 'other' }[];
-    await this.discord.editOriginal(interactionToken, {
-      embeds: groceryEmbeds(items, week.week_of),
-    });
+    const embeds = groceryEmbeds(items, week.week_of);
+    for (let i = 0; i < embeds.length; i += 10) {
+      await this.discord.postMessage(replyChannelId, { embeds: embeds.slice(i, i + 10) });
+    }
   }
 
   // System-prompt + recent-meals loaders moved to ./agent/context.ts so the

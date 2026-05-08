@@ -7,11 +7,8 @@ import { MAX_TOOL_ROUNDS, runAgentRound, type RoundResult } from '../agent/round
 interface SteerParams {
   weekOf: string;
   userMessage: string;
-  // Slash-command path: edit the deferred interaction response.
-  interactionToken?: string;
-  // Chat path (Gateway): post a regular message to this channel instead.
-  channelId?: string;
-  viaChat?: boolean;
+  /** Channel id to post the reply into — always a thread channel id now. */
+  replyChannelId: string;
 }
 
 // Discord's /typing call shows the indicator for ~10s. Refresh well before it
@@ -22,11 +19,9 @@ const TYPING_REFRESH_MS = 7_000;
 
 async function withTypingRefresh<T>(
   discord: DiscordAPI,
-  channelId: string | undefined,
+  channelId: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  if (!channelId) return fn();
-
   let stopped = false;
   const refresh = (async () => {
     while (!stopped) {
@@ -54,37 +49,28 @@ type AgentTurnResult = RoundResult;
  * retry budget — slow LLM calls and slow tool calls retry independently
  * instead of taking down the whole conversation.
  *
+ * All output goes into the thread identified by replyChannelId, which the
+ * caller (DO interaction handler or worker /relay/message handler) creates
+ * before invoking the workflow.
+ *
  * Steps:
  *   1. load-context     — fetch system prompt + recent history from DO
  *   2. save-user-turn   — persist the user's message
  *   3. round-{N}        — one OpenAI call + any tool executions (up to 6 rounds)
  *   4. save-assistant   — persist the final reply
- *   5. post-final       — Discord update
+ *   5. post-final       — post reply into the thread
  */
 export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
   async run(event: WorkflowEvent<SteerParams>, step: WorkflowStep) {
-    const { weekOf, interactionToken, channelId, viaChat, userMessage } = event.payload;
+    const { weekOf, replyChannelId, userMessage } = event.payload;
     const discord = new DiscordAPI(this.env.DISCORD_BOT_TOKEN, this.env.DISCORD_APP_ID);
     const stub = this.kitchen();
 
-    // Helper that posts the final reply via the right Discord channel.
-    // DiscordAPI auto-chunks content over the 2000-char limit.
-    const postReply = async (text: string): Promise<void> => {
-      if (viaChat && channelId) {
-        await discord.postMessage(channelId, text);
-      } else if (interactionToken) {
-        await discord.editOriginal(interactionToken, text);
-      }
-    };
-
-
     // Step 0: instant feedback — fire typing indicator immediately so the
     // user sees the bot is working while load-context + save-turn run.
-    if (viaChat && channelId) {
-      await step.do('initial-typing', async () => {
-        await discord.postTyping(channelId).catch(() => {});
-      });
-    }
+    await step.do('initial-typing', async () => {
+      await discord.postTyping(replyChannelId).catch(() => {});
+    });
 
     // Step 1: load context from DO
     const ctx = await step.do('load-context', async () => {
@@ -123,10 +109,8 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
         async () => {
           // Keep typing live for the whole round — LLM + tool execution can
           // easily exceed Discord's ~10s indicator timeout.
-          return withTypingRefresh(
-            discord,
-            viaChat && channelId ? channelId : undefined,
-            () => this.runOneRound(inputMessages, weekOf),
+          return withTypingRefresh(discord, replyChannelId, () =>
+            this.runOneRound(inputMessages, weekOf),
           );
         }
       );
@@ -146,21 +130,16 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
     // Persist the assistant's final text. Re-fire typing so the indicator
     // bridges any inter-step gap between the last round and the post below.
     await step.do('save-assistant', async () => {
-      if (viaChat && channelId) {
-        await discord.postTyping(channelId).catch(() => {});
-      }
+      await discord.postTyping(replyChannelId).catch(() => {});
       await stub.fetch('https://internal/workflow/save-turn', {
         method: 'POST',
         body: JSON.stringify({ week_of: weekOf, role: 'assistant', content: finalText }),
       });
     });
 
-    // Post to Discord (either edit the interaction or post to channel).
     await step.do('post-final', async () => {
-      if (viaChat && channelId) {
-        await discord.postTyping(channelId).catch(() => {});
-      }
-      await postReply(finalText!);
+      await discord.postTyping(replyChannelId).catch(() => {});
+      await discord.postMessage(replyChannelId, finalText!);
     });
   }
 

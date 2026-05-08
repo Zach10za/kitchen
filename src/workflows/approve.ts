@@ -9,7 +9,8 @@ import { EmbedColor } from '../discord/types';
 
 interface ApproveParams {
   weekOf: string;
-  interactionToken: string;
+  /** Thread channel id to post all status + final messages into. */
+  replyChannelId: string;
 }
 
 const SHOP_FOR_RECIPE_PROMPT = `You convert ONE recipe's ingredients into grocery shopping items.
@@ -71,7 +72,7 @@ Return the final unified list. No duplicates. Real grocery quantities only.`;
  */
 export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
   async run(event: WorkflowEvent<ApproveParams>, step: WorkflowStep) {
-    const { weekOf, interactionToken } = event.payload;
+    const { weekOf, replyChannelId } = event.payload;
     const discord = new DiscordAPI(this.env.DISCORD_BOT_TOKEN, this.env.DISCORD_APP_ID);
     const stub = this.kitchen();
 
@@ -83,7 +84,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
 
     if (!draft) {
       await step.do('post-no-draft', async () => {
-        await discord.editOriginal(interactionToken, {
+        await discord.postMessage(replyChannelId, {
           embeds: [{
             title: '⚠️ No draft to approve',
             description: `No plan found for **${weekOf}**. Use \`/draft\` to create one first.`,
@@ -103,7 +104,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       });
       if (groceryCheck) {
         await step.do('post-already-approved', async () => {
-          await discord.editOriginal(interactionToken, {
+          await discord.postMessage(replyChannelId, {
             embeds: [{
               title: '✅ Already approved',
               description: `Plan for **${weekOf}** is already approved with a grocery list. Use \`/grocery\` to see it.`,
@@ -115,7 +116,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       }
       needsMaterialization = false;
       await step.do('announce-recovery', async () => {
-        await discord.editOriginal(interactionToken, {
+        await discord.postMessage(replyChannelId, {
           embeds: [{
             title: '🔧 Recovering grocery list',
             description: `Plan for **${weekOf}** is approved but the grocery list is missing. Generating it now…`,
@@ -138,7 +139,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
 
     if (needsMaterialization) {
       await step.do('announce', async () => {
-        await discord.editOriginal(interactionToken, {
+        await discord.postMessage(replyChannelId, {
           embeds: [{
             title: `🔒 Approving plan for week of ${weekOf}…`,
             description: '👨‍🍳 Generating full recipes (7 in parallel)…',
@@ -179,7 +180,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     }
 
     await step.do('progress-grocery', async () => {
-      await discord.editOriginal(interactionToken, {
+      await discord.postMessage(replyChannelId, {
         embeds: [{
           title: `🔒 Plan approved for ${weekOf}`,
           description: [
@@ -235,12 +236,10 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
 
       // Discord allows up to 10 embeds per message. plan + grocery typically
       // fits; if a huge grocery list pushes over the cap, send the rest as
-      // follow-ups.
+      // additional thread messages.
       const allEmbeds = [planE, ...groceryE];
-      const firstBatch = allEmbeds.slice(0, 10);
-      await discord.editOriginal(interactionToken, { embeds: firstBatch });
-      for (let i = 10; i < allEmbeds.length; i += 10) {
-        await discord.followUp(interactionToken, { embeds: allEmbeds.slice(i, i + 10) });
+      for (let i = 0; i < allEmbeds.length; i += 10) {
+        await discord.postMessage(replyChannelId, { embeds: allEmbeds.slice(i, i + 10) });
       }
     });
   }

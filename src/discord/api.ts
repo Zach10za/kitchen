@@ -99,6 +99,50 @@ export class DiscordAPI {
     }
   }
 
+  /**
+   * Fetch the deferred interaction's "original" message — the one editOriginal
+   * targets — so we can use its (id, channel_id) as the parent for a thread.
+   */
+  async getOriginalMessage(interactionToken: string): Promise<{ id: string; channel_id: string }> {
+    const res = await fetch(
+      `${DISCORD_API}/webhooks/${this.appId}/${interactionToken}/messages/@original`,
+      { headers: this.headers() }
+    );
+    if (!res.ok) throw new Error(`Discord getOriginalMessage failed: ${res.status} ${await res.text()}`);
+    const json = (await res.json()) as { id: string; channel_id: string };
+    return { id: json.id, channel_id: json.channel_id };
+  }
+
+  /**
+   * Create a public thread anchored to an existing message. Discord returns
+   * a channel object whose `id` is the thread's channel id — postMessage to
+   * that id to put messages in the thread.
+   *
+   * `auto_archive_duration` is in minutes (60 = 1h, 1440 = 24h, 4320 = 3d, 10080 = 7d).
+   * Names are clamped to Discord's 100-char limit.
+   */
+  async startThreadFromMessage(
+    channelId: string,
+    messageId: string,
+    name: string,
+    autoArchiveMinutes: 60 | 1440 | 4320 | 10080 = 1440,
+  ): Promise<{ id: string }> {
+    const res = await fetch(
+      `${DISCORD_API}/channels/${channelId}/messages/${messageId}/threads`,
+      {
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify({
+          name: name.slice(0, 100) || 'Kitchen reply',
+          auto_archive_duration: autoArchiveMinutes,
+        }),
+      }
+    );
+    if (!res.ok) throw new Error(`Discord startThread failed: ${res.status} ${await res.text()}`);
+    const json = (await res.json()) as { id: string };
+    return { id: json.id };
+  }
+
   private headers(): HeadersInit {
     return {
       Authorization: `Bot ${this.botToken}`,
