@@ -6,16 +6,22 @@ interface PromptContext {
   pantry: PantryItem[];
   recentMeals: { weekOf: string; day: string; name: string; cuisine: string }[];
   profile: string | null;
+  /** Current time in the household timezone — must be injected by callers
+   *  so the model can resolve "today" / "tonight" / "tomorrow" without
+   *  guessing from its training cutoff. */
+  now: { iso: string; localFormatted: string; dayKey: string };
 }
 
 export function buildSystemPrompt(args: PromptContext): string {
-  const { plan, preferences, pantry, recentMeals, profile } = args;
+  const { plan, preferences, pantry, recentMeals, profile, now } = args;
 
   const freezer = pantry.filter((p) => p.location === 'freezer');
   const fridge = pantry.filter((p) => p.location === 'fridge');
   const shelf = pantry.filter((p) => !p.location || p.location === 'shelf');
 
   return `You are the user's personal meal planning assistant. You collaborate with them through a Discord channel to plan, refine, and cook the week's meals.
+
+RIGHT NOW: ${now.localFormatted} (ISO: ${now.iso}). Today's day key in the plan below is \`${now.dayKey}\`. Use this when the user says "today", "tonight", "tomorrow", or "this weekend" — do not infer the date from anything else.
 
 COOKING PROFILE (stable, declarative — treat hard rules like allergies as inviolable):
 ${profile ?? '(not yet set — if the user gives details about their kitchen / diet / preferences, call update_profile to record them)'}

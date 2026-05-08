@@ -194,7 +194,7 @@ export class KitchenDO extends DurableObject<Env> {
 
     if (url.pathname === '/workflow/load-context') {
       const weekOf = url.searchParams.get('week_of') ?? '';
-      const systemPrompt = buildSystemPromptFor(this.sql, weekOf);
+      const systemPrompt = buildSystemPromptFor(this.sql, weekOf, this.env.TIMEZONE);
       const history = this.sql.exec<{ role: string; content: string }>(
         "SELECT role, content FROM conversation WHERE week_of = ? AND role IN ('user', 'assistant') ORDER BY id DESC LIMIT 30",
         weekOf

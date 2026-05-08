@@ -104,6 +104,37 @@ export function loadContext(sql: SqlStorage, weekOf: string): AgentContext {
   };
 }
 
-export function buildSystemPromptFor(sql: SqlStorage, weekOf: string): string {
-  return buildSystemPrompt(loadContext(sql, weekOf));
+const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const;
+
+/** Compute the current local time in the household's timezone, in the
+ *  shape the system prompt expects. Centralized so every call site renders
+ *  the same string. */
+function currentNowFor(timezone: string): { iso: string; localFormatted: string; dayKey: string } {
+  const date = new Date();
+  const localFormatted = date.toLocaleString('en-US', {
+    timeZone: timezone,
+    weekday: 'long',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+    timeZoneName: 'short',
+  });
+  // Discord plans use a 3-letter lowercase day key (mon/tue/...). Derive it
+  // from the same timezone so day boundaries match local midnight, not UTC.
+  const weekdayShort = date.toLocaleString('en-US', {
+    timeZone: timezone,
+    weekday: 'short',
+  }).toLowerCase().slice(0, 3);
+  const dayKey = (DAY_KEYS as readonly string[]).includes(weekdayShort) ? weekdayShort : 'mon';
+  return { iso: date.toISOString(), localFormatted, dayKey };
+}
+
+export function buildSystemPromptFor(sql: SqlStorage, weekOf: string, timezone: string): string {
+  return buildSystemPrompt({
+    ...loadContext(sql, weekOf),
+    now: currentNowFor(timezone),
+  });
 }

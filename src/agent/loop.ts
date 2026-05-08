@@ -46,7 +46,7 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
   );
 
   let messages: any[] = [
-    { role: 'system', content: buildSystemPromptFor(sql, weekOf) },
+    { role: 'system', content: buildSystemPromptFor(sql, weekOf, env.TIMEZONE) },
     ...recentConversation(sql, weekOf, 30),
     { role: 'user', content: userMessage },
   ];
