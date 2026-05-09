@@ -26,6 +26,7 @@ export async function executeFinanceTool(name: string, args: any, ctx: FinanceTo
       case 'compare_periods':       return toolComparePeriods(args, ctx);
       case 'unusual_transactions':  return toolUnusualTransactions(args, ctx);
       case 'sync_now':              return await toolSyncNow(ctx);
+      case 'get_transactions_raw':  return toolGetTransactionsRaw(args, ctx);
       default:                      return `Unknown finance tool: ${name}`;
     }
   } catch (err) {
@@ -290,6 +291,66 @@ function toolUnusualTransactions(
   if (flagged.length === 0) return `No unusual transactions in the last ${days} days.`;
   const lines = flagged.slice(0, 25).map(({ tx, reason }) => `${formatTxLine(tx)} — ${reason}`);
   return `${flagged.length} unusual transaction${flagged.length === 1 ? '' : 's'} (last ${days}d):\n${lines.join('\n')}`;
+}
+
+/**
+ * Return raw transaction rows as a JSON string. Designed to feed into
+ * code_interpreter — the model picks columns and runs whatever Python it
+ * needs (cadence detection, paired-flow matching, clustering, forecasts).
+ *
+ * Output is a JSON object so code_interpreter can consume it directly:
+ *   { count, transactions: [{id, account_id, posted, amount, ...}] }
+ */
+function toolGetTransactionsRaw(
+  args: { days?: number; account_id?: string; merchant?: string; only_outflow?: boolean; limit?: number },
+  ctx: FinanceToolCtx
+): string {
+  const days = Math.max(1, Math.min(730, args.days ?? 90));
+  const limit = Math.max(1, Math.min(5000, args.limit ?? 2000));
+  const since = nowSec() - days * 86_400;
+
+  const filters = ['posted >= ?'];
+  const params: SqlStorageValue[] = [since];
+  if (args.account_id) {
+    filters.push('account_id = ?');
+    params.push(args.account_id);
+  }
+  if (args.merchant) {
+    filters.push('normalized_payee = ?');
+    params.push(args.merchant.toLowerCase());
+  }
+  if (args.only_outflow) {
+    filters.push('amount < 0');
+  }
+  params.push(limit);
+
+  const rows = ctx.sql
+    .exec<TransactionRow>(
+      `SELECT id, account_id, posted, amount, description, payee, normalized_payee, memo, pending
+         FROM transactions
+        WHERE ${filters.join(' AND ')}
+        ORDER BY posted DESC
+        LIMIT ?`,
+      ...params
+    )
+    .toArray();
+
+  return JSON.stringify({
+    count: rows.length,
+    truncated: rows.length === limit,
+    days,
+    transactions: rows.map((r) => ({
+      id: r.id,
+      account_id: r.account_id,
+      posted: r.posted,
+      amount: r.amount,
+      description: r.description,
+      payee: r.payee,
+      normalized_payee: r.normalized_payee,
+      memo: r.memo,
+      pending: r.pending === 1,
+    })),
+  });
 }
 
 async function toolSyncNow(ctx: FinanceToolCtx): Promise<string> {

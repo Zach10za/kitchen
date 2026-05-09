@@ -106,6 +106,29 @@ export const FINANCE_TOOLS = [
       parameters: { type: 'object', properties: {} },
     },
   },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_transactions_raw',
+      description: 'Return raw transaction rows as a JSON array — feed these into code_interpreter when you need cadence detection, paired-flow matching (e.g. transfer detection), forecasting, clustering, or any analysis the SQL tools don\'t already provide. Returns the same fields as the database: id, account_id, posted (unix sec), amount (signed: negative=outflow), description, payee, normalized_payee, memo, pending. Default window 90d, max 5000 rows.',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: { type: 'integer', minimum: 1, maximum: 730, description: 'Lookback window in days. Default 90.' },
+          account_id: { type: 'string', description: 'Optional: only return rows for this account.' },
+          merchant: { type: 'string', description: 'Optional: only return rows for this normalized merchant name (lowercase).' },
+          only_outflow: { type: 'boolean', description: 'If true, only negative-amount rows. Default false.' },
+          limit: { type: 'integer', minimum: 1, maximum: 5000, description: 'Max rows. Default 2000.' },
+        },
+      },
+    },
+  },
+  // ── OpenAI server-side built-ins ──────────────────────────────────
+  // These execute on OpenAI's side; their output appears in the response
+  // alongside function calls and we just echo it forward. The agent uses
+  // them by emitting tool calls of these types — no executor on our side.
+  { type: 'web_search' as const },
+  { type: 'code_interpreter' as const, container: { type: 'auto' as const } },
 ] as const;
 
 export interface AccountRow {

@@ -12,10 +12,9 @@ import type OpenAI from 'openai';
 
 export const MAX_TOOL_ROUNDS = 6;
 
-/** OpenAI Chat-Completions-style tool definition (the format every bot's
- *  TOOLS const uses). The runtime converts these into Responses-API form
- *  on the wire. */
-export interface ToolDef {
+/** OpenAI Chat-Completions-style function tool. The runtime converts these
+ *  into Responses-API form on the wire. */
+export interface FunctionToolDef {
   type: 'function';
   function: {
     name: string;
@@ -23,6 +22,17 @@ export interface ToolDef {
     parameters: any;
   };
 }
+
+/** OpenAI server-side built-in tools — executed by OpenAI, not by us.
+ *  Their output items appear in `response.output` alongside function calls
+ *  and we echo them forward like everything else. We never call
+ *  `executeTool` for them; the model gets results inline. */
+export type BuiltinToolDef =
+  | { type: 'web_search' }
+  | { type: 'web_search_preview' }
+  | { type: 'code_interpreter'; container: { type: 'auto' } | { type: 'static'; file_ids?: string[] } };
+
+export type ToolDef = FunctionToolDef | BuiltinToolDef;
 
 export interface RoundResult {
   type: 'final' | 'continue';
@@ -45,18 +55,23 @@ export interface RunRoundArgs {
 }
 
 /**
- * Convert ToolDef (Chat Completions format) into Responses API format.
- * Chat:      { type: 'function', function: { name, description, parameters } }
- * Responses: { type: 'function', name, description, parameters, strict: false }
+ * Convert ToolDef into Responses API format.
+ * Function tools get reshaped (Chat → Responses); built-ins pass through
+ * unchanged because the API expects them in their declared form.
  */
 export function toResponsesTools(tools: readonly ToolDef[]): any[] {
-  return tools.map((t) => ({
-    type: 'function' as const,
-    name: t.function.name,
-    description: t.function.description,
-    parameters: t.function.parameters,
-    strict: false,
-  }));
+  return tools.map((t) => {
+    if (t.type === 'function') {
+      return {
+        type: 'function' as const,
+        name: t.function.name,
+        description: t.function.description,
+        parameters: t.function.parameters,
+        strict: false,
+      };
+    }
+    return t;
+  });
 }
 
 export async function runAgentRound(args: RunRoundArgs): Promise<RoundResult> {
