@@ -3,6 +3,8 @@ import OpenAI from 'openai';
 import type { Env } from '../env';
 import { DiscordAPI } from '../discord/api';
 import { MAX_TOOL_ROUNDS, runAgentRound, type RoundResult } from '../agent/round';
+import { emptyUsage, addUsage, type RoundUsage } from '../runtime/agent-round';
+import { computeCost, formatUsd } from '../runtime/pricing';
 
 interface SteerParams {
   weekOf: string;
@@ -100,6 +102,7 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
     ];
 
     let finalText: string | null = null;
+    let turnUsage: RoundUsage = emptyUsage();
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const inputMessages = messages;
@@ -116,6 +119,7 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
       );
 
       messages = result.newMessages;
+      turnUsage = addUsage(turnUsage, result.usage);
 
       if (result.type === 'final') {
         finalText = result.finalText ?? '(no text)';
@@ -126,6 +130,26 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
     if (!finalText) {
       finalText = 'I got stuck in a tool loop. Try again with a simpler request.';
     }
+
+    // Record turn usage and pull running thread total for the cost footer.
+    // Same pattern as FinanceSteerWorkflow — the DO computes thread totals
+    // from raw counts so retroactive pricing changes flow through.
+    const threadId = replyChannelId;
+    const turnTotals = await step.do('record-usage', async () => {
+      const res = await stub.fetch('https://internal/workflow/record-usage', {
+        method: 'POST',
+        body: JSON.stringify({
+          thread_id: threadId,
+          model: this.env.OPENAI_MODEL,
+          ...turnUsage,
+        }),
+      });
+      return (await res.json()) as { thread_total_usage: RoundUsage };
+    });
+
+    const turnCost = computeCost(turnUsage, this.env);
+    const threadCost = computeCost(turnTotals.thread_total_usage, this.env);
+    const finalWithCost = `${finalText}\n\n_${formatUsd(turnCost.total_usd)} this turn · ${formatUsd(threadCost.total_usd)} thread total_`;
 
     // Persist the assistant's final text. Re-fire typing so the indicator
     // bridges any inter-step gap between the last round and the post below.
@@ -139,7 +163,7 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
 
     await step.do('post-final', async () => {
       await discord.postTyping(replyChannelId).catch(() => {});
-      await discord.postMessage(replyChannelId, finalText!);
+      await discord.postMessage(replyChannelId, finalWithCost);
     });
   }
 
@@ -164,7 +188,10 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
           method: 'POST',
           body: JSON.stringify({ name, args }),
         });
-        return await res.text();
+        // /exec-tool now returns { output, usage|null } so tool-internal LLM
+        // costs (generate_draft, swap_meal) can roll into the round's total.
+        const json = (await res.json()) as { output: string; usage: RoundUsage | null };
+        return json.usage ? { output: json.output, usage: json.usage } : json.output;
       },
       onToolCall: async ({ name, args, output }) => {
         await stub.fetch('https://internal/workflow/save-turn', {

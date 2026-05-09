@@ -10,11 +10,12 @@ import {
   MAX_TOOL_ROUNDS as MAX_RUNTIME,
   type RoundResult,
   type RunRoundArgs as RuntimeRunRoundArgs,
+  type ToolResult,
 } from '../runtime/agent-round';
 import { TOOLS } from './tools';
 
 export const MAX_TOOL_ROUNDS = MAX_RUNTIME;
-export type { RoundResult };
+export type { RoundResult, ToolResult };
 
 export interface RunRoundArgs {
   client: RuntimeRunRoundArgs['client'];
@@ -22,7 +23,7 @@ export interface RunRoundArgs {
   messages: any[];
   /** Filled in for tools whose schema has a week_of param when the model omitted it. */
   weekOf: string;
-  executeTool: (name: string, args: any) => Promise<string>;
+  executeTool: (name: string, args: any) => Promise<ToolResult>;
   onToolCall?: (call: { name: string; args: any; output: string }) => Promise<void>;
 }
 

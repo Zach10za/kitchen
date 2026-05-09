@@ -105,7 +105,16 @@
     "TIMEZONE": "America/Los_Angeles",
     "GITHUB_REPO": "Zach10za/kitchen",
     // Per-channel /relay/message rate limit, in messages per rolling hour.
-    "RELAY_RATE_LIMIT_PER_HOUR": "30"
+    "RELAY_RATE_LIMIT_PER_HOUR": "30",
+    // OpenAI pricing — update when OpenAI changes prices, no code deploy needed.
+    // Defaults reflect gpt-5-mini per OpenAI's published pricing as of 2026-01;
+    // built-in tool prices are flat per-call. Override per-environment if you
+    // switch to a different model tier (e.g. gpt-5-pro).
+    "PRICE_INPUT_PER_M": "0.25",
+    "PRICE_CACHED_INPUT_PER_M": "0.025",
+    "PRICE_OUTPUT_PER_M": "2.00",
+    "PRICE_WEB_SEARCH_PER_CALL": "0.025",
+    "PRICE_CODE_INTERPRETER_PER_CALL": "0.03"
   }
 
   // Secrets to set with `wrangler secret put`:

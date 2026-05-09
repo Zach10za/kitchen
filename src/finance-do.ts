@@ -9,6 +9,13 @@ import {
   checkRelayRateLimit as checkRelayRate,
   ensureRelayRateSchema,
 } from './runtime/relay-rate-limit';
+import {
+  ensureUsageSchema,
+  recordUsage,
+  sumUsageByThread,
+  sumUsageSince,
+  countTurnsByThread,
+} from './runtime/usage';
 import { makeOpenAIClient } from './runtime/openai';
 import { runSync } from './finance/sync';
 import { executeFinanceTool, type FinanceToolCtx } from './finance/loop';
@@ -145,6 +152,23 @@ export class FinanceDO extends DurableObject<Env> {
         body.role, body.content, body.tool_call_json ?? null, body.thread_id ?? null, Date.now()
       );
       return Response.json({ ok: true });
+    }
+
+    if (url.pathname === '/workflow/finance/record-usage' && request.method === 'POST') {
+      const body = (await request.json()) as Parameters<typeof recordUsage>[1];
+      const totals = recordUsage(this.sql, body);
+      return Response.json({ thread_total_usage: totals });
+    }
+
+    if (url.pathname === '/workflow/finance/cost-summary') {
+      const threadId = url.searchParams.get('thread_id');
+      const days = Math.max(1, Math.min(365, Number(url.searchParams.get('days') ?? 30)));
+      const sinceMs = Date.now() - days * 86_400_000;
+      const totals = threadId ? sumUsageByThread(this.sql, threadId) : sumUsageSince(this.sql, sinceMs);
+      const turnCount = threadId
+        ? countTurnsByThread(this.sql, threadId)
+        : this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM usage WHERE ts >= ?', sinceMs).toArray()[0]?.n ?? 0;
+      return Response.json({ usage: totals, turn_count: turnCount, days, thread_id: threadId });
     }
 
     if (url.pathname === '/workflow/finance/exec-tool' && request.method === 'POST') {
@@ -388,6 +412,11 @@ export class FinanceDO extends DurableObject<Env> {
         }
         sql.exec('CREATE INDEX IF NOT EXISTS idx_conv_thread ON conversation(thread_id, id DESC)');
       },
+    },
+    {
+      // Per-turn usage rows shared with KitchenDO via runtime/usage.
+      version: 4,
+      up: (sql) => ensureUsageSchema(sql),
     },
   ];
 }

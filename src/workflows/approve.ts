@@ -6,6 +6,9 @@ import { GROCERY_SCHEMA, RECIPE_DETAILS_SCHEMA } from '../agent/schemas';
 import { DiscordAPI } from '../discord/api';
 import { planEmbed, groceryEmbeds } from '../agent/render';
 import { EmbedColor } from '../discord/types';
+import { emptyUsage, addUsage, type RoundUsage } from '../runtime/agent-round';
+import { extractUsageFromResponse } from '../runtime/usage';
+import { computeCost, formatUsd } from '../runtime/pricing';
 
 interface ApproveParams {
   weekOf: string;
@@ -136,6 +139,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
 
     let materialized: MealSlot[] = draft.meals;
     let remindersScheduled = 0;
+    let turnUsage: RoundUsage = emptyUsage();
 
     if (needsMaterialization) {
       await step.do('announce', async () => {
@@ -149,24 +153,33 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       });
 
       // Materialize 7 meals in parallel — each independently retriable.
-      materialized = await Promise.all(
+      // Usage from each call is returned alongside the meal so we can fold
+      // it into the turn total without leaking step state across closures.
+      const materializedWithUsage = await Promise.all(
         draft.meals.map((meal) =>
           step.do(
             `materialize-${meal.day}`,
             { retries: { limit: 2, delay: '2 seconds', backoff: 'linear' } },
-            async (): Promise<MealSlot> => {
-              if (meal.ingredients && meal.steps) return meal;
-              const details = await this.materializeOne(meal, freezerNames);
+            async (): Promise<{ meal: MealSlot; usage: RoundUsage }> => {
+              if (meal.ingredients && meal.steps) {
+                return { meal, usage: emptyUsage() };
+              }
+              const { details, usage } = await this.materializeOne(meal, freezerNames);
               return {
-                ...meal,
-                ingredients: details.ingredients,
-                steps: details.steps,
-                requires_defrost: details.requires_defrost,
+                meal: {
+                  ...meal,
+                  ingredients: details.ingredients,
+                  steps: details.steps,
+                  requires_defrost: details.requires_defrost,
+                },
+                usage,
               };
             }
           )
         )
       );
+      materialized = materializedWithUsage.map((m) => m.meal);
+      for (const m of materializedWithUsage) turnUsage = addUsage(turnUsage, m.usage);
 
       // save-approved is idempotent: only flips status if not already approved.
       // This guards against retry-induced timestamp clobber.
@@ -195,26 +208,30 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
 
     // Per-recipe shopping lists in parallel. Wall-clock = max(per-recipe latency).
     const pantryNames = pantry.map((p) => p.name);
-    const perRecipeLists = await Promise.all(
+    const perRecipeWithUsage = await Promise.all(
       materialized.map((meal) =>
         step.do(
           `shop-${meal.day}`,
           { retries: { limit: 2, delay: '2 seconds', backoff: 'linear' } },
-          async (): Promise<GroceryItem[]> => {
+          async (): Promise<{ items: GroceryItem[]; usage: RoundUsage }> => {
             return await this.shopForRecipe(meal, pantryNames);
           }
         )
       )
     );
+    const perRecipeLists = perRecipeWithUsage.map((r) => r.items);
+    for (const r of perRecipeWithUsage) turnUsage = addUsage(turnUsage, r.usage);
 
     // Combine the 7 lists into one unified list.
-    const groceryItems = await step.do(
+    const combineResult = await step.do(
       'combine-grocery',
       { retries: { limit: 2, delay: '2 seconds', backoff: 'linear' } },
-      async (): Promise<GroceryItem[]> => {
+      async (): Promise<{ items: GroceryItem[]; usage: RoundUsage }> => {
         return await this.combineGroceryLists(perRecipeLists);
       }
     );
+    const groceryItems = combineResult.items;
+    turnUsage = addUsage(turnUsage, combineResult.usage);
 
     await step.do('save-grocery', async () => {
       await stub.fetch('https://internal/workflow/save-grocery', {
@@ -222,6 +239,24 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
         body: JSON.stringify({ week_of: weekOf, items: groceryItems }),
       });
     });
+
+    // Record the cumulative cost of all 15+ LLM calls in this approve flow,
+    // and grab the running thread total for the footer on the final message.
+    const turnTotals = await step.do('record-usage', async () => {
+      const res = await this.kitchen().fetch('https://internal/workflow/record-usage', {
+        method: 'POST',
+        body: JSON.stringify({
+          thread_id: replyChannelId,
+          model: this.env.OPENAI_MODEL,
+          ...turnUsage,
+        }),
+      });
+      return (await res.json()) as { thread_total_usage: RoundUsage };
+    });
+
+    const turnCost = computeCost(turnUsage, this.env);
+    const threadCost = computeCost(turnTotals.thread_total_usage, this.env);
+    const footer = `_${formatUsd(turnCost.total_usd)} this turn · ${formatUsd(threadCost.total_usd)} thread total_`;
 
     await step.do('final-post', async () => {
       const planE = planEmbed({
@@ -236,10 +271,16 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
 
       // Discord allows up to 10 embeds per message. plan + grocery typically
       // fits; if a huge grocery list pushes over the cap, send the rest as
-      // additional thread messages.
+      // additional thread messages. The footer rides on the last batch only.
       const allEmbeds = [planE, ...groceryE];
+      const lastIdx = Math.max(0, allEmbeds.length - 1);
       for (let i = 0; i < allEmbeds.length; i += 10) {
-        await discord.postMessage(replyChannelId, { embeds: allEmbeds.slice(i, i + 10) });
+        const slice = allEmbeds.slice(i, i + 10);
+        const isLast = i + slice.length > lastIdx;
+        await discord.postMessage(replyChannelId, {
+          embeds: slice,
+          ...(isLast ? { content: footer } : {}),
+        });
       }
     });
   }
@@ -258,7 +299,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     });
   }
 
-  private async materializeOne(meal: MealSlot, freezerNames: string[]): Promise<RecipeDetails> {
+  private async materializeOne(meal: MealSlot, freezerNames: string[]): Promise<{ details: RecipeDetails; usage: RoundUsage }> {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 180_000);
     try {
@@ -291,13 +332,16 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       );
       const content = response.output_text;
       if (!content) throw new Error('Recipe materialization returned no content');
-      return JSON.parse(content) as RecipeDetails;
+      return {
+        details: JSON.parse(content) as RecipeDetails,
+        usage: extractUsageFromResponse(response),
+      };
     } finally {
       clearTimeout(timer);
     }
   }
 
-  private async shopForRecipe(meal: MealSlot, pantry: string[]): Promise<GroceryItem[]> {
+  private async shopForRecipe(meal: MealSlot, pantry: string[]): Promise<{ items: GroceryItem[]; usage: RoundUsage }> {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 60_000);
     try {
@@ -332,13 +376,16 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       );
       const content = response.output_text;
       if (!content) throw new Error('Per-recipe grocery returned no content');
-      return (JSON.parse(content) as { items: GroceryItem[] }).items;
+      return {
+        items: (JSON.parse(content) as { items: GroceryItem[] }).items,
+        usage: extractUsageFromResponse(response),
+      };
     } finally {
       clearTimeout(timer);
     }
   }
 
-  private async combineGroceryLists(lists: GroceryItem[][]): Promise<GroceryItem[]> {
+  private async combineGroceryLists(lists: GroceryItem[][]): Promise<{ items: GroceryItem[]; usage: RoundUsage }> {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 60_000);
     try {
@@ -372,7 +419,10 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       );
       const content = response.output_text;
       if (!content) throw new Error('Combine grocery returned no content');
-      return (JSON.parse(content) as { items: GroceryItem[] }).items;
+      return {
+        items: (JSON.parse(content) as { items: GroceryItem[] }).items,
+        usage: extractUsageFromResponse(response),
+      };
     } finally {
       clearTimeout(timer);
     }

@@ -20,6 +20,13 @@ import { MAX_TOOL_ROUNDS, runAgentRound } from './round';
 import type { WeekRow } from '../kitchen-do';
 import type { DiscordAPI } from '../discord/api';
 import { makeOpenAIClient } from '../runtime/openai';
+import {
+  emptyUsage,
+  addUsage,
+  type RoundUsage,
+  type ToolResult,
+} from '../runtime/agent-round';
+import { extractUsageFromResponse, recordUsage, costFooter } from '../runtime/usage';
 
 interface AgentArgs {
   env: Env;
@@ -30,6 +37,10 @@ interface AgentArgs {
 
 export interface AgentResult {
   summary: string;
+  /** Aggregated token + tool usage across every LLM call this turn —
+   *  including tool-internal calls (generate_draft, swap_meal). Callers
+   *  pass this to recordUsage + costFooter for the user-visible footer. */
+  usage: RoundUsage;
 }
 
 /**
@@ -52,6 +63,7 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
   ];
 
   const ctx: ToolCtx = { env, sql, client };
+  let usage: RoundUsage = emptyUsage();
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const result = await runAgentRound({
@@ -71,6 +83,7 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
     });
 
     messages = result.newMessages;
+    usage = addUsage(usage, result.usage);
 
     if (result.type === 'final') {
       const finalText = result.finalText ?? '(no text)';
@@ -78,11 +91,14 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
         'INSERT INTO conversation (week_of, role, content, ts) VALUES (?, ?, ?, ?)',
         weekOf, 'assistant', finalText, Date.now()
       );
-      return { summary: finalText };
+      return { summary: finalText, usage };
     }
   }
 
-  return { summary: 'I got stuck in a tool loop. Try again with a simpler request.' };
+  return {
+    summary: 'I got stuck in a tool loop. Try again with a simpler request.',
+    usage,
+  };
 }
 
 function makeClient(env: Env): OpenAI {
@@ -109,11 +125,15 @@ function recentConversation(
   }));
 }
 
-export async function executeTool(name: string, args: any, ctx: ToolCtx): Promise<string> {
+export async function executeTool(name: string, args: any, ctx: ToolCtx): Promise<ToolResult> {
   try {
     switch (name) {
+      // LLM-using tools — return ToolResult so their token spend rolls into
+      // the round's reported usage. Without this the footer would show only
+      // the wrapper LLM's cost and miss the recipe/swap generations.
       case 'generate_draft':        return await toolGenerateDraft(args, ctx);
       case 'swap_meal':             return await toolSwapMeal(args, ctx);
+      // Pure SQL tools — string return is fine.
       case 'adjust_servings':       return toolAdjustServings(args, ctx);
       case 'reschedule_meal':       return toolRescheduleMeal(args, ctx);
       case 'update_pantry':         return toolUpdatePantry(args, ctx);
@@ -168,7 +188,7 @@ const WEEK_STUBS_SCHEMA = {
 async function generateWeekStubs(
   ctx: ToolCtx,
   args: { prefs: PreferenceRow[]; pantry: PantryItem[]; constraints: string[] }
-): Promise<(MealStub & { day: Day })[]> {
+): Promise<{ stubs: (MealStub & { day: Day })[]; usage: RoundUsage }> {
   const response = await ctx.client.responses.create({
     model: ctx.env.OPENAI_MODEL,
     input: [
@@ -189,14 +209,17 @@ async function generateWeekStubs(
   });
   const content = response.output_text;
   if (!content) throw new Error('Week stub generation returned no content');
-  return (JSON.parse(content) as { meals: (MealStub & { day: Day })[] }).meals;
+  return {
+    stubs: (JSON.parse(content) as { meals: (MealStub & { day: Day })[] }).meals,
+    usage: extractUsageFromResponse(response),
+  };
 }
 
 /** Single-meal stub for swap operations. */
 async function generateMealStub(
   ctx: ToolCtx,
   prompt: string
-): Promise<MealStub> {
+): Promise<{ stub: MealStub; usage: RoundUsage }> {
   const response = await ctx.client.responses.create({
     model: ctx.env.OPENAI_MODEL,
     input: [
@@ -214,19 +237,22 @@ async function generateMealStub(
   });
   const content = response.output_text;
   if (!content) throw new Error('Stub generation returned no content');
-  return JSON.parse(content) as MealStub;
+  return {
+    stub: JSON.parse(content) as MealStub,
+    usage: extractUsageFromResponse(response),
+  };
 }
 
 async function toolGenerateDraft(
   args: { week_of: string; constraints?: string[] },
   ctx: ToolCtx
-): Promise<string> {
+): Promise<ToolResult> {
   const { sql } = ctx;
   const prefs = loadPreferences(sql);
   const pantry = loadPantry(sql);
   const constraints = args.constraints ?? [];
 
-  const stubs = await generateWeekStubs(ctx, { prefs, pantry, constraints });
+  const { stubs, usage } = await generateWeekStubs(ctx, { prefs, pantry, constraints });
 
   const meals: MealSlot[] = stubs.map((s) => ({
     day: s.day,
@@ -253,7 +279,10 @@ async function toolGenerateDraft(
     args.week_of
   );
 
-  return `Generated 7-day draft for week of ${args.week_of}. Meals: ${meals.map((m) => `${m.day}=${m.name}`).join(', ')}.`;
+  return {
+    output: `Generated 7-day draft for week of ${args.week_of}. Meals: ${meals.map((m) => `${m.day}=${m.name}`).join(', ')}.`,
+    usage,
+  };
 }
 
 function buildWeekStubPrompt(args: {
@@ -280,12 +309,12 @@ function buildWeekStubPrompt(args: {
 async function toolSwapMeal(
   args: { week_of: string; day: Day; criteria: string },
   ctx: ToolCtx
-): Promise<string> {
+): Promise<ToolResult> {
   const week = loadWeek(ctx.sql, args.week_of);
   if (!week) return `No plan exists for ${args.week_of}.`;
 
   const otherMeals = week.meals.filter((m) => m.day !== args.day);
-  const stub = await generateMealStub(
+  const { stub, usage } = await generateMealStub(
     ctx,
     [
       `Pick a dinner for ${dayLabel(args.day)} matching: ${args.criteria}.`,
@@ -313,7 +342,10 @@ async function toolSwapMeal(
   );
 
   ctx.sql.exec('UPDATE weeks SET meals_json = ? WHERE week_of = ?', JSON.stringify(meals), args.week_of);
-  return `Swapped ${args.day} to ${stub.name} (${stub.total_minutes} min, ${stub.cuisine}).`;
+  return {
+    output: `Swapped ${args.day} to ${stub.name} (${stub.total_minutes} min, ${stub.cuisine}).`,
+    usage,
+  };
 }
 
 function toolAdjustServings(
@@ -556,6 +588,8 @@ export async function runDraftFlow(args: {
 
   const constraints = notes ? [notes] : [];
   const result = await toolGenerateDraft({ week_of: weekOf, constraints }, ctx);
+  const resultText = typeof result === 'string' ? result : result.output;
+  const turnUsage = typeof result === 'string' ? emptyUsage() : (result.usage ?? emptyUsage());
 
   const week = sql
     .exec<WeekRow>('SELECT * FROM weeks WHERE week_of = ?', weekOf)
@@ -564,15 +598,23 @@ export async function runDraftFlow(args: {
     await discord.postMessage(replyChannelId, {
       embeds: [{
         title: '⚠️ Draft generation failed',
-        description: result,
+        description: resultText,
         color: EmbedColor.error,
       }],
     });
     return;
   }
 
+  // Record usage scoped to this thread + emit the cost footer alongside the
+  // plan embed. Same shape as every other Discord-bound assistant reply.
+  const threadTotal = recordUsage(sql, {
+    thread_id: replyChannelId,
+    model: env.OPENAI_MODEL,
+    ...turnUsage,
+  });
   await discord.postMessage(replyChannelId, {
     embeds: [planEmbed(week, { includeFooterHint: true })],
+    content: costFooter(turnUsage, threadTotal, env).trimStart(),
   });
 }
 
@@ -641,6 +683,7 @@ export async function runPantryFlow(args: {
     },
   });
 
+  const turnUsage = extractUsageFromResponse(response);
   const content = response.output_text;
   if (!content) {
     await discord.postMessage(replyChannelId, {
@@ -701,6 +744,11 @@ export async function runPantryFlow(args: {
   }
 
   const description = fields.length === 0 ? 'No items parsed from that input.' : undefined;
+  const threadTotal = recordUsage(sql, {
+    thread_id: replyChannelId,
+    model: env.OPENAI_MODEL_EXTRACT,
+    ...turnUsage,
+  });
   await discord.postMessage(replyChannelId, {
     embeds: [{
       title: '🥫 Pantry updated',
@@ -708,5 +756,6 @@ export async function runPantryFlow(args: {
       color: fields.length === 0 ? EmbedColor.archived : EmbedColor.inProgress,
       fields: fields.length > 0 ? fields : undefined,
     }],
+    content: costFooter(turnUsage, threadTotal, env).trimStart(),
   });
 }

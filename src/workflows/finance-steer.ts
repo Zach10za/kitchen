@@ -4,9 +4,13 @@ import { DiscordAPI } from '../discord/api';
 import {
   MAX_TOOL_ROUNDS,
   runAgentRound,
+  emptyUsage,
+  addUsage,
   type RoundResult,
+  type RoundUsage,
 } from '../runtime/agent-round';
 import { makeOpenAIClient } from '../runtime/openai';
+import { computeCost, formatUsd } from '../runtime/pricing';
 import { FINANCE_TOOLS } from '../finance/tools';
 
 interface FinanceSteerParams {
@@ -91,6 +95,7 @@ export class FinanceSteerWorkflow extends WorkflowEntrypoint<Env, FinanceSteerPa
     ];
 
     let finalText: string | null = null;
+    let turnUsage: RoundUsage = emptyUsage();
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const inputMessages = messages;
@@ -101,6 +106,7 @@ export class FinanceSteerWorkflow extends WorkflowEntrypoint<Env, FinanceSteerPa
       );
 
       messages = result.newMessages;
+      turnUsage = addUsage(turnUsage, result.usage);
       if (result.type === 'final') {
         finalText = result.finalText ?? '(no text)';
         break;
@@ -110,6 +116,26 @@ export class FinanceSteerWorkflow extends WorkflowEntrypoint<Env, FinanceSteerPa
     if (!finalText) {
       finalText = 'I got stuck in a tool loop. Try again with a simpler request.';
     }
+
+    // Record this turn's usage and pull the running thread total for the
+    // footer. The DO computes the thread total from raw counts so retroactive
+    // pricing changes flow through without rewriting any rows.
+    const turnTotals = await step.do('record-usage', async () => {
+      const res = await stub.fetch('https://internal/workflow/finance/record-usage', {
+        method: 'POST',
+        body: JSON.stringify({
+          thread_id: threadId,
+          model: this.env.OPENAI_MODEL,
+          ...turnUsage,
+        }),
+      });
+      return (await res.json()) as { thread_total_usage: RoundUsage };
+    });
+
+    const turnCost = computeCost(turnUsage, this.env);
+    const threadCost = computeCost(turnTotals.thread_total_usage, this.env);
+    const footer = `\n\n_${formatUsd(turnCost.total_usd)} this turn · ${formatUsd(threadCost.total_usd)} thread total_`;
+    const finalWithCost = finalText + footer;
 
     await step.do('save-assistant', async () => {
       await discord.postTyping(replyChannelId).catch(() => {});
@@ -121,7 +147,7 @@ export class FinanceSteerWorkflow extends WorkflowEntrypoint<Env, FinanceSteerPa
 
     await step.do('post-final', async () => {
       await discord.postTyping(replyChannelId).catch(() => {});
-      await discord.postMessage(replyChannelId, finalText!);
+      await discord.postMessage(replyChannelId, finalWithCost);
     });
   }
 

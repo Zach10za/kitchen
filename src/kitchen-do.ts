@@ -15,6 +15,14 @@ import {
   ensureRelayRateSchema,
 } from './runtime/relay-rate-limit';
 import { runMigrations, type Migration } from './runtime/migrations';
+import {
+  ensureUsageSchema,
+  recordUsage,
+  sumUsageByThread,
+  sumUsageSince,
+  countTurnsByThread,
+  costFooter,
+} from './runtime/usage';
 
 /** Keep this many of the most recent conversation rows per week_of when pruning. */
 const CONVERSATION_PRUNE_PER_WEEK = 200;
@@ -227,7 +235,29 @@ export class KitchenDO extends DurableObject<Env> {
       const client = makeOpenAIClient(this.env, { timeoutMs: 25_000 });
       const ctx: ToolCtx = { env: this.env, sql: this.sql, client };
       const result = await executeTool(body.name, body.args, ctx);
-      return new Response(result, { headers: { 'content-type': 'text/plain' } });
+      // Always return the structured form so SteerWorkflow can fold tool-internal
+      // LLM usage (e.g. generate_draft, swap_meal) into the round's footer total.
+      const payload = typeof result === 'string'
+        ? { output: result, usage: null }
+        : { output: result.output, usage: result.usage ?? null };
+      return Response.json(payload);
+    }
+
+    if (url.pathname === '/workflow/record-usage' && request.method === 'POST') {
+      const body = (await request.json()) as Parameters<typeof recordUsage>[1];
+      const totals = recordUsage(this.sql, body);
+      return Response.json({ thread_total_usage: totals });
+    }
+
+    if (url.pathname === '/workflow/cost-summary') {
+      const threadId = url.searchParams.get('thread_id');
+      const days = Math.max(1, Math.min(365, Number(url.searchParams.get('days') ?? 30)));
+      const sinceMs = Date.now() - days * 86_400_000;
+      const totals = threadId ? sumUsageByThread(this.sql, threadId) : sumUsageSince(this.sql, sinceMs);
+      const turnCount = threadId
+        ? countTurnsByThread(this.sql, threadId)
+        : this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM usage WHERE ts >= ?', sinceMs).toArray()[0]?.n ?? 0;
+      return Response.json({ usage: totals, turn_count: turnCount, days, thread_id: threadId });
     }
 
     if (url.pathname === '/dump') {
@@ -414,14 +444,25 @@ export class KitchenDO extends DurableObject<Env> {
         weekOf,
       });
 
+      // The alarm posts top-level into the kitchen channel (not a thread).
+      // Use the channel id as the "thread" key so the running thread_total
+      // surfaces aggregate cost of all auto-drafts in this channel.
+      const threadTotal = recordUsage(this.sql, {
+        thread_id: this.env.DISCORD_CHANNEL_ID,
+        model: this.env.OPENAI_MODEL,
+        ...result.usage,
+      });
+      const footer = costFooter(result.usage, threadTotal, this.env);
+
       const plan = this.getWeek(weekOf);
       if (plan) {
         await this.discord.postMessage(this.env.DISCORD_CHANNEL_ID, {
-          content: result.summary || undefined,
+          content: (result.summary || '') + footer,
           embeds: [planEmbed(plan, { includeFooterHint: true })],
         });
       } else {
         await this.discord.postMessage(this.env.DISCORD_CHANNEL_ID, {
+          content: footer.trimStart(),
           embeds: [statusEmbed({
             title: '⚠️ Draft generation failed',
             description: result.summary || 'Unknown error.',
@@ -589,7 +630,16 @@ export class KitchenDO extends DurableObject<Env> {
       weekOf,
     });
 
-    await this.discord.postMessage(replyChannelId, result.summary || '(no response)');
+    const threadTotal = recordUsage(this.sql, {
+      thread_id: replyChannelId,
+      model: this.env.OPENAI_MODEL,
+      ...result.usage,
+    });
+    const summary = result.summary || '(no response)';
+    await this.discord.postMessage(
+      replyChannelId,
+      summary + costFooter(result.usage, threadTotal, this.env)
+    );
   }
 
   /**
@@ -719,6 +769,12 @@ export class KitchenDO extends DurableObject<Env> {
       // so other bots can adopt the same table by calling ensureRelayRateSchema.
       version: 4,
       up: (sql) => ensureRelayRateSchema(sql),
+    },
+    {
+      // Per-turn usage rows shared with FinanceDO via runtime/usage.
+      // Used to render the cost footer on every Discord-bound reply.
+      version: 5,
+      up: (sql) => ensureUsageSchema(sql),
     },
   ];
 

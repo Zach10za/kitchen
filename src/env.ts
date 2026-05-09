@@ -19,6 +19,13 @@ export interface Env {
   GITHUB_REPO: string;
   /** Per-channel relay rate limit: max forwarded messages per hour (defaults to 30 if unset). */
   RELAY_RATE_LIMIT_PER_HOUR?: string;
+  /** OpenAI pricing in USD per million tokens / per call. Update when OpenAI
+   *  changes prices — no code deploy needed. Strings so wrangler vars work. */
+  PRICE_INPUT_PER_M?: string;
+  PRICE_CACHED_INPUT_PER_M?: string;
+  PRICE_OUTPUT_PER_M?: string;
+  PRICE_WEB_SEARCH_PER_CALL?: string;
+  PRICE_CODE_INTERPRETER_PER_CALL?: string;
 
   // Secrets
   DISCORD_PUBLIC_KEY: string;
