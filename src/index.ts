@@ -5,10 +5,13 @@ import { DiscordAPI } from './discord/api';
 import { prepareChatThread } from './discord/thread';
 import { currentOrNextMondayISO } from './util/datetime';
 import { captureError } from './error-triage';
+import { ALL_BOTS, botForChannel, botForCommand } from './runtime/bot-registry';
 
 export { KitchenDO } from './kitchen-do';
+export { FinanceDO } from './finance-do';
 export { ApproveWorkflow } from './workflows/approve';
 export { SteerWorkflow } from './workflows/steer';
+export { FinanceSteerWorkflow } from './workflows/finance-steer';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -22,12 +25,15 @@ export default {
   },
 
   /**
-   * Cron heartbeat: pings KitchenDO (re-arms alarms, dispatches reminders).
-   * Runs hourly. The Discord Gateway connection lives on Fly.io now.
+   * Cron heartbeat: pings every bot DO so each can re-arm alarms, dispatch
+   * reminders, or run its scheduled work (e.g. FinanceDO syncs from
+   * SimpleFin). Runs hourly. The Discord Gateway connection lives on Fly.io.
    */
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    const kitchen = getKitchenStub(env);
-    ctx.waitUntil(kitchen.fetch('https://internal/heartbeat', { method: 'POST' }));
+    for (const bot of ALL_BOTS) {
+      const stub = bot.getStub(env);
+      ctx.waitUntil(stub.fetch('https://internal/heartbeat', { method: 'POST' }));
+    }
   },
 } satisfies ExportedHandler<Env>;
 
@@ -45,14 +51,17 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   }
 
   // Discord Gateway relay (running on Fly.io) forwards plain-text messages
-  // here via shared-secret HTTPS. We anchor a thread to the user's message
-  // and run the SteerWorkflow with that thread as its replyChannelId.
+  // here via shared-secret HTTPS. We pick the bot owning the channel,
+  // anchor a thread to the user's message, and dispatch into that bot.
   if (url.pathname === '/relay/message' && request.method === 'POST') {
     if (!relaySecretValid(request, env)) {
       return new Response('forbidden', { status: 403 });
     }
     const body = (await request.json()) as {
       channelId: string;
+      /** Set when the message is inside a thread. The relay resolves the
+       *  thread's parent so we can route by the bot owning that channel. */
+      parentChannelId?: string | null;
       messageId?: string;
       userMessage: string;
       author?: string;
@@ -61,44 +70,65 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       return new Response('bad request', { status: 400 });
     }
 
-    // Per-channel hourly rate limit. The DO is the single source of truth for
-    // this, so a compromised relay can't drive unlimited LLM spend.
-    const stub = getKitchenStub(env);
+    // Bot ownership is decided by the parent channel when in a thread, else
+    // by the channel itself. Per-channel rate limit + reply target both
+    // follow from this.
+    const ownerChannelId = body.parentChannelId || body.channelId;
+    const bot = botForChannel(env, ownerChannelId);
+    if (!bot) {
+      // Unknown channel — relay must be misconfigured. Drop with 404 so the
+      // relay's logs flag the misrouted message.
+      return new Response('channel not registered', { status: 404 });
+    }
+
+    const stub = bot.getStub(env);
     const rateRes = await stub.fetch('https://internal/relay-allowed', {
       method: 'POST',
-      body: JSON.stringify({ channelId: body.channelId }),
+      body: JSON.stringify({ channelId: ownerChannelId }),
     });
     if (!rateRes.ok) {
       return new Response('rate limited', { status: 429 });
     }
 
-    // Anchor a thread to the user's own message and reply inside it. Done
-    // here (not inside the workflow) because thread creation is non-idempotent
-    // and workflow steps re-run on retry.
-    const discord = new DiscordAPI(env.DISCORD_BOT_TOKEN, env.DISCORD_APP_ID);
+    // Two reply paths:
+    //  1) Top-level message → open a fresh thread anchored to the user's msg.
+    //  2) Already in a thread → reuse that thread, no new thread creation.
     let replyChannelId: string;
-    try {
-      replyChannelId = await prepareChatThread({
-        discord,
-        env,
-        channelId: body.channelId,
-        parentMessageId: body.messageId,
-        titleSeed: body.userMessage,
-      });
-    } catch (err) {
-      ctx.waitUntil(captureError(env, err, { source: 'relay:thread-create' }));
-      return new Response('thread create failed', { status: 502 });
+    if (body.parentChannelId) {
+      replyChannelId = body.channelId;
+    } else {
+      const discord = new DiscordAPI(env.DISCORD_BOT_TOKEN, env.DISCORD_APP_ID);
+      try {
+        replyChannelId = await prepareChatThread({
+          discord,
+          env,
+          channelId: body.channelId,
+          parentMessageId: body.messageId,
+          titleSeed: body.userMessage,
+        });
+      } catch (err) {
+        ctx.waitUntil(captureError(env, err, { source: 'relay:thread-create' }));
+        return new Response('thread create failed', { status: 502 });
+      }
     }
 
-    ctx.waitUntil(
-      env.STEER_WORKFLOW.create({
-        params: {
-          weekOf: currentOrNextMondayISO(env.TIMEZONE),
-          replyChannelId,
-          userMessage: body.userMessage,
-        },
-      })
-    );
+    if (bot.id === 'kitchen') {
+      ctx.waitUntil(
+        env.STEER_WORKFLOW.create({
+          params: {
+            weekOf: currentOrNextMondayISO(env.TIMEZONE),
+            replyChannelId,
+            userMessage: body.userMessage,
+          },
+        })
+      );
+    } else {
+      ctx.waitUntil(
+        env.FINANCE_STEER_WORKFLOW.create({
+          params: { userMessage: body.userMessage, replyChannelId },
+        })
+      );
+    }
 
     return Response.json({ ok: true });
   }
@@ -107,14 +137,22 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   // bot token, which is a live production credential), supplied via the
   // Authorization header so it doesn't leak through CDN/proxy access logs.
   //
+  // /admin/dump and /admin/reset accept ?bot=kitchen|finance (default kitchen).
+  // Kitchen-specific endpoints (/admin/grocery, /admin/clear-grocery) target
+  // KitchenDO regardless. /admin/finance/sync forces a SimpleFin pull.
+  //
   // Usage:
   //   curl -H "Authorization: Bearer $ADMIN_TOKEN" https://.../admin/dump
-  //   curl -H "Authorization: Bearer $ADMIN_TOKEN" -X POST https://.../admin/reset
+  //   curl -H "Authorization: Bearer $ADMIN_TOKEN" 'https://.../admin/dump?bot=finance'
+  //   curl -H "Authorization: Bearer $ADMIN_TOKEN" -X POST https://.../admin/finance/sync
   if (url.pathname.startsWith('/admin/')) {
     if (!checkAdmin(request, env)) {
       return new Response('forbidden', { status: 403 });
     }
-    const stub = getKitchenStub(env);
+    const botParam = url.searchParams.get('bot') === 'finance' ? 'finance' : 'kitchen';
+    const stub = botParam === 'finance'
+      ? env.FINANCE.get(env.FINANCE.idFromName('default-household'))
+      : env.KITCHEN.get(env.KITCHEN.idFromName('default-household'));
 
     if (url.pathname === '/admin/dump' && request.method === 'GET') {
       return stub.fetch('https://internal/dump');
@@ -122,15 +160,21 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (url.pathname === '/admin/reset' && request.method === 'POST') {
       return stub.fetch('https://internal/reset', { method: 'POST' });
     }
+    if (url.pathname === '/admin/finance/sync' && request.method === 'POST') {
+      const finance = env.FINANCE.get(env.FINANCE.idFromName('default-household'));
+      return finance.fetch('https://internal/sync', { method: 'POST' });
+    }
     if (url.pathname === '/admin/grocery' && request.method === 'GET') {
       const weekOf = validateWeekOf(url.searchParams.get('week_of'));
       if (!weekOf) return new Response('invalid week_of', { status: 400 });
-      return stub.fetch(`https://internal/get-grocery?week_of=${weekOf}`);
+      const kitchen = env.KITCHEN.get(env.KITCHEN.idFromName('default-household'));
+      return kitchen.fetch(`https://internal/get-grocery?week_of=${weekOf}`);
     }
     if (url.pathname === '/admin/clear-grocery' && request.method === 'POST') {
       const weekOf = validateWeekOf(url.searchParams.get('week_of'));
       if (!weekOf) return new Response('invalid week_of', { status: 400 });
-      return stub.fetch(`https://internal/clear-grocery?week_of=${weekOf}`, { method: 'POST' });
+      const kitchen = env.KITCHEN.get(env.KITCHEN.idFromName('default-household'));
+      return kitchen.fetch(`https://internal/clear-grocery?week_of=${weekOf}`, { method: 'POST' });
     }
     return new Response('not found', { status: 404 });
   }
@@ -153,10 +197,19 @@ async function handleDiscordInteraction(
     return Response.json({ type: InteractionResponseType.PONG });
   }
 
+  // Pick the owning bot by command name. MESSAGE_COMPONENT interactions inherit
+  // the bot of the originating slash-command; in practice all current components
+  // are kitchen-side, so we route those there.
+  const commandName = interaction.data?.name ?? '';
+  const bot =
+    interaction.type === InteractionType.APPLICATION_COMMAND
+      ? botForCommand(commandName)
+      : botForCommand(commandName); // (same fallback — extend here once a bot owns components)
+  const stub = bot.getStub(env);
+
   // Fast path: pure-read commands with sub-3s budget skip the defer roundtrip
   // and respond inline. Saves ~600-800ms of perceived latency.
   if (interaction.type === InteractionType.APPLICATION_COMMAND && isFastReadCommand(interaction)) {
-    const stub = getKitchenStub(env);
     const res = await stub.fetch('https://internal/fast-read', {
       method: 'POST',
       body: JSON.stringify(interaction),
@@ -175,7 +228,6 @@ async function handleDiscordInteraction(
     interaction.type === InteractionType.APPLICATION_COMMAND ||
     interaction.type === InteractionType.MESSAGE_COMPONENT
   ) {
-    const stub = getKitchenStub(env);
     ctx.waitUntil(
       stub.fetch('https://internal/interaction', {
         method: 'POST',
@@ -199,6 +251,7 @@ function isFastReadCommand(interaction: Interaction): boolean {
   );
 
   switch (name) {
+    // Kitchen
     case 'profile':
       return !hasMessage;     // /profile (alone) = read; with message = write
     case 'pantry':
@@ -209,15 +262,18 @@ function isFastReadCommand(interaction: Interaction): boolean {
       return false;           // routed through DO so it can split into multiple messages
     case 'reminders':
       return true;            // simple list, fits in one message
+    // Finance
+    case 'finance':
+      return !hasMessage;     // /finance (alone) = read; with message = agent
+    case 'spending':
+      return true;            // pure read
+    case 'merchant':
+      return true;            // pure read
+    case 'accounts':
+      return true;            // pure read
     default:
       return false;
   }
-}
-
-/** Single-tenant for now: one DO per household, fixed name. */
-function getKitchenStub(env: Env) {
-  const id = env.KITCHEN.idFromName('default-household');
-  return env.KITCHEN.get(id);
 }
 
 /**

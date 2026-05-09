@@ -9,15 +9,30 @@
  *
  * Required env:
  *   DISCORD_BOT_TOKEN     — bot's authentication token
- *   DISCORD_CHANNEL_ID    — kitchen channel ID (we filter by this)
+ *   DISCORD_CHANNEL_IDS   — comma-separated channel IDs to forward (one per bot:
+ *                           kitchen, finance, …). Legacy DISCORD_CHANNEL_ID is
+ *                           also accepted as a single-channel fallback.
  *   WORKER_URL            — base URL of the Cloudflare Worker (no trailing slash)
  *   RELAY_SECRET          — shared secret between Fly + Worker
  */
 
 const TOKEN = required('DISCORD_BOT_TOKEN');
-const CHANNEL_ID = required('DISCORD_CHANNEL_ID');
+const CHANNEL_IDS = parseChannelIds();
 const WORKER_URL = required('WORKER_URL');
 const RELAY_SECRET = required('RELAY_SECRET');
+
+function parseChannelIds(): Set<string> {
+  const list = process.env.DISCORD_CHANNEL_IDS ?? process.env.DISCORD_CHANNEL_ID ?? '';
+  const ids = list
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (ids.length === 0) {
+    console.error('Missing required env: DISCORD_CHANNEL_IDS (or legacy DISCORD_CHANNEL_ID)');
+    process.exit(1);
+  }
+  return new Set(ids);
+}
 
 // Intents:
 //   GUILDS (1)              — basic guild metadata
@@ -182,16 +197,58 @@ function handleDispatch(eventType: string, data: any): void {
   // Ignore everything else (typing, presence, reactions, ...)
 }
 
+/**
+ * Cache for thread→parent_id lookups. Discord channel IDs are stable, so once
+ * we've classified a thread we don't need to ask again. Negative results
+ * (channel is unrelated to a watched parent) are cached as null to avoid
+ * re-querying every relay event for chatty unrelated channels.
+ */
+const threadParentCache = new Map<string, string | null>();
+/** Channel types from Discord docs: 10/11/12 are thread types. */
+const THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
+
+async function resolveThreadParent(channelId: string): Promise<string | null> {
+  if (threadParentCache.has(channelId)) {
+    return threadParentCache.get(channelId)!;
+  }
+  try {
+    const res = await fetch(`https://discord.com/api/v10/channels/${channelId}`, {
+      headers: { Authorization: `Bot ${TOKEN}` },
+    });
+    if (!res.ok) {
+      // 403/404 happen for channels in guilds we're not in, etc. Cache null.
+      threadParentCache.set(channelId, null);
+      return null;
+    }
+    const json = (await res.json()) as { type: number; parent_id?: string | null };
+    const parent = THREAD_CHANNEL_TYPES.has(json.type) ? json.parent_id ?? null : null;
+    threadParentCache.set(channelId, parent);
+    return parent;
+  } catch (err) {
+    console.warn(`resolveThreadParent failed for ${channelId}:`, err);
+    return null;
+  }
+}
+
 async function forwardMessage(msg: any): Promise<void> {
-  // Filter: only kitchen channel
-  if (msg.channel_id !== CHANNEL_ID) return;
-  // Filter: ignore bot messages (including ourselves)
+  // Ignore bot messages (including our own replies).
   if (msg.author?.bot) return;
-  // Filter: ignore empty messages (embed-only, attachments without text)
+  // Ignore empty messages (embed-only, attachments without text).
   const content = (msg.content ?? '').trim();
   if (!content) return;
 
-  console.log(`Forwarding from ${msg.author?.username}: ${content.slice(0, 80)}`);
+  // Two paths:
+  //  1) Top-level message in a watched channel → forward as-is.
+  //  2) Message in a thread whose parent is watched → forward with parentChannelId
+  //     so the Worker can reply inside the thread instead of opening a new one.
+  let parentChannelId: string | null = null;
+  if (!CHANNEL_IDS.has(msg.channel_id)) {
+    parentChannelId = await resolveThreadParent(msg.channel_id);
+    if (!parentChannelId || !CHANNEL_IDS.has(parentChannelId)) return;
+  }
+
+  const where = parentChannelId ? `thread of ${parentChannelId}` : 'channel';
+  console.log(`Forwarding from ${msg.author?.username} (${where}): ${content.slice(0, 80)}`);
 
   try {
     const res = await fetch(`${WORKER_URL}/relay/message`, {
@@ -202,6 +259,7 @@ async function forwardMessage(msg: any): Promise<void> {
       },
       body: JSON.stringify({
         channelId: msg.channel_id,
+        parentChannelId,
         messageId: msg.id,
         author: msg.author?.username,
         userMessage: content,
@@ -289,7 +347,7 @@ Bun.serve({
 
 console.log(`Health server listening on :${healthPort}`);
 console.log(`Worker URL: ${WORKER_URL}`);
-console.log(`Channel ID: ${CHANNEL_ID}`);
+console.log(`Channel IDs: ${[...CHANNEL_IDS].join(', ')}`);
 
 // Kick off the gateway connection
 connect();

@@ -1,9 +1,11 @@
 export interface Env {
   // Bindings
   KITCHEN: DurableObjectNamespace;
+  FINANCE: DurableObjectNamespace;
   AI: Ai;
   APPROVE_WORKFLOW: Workflow;
   STEER_WORKFLOW: Workflow;
+  FINANCE_STEER_WORKFLOW: Workflow;
 
   // Vars
   OPENAI_MODEL: string;
@@ -24,9 +26,14 @@ export interface Env {
   DISCORD_APP_ID: string;
   DISCORD_GUILD_ID: string;
   DISCORD_CHANNEL_ID: string;
+  /** Channel ID where the FinanceDO posts. Required for the finance bot. */
+  DISCORD_FINANCE_CHANNEL_ID: string;
   OPENAI_API_KEY: string;
   AI_GATEWAY_URL: string;
   RELAY_SECRET: string;
   ADMIN_TOKEN: string;
   GITHUB_TOKEN: string;
+  /** SimpleFin Bridge access URL (https://USER:PASS@.../simplefin). Obtained
+   *  by running `bun run scripts/simplefin-claim.ts` once with a setup token. */
+  SIMPLEFIN_ACCESS_URL: string;
 }

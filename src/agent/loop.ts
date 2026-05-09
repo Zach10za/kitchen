@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import type OpenAI from 'openai';
 import type { Env } from '../env';
 import type {
   Day,
@@ -7,7 +7,6 @@ import type {
   PantryItem,
   PreferenceRow,
 } from './tools';
-import { TOOLS } from './tools';
 import { planEmbed } from './render';
 import { EmbedColor } from '../discord/types';
 import {
@@ -20,6 +19,7 @@ import {
 import { MAX_TOOL_ROUNDS, runAgentRound } from './round';
 import type { WeekRow } from '../kitchen-do';
 import type { DiscordAPI } from '../discord/api';
+import { makeOpenAIClient } from '../runtime/openai';
 
 interface AgentArgs {
   env: Env;
@@ -85,30 +85,10 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
   return { summary: 'I got stuck in a tool loop. Try again with a simpler request.' };
 }
 
-/**
- * Convert TOOLS (Chat Completions format) to Responses API format.
- * Chat:      { type: 'function', function: { name, description, parameters } }
- * Responses: { type: 'function', name, description, parameters, strict: false }
- */
-export function toResponsesTools(tools: typeof TOOLS): any[] {
-  return tools.map((t) => ({
-    type: 'function' as const,
-    name: t.function.name,
-    description: t.function.description,
-    parameters: t.function.parameters,
-    strict: false,
-  }));
-}
-
 function makeClient(env: Env): OpenAI {
-  return new OpenAI({
-    apiKey: env.OPENAI_API_KEY,
-    baseURL: env.AI_GATEWAY_URL || undefined,
-    // 3 min per call. Lets gpt-5 take its time on hard tasks (grocery list
-    // transformation, complex tool decisions) without falsely aborting.
-    timeout: 180_000,
-    maxRetries: 1,
-  });
+  // 3 min per call lets gpt-5 take its time on hard tasks (grocery list
+  // transformation, complex tool decisions) without falsely aborting.
+  return makeOpenAIClient(env);
 }
 
 export interface ToolCtx { env: Env; sql: SqlStorage; client: OpenAI }

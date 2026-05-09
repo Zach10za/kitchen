@@ -9,10 +9,13 @@ import { buildSystemPromptFor, findActiveWeek } from './agent/context';
 import { planEmbed, groceryEmbeds, statusEmbed } from './agent/render';
 import { currentOrNextMondayISO, nextMondayISO, nextDraftTime, mealCookTime } from './util/datetime';
 import { captureError } from './error-triage';
-import OpenAI from 'openai';
+import { makeOpenAIClient } from './runtime/openai';
+import {
+  checkRelayRateLimit as checkRelayRate,
+  ensureRelayRateSchema,
+} from './runtime/relay-rate-limit';
+import { runMigrations, type Migration } from './runtime/migrations';
 
-/** Rolling-window rate limit: forwarded /relay/message calls per channel per hour. */
-const DEFAULT_RELAY_RATE_LIMIT_PER_HOUR = 30;
 /** Keep this many of the most recent conversation rows per week_of when pruning. */
 const CONVERSATION_PRUNE_PER_WEEK = 200;
 /** Run conversation prune at most once per this many ms per DO instance. */
@@ -80,7 +83,8 @@ export class KitchenDO extends DurableObject<Env> {
     if (url.pathname === '/relay-allowed' && request.method === 'POST') {
       const body = (await request.json()) as { channelId: string };
       if (!body.channelId) return Response.json({ allowed: false, reason: 'missing channelId' }, { status: 400 });
-      const decision = this.checkRelayRateLimit(body.channelId);
+      const limit = Number(this.env.RELAY_RATE_LIMIT_PER_HOUR ?? '') || undefined;
+      const decision = checkRelayRate(this.sql, body.channelId, limit);
       return Response.json(decision, { status: decision.allowed ? 200 : 429 });
     }
 
@@ -218,12 +222,9 @@ export class KitchenDO extends DurableObject<Env> {
 
     if (url.pathname === '/workflow/exec-tool' && request.method === 'POST') {
       const body = (await request.json()) as { name: string; args: any };
-      const client = new OpenAI({
-        apiKey: this.env.OPENAI_API_KEY,
-        baseURL: this.env.AI_GATEWAY_URL || undefined,
-        timeout: 25_000,
-        maxRetries: 1,
-      });
+      // 25s per-tool budget keeps a single slow tool from monopolizing the
+      // workflow step retry budget; the whole-flow budget lives at the round level.
+      const client = makeOpenAIClient(this.env, { timeoutMs: 25_000 });
       const ctx: ToolCtx = { env: this.env, sql: this.sql, client };
       const result = await executeTool(body.name, body.args, ctx);
       return new Response(result, { headers: { 'content-type': 'text/plain' } });
@@ -626,7 +627,7 @@ export class KitchenDO extends DurableObject<Env> {
    * version is stored in settings.schema_version. Append new entries — never
    * mutate existing ones, since old DOs may have already applied them.
    */
-  private static readonly MIGRATIONS: { version: number; up: (sql: SqlStorage) => void }[] = [
+  private static readonly MIGRATIONS: readonly Migration[] = [
     {
       version: 1,
       up: (sql) => {
@@ -714,46 +715,15 @@ export class KitchenDO extends DurableObject<Env> {
       },
     },
     {
-      // /relay/message rate-limit hits.
+      // /relay/message rate-limit hits. Schema lives in runtime/relay-rate-limit
+      // so other bots can adopt the same table by calling ensureRelayRateSchema.
       version: 4,
-      up: (sql) => {
-        sql.exec(`
-          CREATE TABLE IF NOT EXISTS relay_rate (
-            channel_id TEXT NOT NULL,
-            hit_at INTEGER NOT NULL
-          );
-          CREATE INDEX IF NOT EXISTS idx_relay_rate_channel ON relay_rate(channel_id, hit_at);
-        `);
-      },
+      up: (sql) => ensureRelayRateSchema(sql),
     },
   ];
 
   private initSchema(): void {
-    // Bootstrap settings table so we have somewhere to record schema_version.
-    // It's also the first table created by migration v1 — guarded by IF NOT EXISTS.
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-    `);
-    const row = this.sql
-      .exec<{ value: string }>("SELECT value FROM settings WHERE key = 'schema_version'")
-      .toArray()[0];
-    const current = row ? Number(row.value) || 0 : 0;
-    let applied = current;
-    for (const m of KitchenDO.MIGRATIONS) {
-      if (m.version <= current) continue;
-      m.up(this.sql);
-      applied = m.version;
-    }
-    if (applied !== current) {
-      this.sql.exec(
-        "INSERT INTO settings (key, value, updated_at) VALUES ('schema_version', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        String(applied), Date.now()
-      );
-    }
+    runMigrations(this.sql, KitchenDO.MIGRATIONS);
   }
 
   getWeek(weekOf: string): WeekRow | null {
@@ -838,26 +808,6 @@ export class KitchenDO extends DurableObject<Env> {
       }
     }
     return count;
-  }
-
-  /**
-   * Per-channel rolling-window rate limit for /relay/message. Stored in a
-   * relay_rate table so it's transactionally safe across DO restarts and
-   * doesn't depend on cf-cache TTLs.
-   */
-  private checkRelayRateLimit(channelId: string): { allowed: boolean; remaining: number; reason?: string } {
-    const limit = Number(this.env.RELAY_RATE_LIMIT_PER_HOUR ?? '') || DEFAULT_RELAY_RATE_LIMIT_PER_HOUR;
-    const now = Date.now();
-    const windowStart = now - 3_600_000;
-    this.sql.exec('DELETE FROM relay_rate WHERE hit_at < ?', windowStart);
-    const count = this.sql
-      .exec<{ n: number }>('SELECT COUNT(*) AS n FROM relay_rate WHERE channel_id = ?', channelId)
-      .toArray()[0]?.n ?? 0;
-    if (count >= limit) {
-      return { allowed: false, remaining: 0, reason: 'rate_limit_exceeded' };
-    }
-    this.sql.exec('INSERT INTO relay_rate (channel_id, hit_at) VALUES (?, ?)', channelId, now);
-    return { allowed: true, remaining: limit - count - 1 };
   }
 
   /**

@@ -5,18 +5,24 @@
   "compatibility_date": "2026-04-01",
   "compatibility_flags": ["nodejs_compat"],
 
-  // Durable Object holding household state
+  // Durable Objects: one per bot. Each owns its own SQLite + alarm slot;
+  // the runtime modules under src/runtime/ are what they share.
   "durable_objects": {
     "bindings": [
       {
         "name": "KITCHEN",
         "class_name": "KitchenDO"
+      },
+      {
+        "name": "FINANCE",
+        "class_name": "FinanceDO"
       }
     ]
   },
 
   // Migrations history. v1 created KitchenDO, v2 added GatewayDO (now removed),
-  // v3 deletes GatewayDO since the gateway connection lives on Fly.io now.
+  // v3 deletes GatewayDO (gateway connection lives on Fly.io now), v4 adds
+  // FinanceDO for the finance bot.
   "migrations": [
     {
       "tag": "v1",
@@ -29,6 +35,10 @@
     {
       "tag": "v3",
       "deleted_classes": ["GatewayDO"]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": ["FinanceDO"]
     }
   ],
 
@@ -44,6 +54,11 @@
       "name": "steer",
       "binding": "STEER_WORKFLOW",
       "class_name": "SteerWorkflow"
+    },
+    {
+      "name": "finance-steer",
+      "binding": "FINANCE_STEER_WORKFLOW",
+      "class_name": "FinanceSteerWorkflow"
     }
   ],
 
@@ -94,15 +109,19 @@
   }
 
   // Secrets to set with `wrangler secret put`:
-  //   DISCORD_PUBLIC_KEY      — for verifying interaction signatures
-  //   DISCORD_BOT_TOKEN       — for posting messages via REST
-  //   DISCORD_APP_ID          — for slash command registration
-  //   DISCORD_GUILD_ID        — your server ID (scopes commands to your server)
-  //   DISCORD_CHANNEL_ID      — the channel the bot posts proactive drafts to
-  //   OPENAI_API_KEY          — your OpenAI key
-  //   AI_GATEWAY_URL          — e.g. https://gateway.ai.cloudflare.com/v1/<acct>/kitchen/openai
-  //   RELAY_SECRET            — shared secret with the Fly.io gateway-relay
-  //   ADMIN_TOKEN             — bearer token for /admin/* endpoints
-  //   GITHUB_TOKEN            — fine-grained PAT with Issues:write on this repo
-  //                             (used by error-triage to file auto-fix issues)
+  //   DISCORD_PUBLIC_KEY         — for verifying interaction signatures
+  //   DISCORD_BOT_TOKEN          — for posting messages via REST
+  //   DISCORD_APP_ID             — for slash command registration
+  //   DISCORD_GUILD_ID           — your server ID (scopes commands to your server)
+  //   DISCORD_CHANNEL_ID         — channel the kitchen bot posts proactive drafts to
+  //   DISCORD_FINANCE_CHANNEL_ID — channel the finance bot posts to
+  //   OPENAI_API_KEY             — your OpenAI key
+  //   AI_GATEWAY_URL             — e.g. https://gateway.ai.cloudflare.com/v1/<acct>/kitchen/openai
+  //   RELAY_SECRET               — shared secret with the Fly.io gateway-relay
+  //   ADMIN_TOKEN                — bearer token for /admin/* endpoints
+  //   GITHUB_TOKEN               — fine-grained PAT with Issues:write on this repo
+  //                                (used by error-triage to file auto-fix issues)
+  //   SIMPLEFIN_ACCESS_URL       — long-lived SimpleFin Bridge access URL with embedded
+  //                                Basic-auth creds. Run `bun run scripts/simplefin-claim.ts`
+  //                                once with a setup token to mint this.
 }

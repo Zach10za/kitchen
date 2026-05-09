@@ -10,7 +10,10 @@
  *   (read from process.env; if .dev.vars exists, source it first)
  */
 
+export {};
+
 const STRING = 3;
+const INTEGER = 4;
 
 const COMMANDS = [
   {
@@ -60,6 +63,38 @@ const COMMANDS = [
   {
     name: 'reminders',
     description: 'Show upcoming defrost/prep reminders',
+  },
+  // ─── Finance bot ──────────────────────────────────────────────────
+  // Lives in #finance. Shares the same Discord app + bot token.
+  {
+    name: 'finance',
+    description: 'Ask anything about your spending, accounts, or trends. Without a message, shows a 30d summary.',
+    options: [
+      { name: 'message', description: 'What you want to know (omit to see a quick summary)', type: STRING, required: false },
+    ],
+  },
+  {
+    name: 'spending',
+    description: 'Quick spending summary with top merchants',
+    options: [
+      { name: 'days', description: 'Lookback window in days (default 30)', type: INTEGER, required: false },
+    ],
+  },
+  {
+    name: 'merchant',
+    description: 'Show all transactions and stats for one merchant',
+    options: [
+      { name: 'name', description: 'Normalized merchant name, e.g. "starbucks", "amazon"', type: STRING, required: true },
+      { name: 'days', description: 'Lookback window in days (default 90)', type: INTEGER, required: false },
+    ],
+  },
+  {
+    name: 'accounts',
+    description: 'List linked bank/card accounts and balances',
+  },
+  {
+    name: 'finance-sync',
+    description: 'Pull latest from SimpleFin now (normally syncs hourly)',
   },
 ];
 
