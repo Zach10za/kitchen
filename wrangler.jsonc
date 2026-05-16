@@ -11,13 +11,13 @@
     "bindings": [
       {
         "name": "KITCHEN",
-        "class_name": "KitchenDO"
+        "class_name": "KitchenDO",
       },
       {
         "name": "FINANCE",
-        "class_name": "FinanceDO"
-      }
-    ]
+        "class_name": "FinanceDO",
+      },
+    ],
   },
 
   // Migrations history. v1 created KitchenDO, v2 added GatewayDO (now removed),
@@ -26,20 +26,20 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["KitchenDO"]
+      "new_sqlite_classes": ["KitchenDO"],
     },
     {
       "tag": "v2",
-      "new_sqlite_classes": ["GatewayDO"]
+      "new_sqlite_classes": ["GatewayDO"],
     },
     {
       "tag": "v3",
-      "deleted_classes": ["GatewayDO"]
+      "deleted_classes": ["GatewayDO"],
     },
     {
       "tag": "v4",
-      "new_sqlite_classes": ["FinanceDO"]
-    }
+      "new_sqlite_classes": ["FinanceDO"],
+    },
   ],
 
   // Workflows for long-running multi-step operations (e.g. /approve).
@@ -48,29 +48,29 @@
     {
       "name": "approve-plan",
       "binding": "APPROVE_WORKFLOW",
-      "class_name": "ApproveWorkflow"
+      "class_name": "ApproveWorkflow",
     },
     {
       "name": "steer",
       "binding": "STEER_WORKFLOW",
-      "class_name": "SteerWorkflow"
+      "class_name": "SteerWorkflow",
     },
     {
       "name": "finance-steer",
       "binding": "FINANCE_STEER_WORKFLOW",
-      "class_name": "FinanceSteerWorkflow"
-    }
+      "class_name": "FinanceSteerWorkflow",
+    },
   ],
 
   // Hourly cron keeps KitchenDO alarms armed and dispatches due reminders.
   "triggers": {
-    "crons": ["0 * * * *"]
+    "crons": ["0 * * * *"],
   },
 
   // AI Gateway binding (set up in Cloudflare dashboard at:
   //   AI > AI Gateway > create gateway "kitchen")
   "ai": {
-    "binding": "AI"
+    "binding": "AI",
   },
 
   // Workers Logs — populates the dashboard's Observability tab with every
@@ -87,19 +87,19 @@
     "head_sampling_rate": 1,
     "traces": {
       "enabled": true,
-      "head_sampling_rate": 1
-    }
+      "head_sampling_rate": 1,
+    },
   },
 
   // Public env (non-secret). Secrets go via `wrangler secret put`.
   "vars": {
     // Planner / steering model — strongest reasoning we use.
-    "OPENAI_MODEL": "gpt-5-mini",
+    "OPENAI_MODEL": "gpt-5.4-mini",
     // Pure structured-output extraction (pantry parse, recipe materialize).
     // Cheap + fast; no creativity needed.
-    "OPENAI_MODEL_EXTRACT": "gpt-5-nano",
+    "OPENAI_MODEL_EXTRACT": "gpt-5.4-nano",
     // Cheap, fast model for one-shot title generation in error triage.
-    "OPENAI_MODEL_FAST": "gpt-5-nano",
+    "OPENAI_MODEL_FAST": "gpt-5.4-nano",
     "DRAFT_DAY": "fri",
     "DRAFT_HOUR_LOCAL": "18",
     "TIMEZONE": "America/Los_Angeles",
@@ -107,15 +107,15 @@
     // Per-channel /relay/message rate limit, in messages per rolling hour.
     "RELAY_RATE_LIMIT_PER_HOUR": "30",
     // OpenAI pricing — update when OpenAI changes prices, no code deploy needed.
-    // Defaults reflect gpt-5-mini per OpenAI's published pricing as of 2026-01;
-    // built-in tool prices are flat per-call. Override per-environment if you
-    // switch to a different model tier (e.g. gpt-5-pro).
-    "PRICE_INPUT_PER_M": "0.25",
-    "PRICE_CACHED_INPUT_PER_M": "0.025",
-    "PRICE_OUTPUT_PER_M": "2.00",
+    // Defaults reflect gpt-5.4-mini per OpenAI's published pricing as of 2026-05;
+    // cached input is 90% off standard. Built-in tool prices are flat per-call.
+    // Override per-environment if you switch to a different model tier.
+    "PRICE_INPUT_PER_M": "0.75",
+    "PRICE_CACHED_INPUT_PER_M": "0.075",
+    "PRICE_OUTPUT_PER_M": "4.50",
     "PRICE_WEB_SEARCH_PER_CALL": "0.025",
-    "PRICE_CODE_INTERPRETER_PER_CALL": "0.03"
-  }
+    "PRICE_CODE_INTERPRETER_PER_CALL": "0.03",
+  },
 
   // Secrets to set with `wrangler secret put`:
   //   DISCORD_PUBLIC_KEY         — for verifying interaction signatures
