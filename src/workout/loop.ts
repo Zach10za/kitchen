@@ -1,7 +1,7 @@
 /**
- * Workout tool implementations. WorkoutSteerWorkflow drives the agent via
- * runtime/agent-round; tool execution lives here and is called from
- * WorkoutDO's /workflow/workout/exec-tool endpoint.
+ * Workout tool implementations. AgentChatWorkflow drives the agent loop via
+ * runtime/agent-round; tool execution lives here and is called from the
+ * universal `/workflow/agent/exec-tool` endpoint on WorkoutDO.
  *
  * All weights are pounds. Bodyweight exercises have NULL weight.
  */

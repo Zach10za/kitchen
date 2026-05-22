@@ -6,10 +6,10 @@ export interface Env {
   WORKOUT: DurableObjectNamespace;
   AI: Ai;
   APPROVE_WORKFLOW: Workflow;
-  STEER_WORKFLOW: Workflow;
-  FINANCE_STEER_WORKFLOW: Workflow;
-  TASKS_STEER_WORKFLOW: Workflow;
-  WORKOUT_STEER_WORKFLOW: Workflow;
+  /** Unified chat workflow. Replaces the per-bot *_STEER_WORKFLOW bindings —
+   *  one Cloudflare Workflow class (`AgentChatWorkflow`) serves every bot,
+   *  parameterized by `botId` in the workflow params. */
+  AGENT_CHAT_WORKFLOW: Workflow;
 
   // Vars
   OPENAI_MODEL: string;

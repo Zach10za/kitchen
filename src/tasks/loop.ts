@@ -1,7 +1,7 @@
 /**
- * Tasks tool implementations. The workflow runner (TasksSteerWorkflow) drives
- * the agent loop via runtime/agent-round; tool execution lives here and is
- * called from TasksDO's /workflow/tasks/exec-tool endpoint.
+ * Tasks tool implementations. AgentChatWorkflow drives the agent loop via
+ * runtime/agent-round; tool execution lives here and is called from the
+ * universal `/workflow/agent/exec-tool` endpoint on TasksDO.
  */
 
 import type { TaskRow } from './tools';

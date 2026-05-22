@@ -59,8 +59,13 @@
     },
   ],
 
-  // Workflows for long-running multi-step operations (e.g. /approve).
+  // Workflows for long-running multi-step operations.
   // Each step.do(...) gets its own request lifetime + automatic retries.
+  //
+  // AgentChatWorkflow replaces the four legacy per-bot *SteerWorkflow classes.
+  // It's parameterized by `botId` in workflow params so one class serves every
+  // bot (kitchen/finance/tasks/workout). Adding a new agent bot no longer
+  // requires a new workflow binding here.
   "workflows": [
     {
       "name": "approve-plan",
@@ -68,24 +73,9 @@
       "class_name": "ApproveWorkflow",
     },
     {
-      "name": "steer",
-      "binding": "STEER_WORKFLOW",
-      "class_name": "SteerWorkflow",
-    },
-    {
-      "name": "finance-steer",
-      "binding": "FINANCE_STEER_WORKFLOW",
-      "class_name": "FinanceSteerWorkflow",
-    },
-    {
-      "name": "tasks-steer",
-      "binding": "TASKS_STEER_WORKFLOW",
-      "class_name": "TasksSteerWorkflow",
-    },
-    {
-      "name": "workout-steer",
-      "binding": "WORKOUT_STEER_WORKFLOW",
-      "class_name": "WorkoutSteerWorkflow",
+      "name": "agent-chat",
+      "binding": "AGENT_CHAT_WORKFLOW",
+      "class_name": "AgentChatWorkflow",
     },
   ],
 
