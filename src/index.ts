@@ -3,9 +3,9 @@ import { verifyDiscordRequest } from './discord/verify';
 import { InteractionType, InteractionResponseType, type Interaction } from './discord/types';
 import { DiscordAPI } from './discord/api';
 import { prepareChatThread } from './discord/thread';
-import { currentOrNextMondayISO } from './util/datetime';
 import { captureError } from './error-triage';
 import { ALL_BOTS, botForChannel, botForCommand } from './runtime/bot-registry';
+import { constantTimeEquals } from './runtime/timing-safe';
 
 export { KitchenDO } from './kitchen-do';
 export { FinanceDO } from './finance-do';
@@ -76,8 +76,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
     // Bot ownership is decided by the parent channel when in a thread, else
     // by the channel itself. Per-channel rate limit + reply target both
-    // follow from this.
-    const ownerChannelId = body.parentChannelId || body.channelId;
+    // follow from this. `??` not `||` so an explicit "" doesn't fall through.
+    const ownerChannelId = body.parentChannelId ?? body.channelId;
     const bot = botForChannel(env, ownerChannelId);
     if (!bot) {
       // Unknown channel — relay must be misconfigured. Drop with 404 so the
@@ -116,35 +116,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       }
     }
 
-    if (bot.id === 'kitchen') {
-      ctx.waitUntil(
-        env.STEER_WORKFLOW.create({
-          params: {
-            weekOf: currentOrNextMondayISO(env.TIMEZONE),
-            replyChannelId,
-            userMessage: body.userMessage,
-          },
-        })
-      );
-    } else if (bot.id === 'tasks') {
-      ctx.waitUntil(
-        env.TASKS_STEER_WORKFLOW.create({
-          params: { userMessage: body.userMessage, replyChannelId },
-        })
-      );
-    } else if (bot.id === 'workout') {
-      ctx.waitUntil(
-        env.WORKOUT_STEER_WORKFLOW.create({
-          params: { userMessage: body.userMessage, replyChannelId },
-        })
-      );
-    } else {
-      ctx.waitUntil(
-        env.FINANCE_STEER_WORKFLOW.create({
-          params: { userMessage: body.userMessage, replyChannelId },
-        })
-      );
-    }
+    // Dispatch via the bot registry — each bot owns its workflow binding so
+    // this stays a single registry lookup instead of an if/else ladder.
+    ctx.waitUntil(bot.dispatchRelay(env, body.userMessage, replyChannelId));
 
     return Response.json({ ok: true });
   }
@@ -224,14 +198,12 @@ async function handleDiscordInteraction(
     return Response.json({ type: InteractionResponseType.PONG });
   }
 
-  // Pick the owning bot by command name. MESSAGE_COMPONENT interactions inherit
-  // the bot of the originating slash-command; in practice all current components
-  // are kitchen-side, so we route those there.
+  // Pick the owning bot by command name. MESSAGE_COMPONENT interactions
+  // currently always come from kitchen-owned UIs; if another bot ever
+  // introduces components, attach the owning bot id to `custom_id` and
+  // branch here. Until then a single lookup covers both paths.
   const commandName = interaction.data?.name ?? '';
-  const bot =
-    interaction.type === InteractionType.APPLICATION_COMMAND
-      ? botForCommand(commandName)
-      : botForCommand(commandName); // (same fallback — extend here once a bot owns components)
+  const bot = botForCommand(commandName);
   const stub = bot.getStub(env);
 
   // Fast path: pure-read commands with sub-3s budget skip the defer roundtrip
@@ -336,14 +308,7 @@ function checkAdmin(request: Request, env: Env): boolean {
   const auth = request.headers.get('authorization') ?? '';
   const match = auth.match(/^Bearer\s+(.+)$/);
   if (!match) return false;
-  const token = match[1]!.trim();
-  // Length-prefix check so the timing comparison can't leak the right length.
-  if (token.length !== env.ADMIN_TOKEN.length) return false;
-  let result = 0;
-  for (let i = 0; i < token.length; i++) {
-    result |= token.charCodeAt(i) ^ env.ADMIN_TOKEN.charCodeAt(i);
-  }
-  return result === 0;
+  return constantTimeEquals(match[1]!.trim(), env.ADMIN_TOKEN);
 }
 
 /** Validate week_of query params before forwarding to the DO. */
@@ -354,12 +319,8 @@ function validateWeekOf(input: string | null): string | null {
 
 /** Constant-time-ish check for the shared relay secret. */
 function relaySecretValid(request: Request, env: Env): boolean {
-  const got = request.headers.get('x-relay-secret') ?? '';
-  const expected = env.RELAY_SECRET ?? '';
-  if (!expected || got.length !== expected.length) return false;
-  let result = 0;
-  for (let i = 0; i < got.length; i++) {
-    result |= got.charCodeAt(i) ^ expected.charCodeAt(i);
-  }
-  return result === 0;
+  return constantTimeEquals(
+    request.headers.get('x-relay-secret') ?? '',
+    env.RELAY_SECRET ?? '',
+  );
 }

@@ -216,6 +216,10 @@ function toolComparePeriods(
     )
     .toArray();
 
+  // SQL returns negative outflows (debits stored as negative amounts). Flip
+  // once into positive spend so the user-facing strings read naturally as
+  // dollar amounts. The previous code flipped twice — once here, then
+  // again in formatMoney(-recentOut) — which rendered spend as "-$500".
   const recentOut = -recent.outflow;
   const priorOut = -prior.outflow;
   const delta = recentOut - priorOut;
@@ -224,12 +228,12 @@ function toolComparePeriods(
   const moverLines = movers.map((m) => {
     const r = -m.recent, p = -m.prior;
     const d = r - p;
-    return `- ${m.normalized_payee}: ${formatMoney(-r)} now vs ${formatMoney(-p)} prior (Δ ${formatMoneySigned(-d)})`;
+    return `- ${m.normalized_payee}: ${formatMoney(r)} now vs ${formatMoney(p)} prior (Δ ${formatMoneySigned(d)})`;
   });
 
   return [
     `Compare: last ${days}d vs prior ${days}d`,
-    `Outflow: ${formatMoney(-recentOut)} now vs ${formatMoney(-priorOut)} prior (Δ ${formatMoneySigned(-delta)}${pct !== 'n/a' ? `, ${pct}%` : ''})`,
+    `Outflow: ${formatMoney(recentOut)} now vs ${formatMoney(priorOut)} prior (Δ ${formatMoneySigned(delta)}${pct !== 'n/a' ? `, ${pct}%` : ''})`,
     `Inflow: ${formatMoney(recent.inflow)} now vs ${formatMoney(prior.inflow)} prior`,
     '',
     'Top movers by absolute change in spend:',
@@ -253,26 +257,37 @@ function toolUnusualTransactions(
     )
     .toArray();
 
+  // Single aggregate query for per-merchant history stats. The previous
+  // implementation issued one query per recent transaction (50–200 round
+  // trips per tool call); this is a single GROUP BY.
+  // Std deviation derived via SUM(x²) instead of a nested AVG subquery so
+  // it computes in one pass alongside count + avg.
+  const historyRows = ctx.sql
+    .exec<{ normalized_payee: string; count: number; avg: number; sum_sq: number }>(
+      `SELECT normalized_payee,
+              COUNT(*) AS count,
+              AVG(ABS(amount)) AS avg,
+              SUM(ABS(amount) * ABS(amount)) AS sum_sq
+         FROM transactions
+        WHERE posted < ? AND posted >= ? AND amount < 0
+        GROUP BY normalized_payee`,
+      recentSince, historySince,
+    )
+    .toArray();
+
+  const historyByMerchant = new Map<string, { count: number; avg: number; std: number }>();
+  for (const h of historyRows) {
+    const variance = h.count > 0 ? Math.max(0, h.sum_sq / h.count - h.avg * h.avg) : 0;
+    historyByMerchant.set(h.normalized_payee, {
+      count: h.count,
+      avg: h.avg,
+      std: Math.sqrt(variance),
+    });
+  }
+
   const flagged: { tx: TransactionRow; reason: string }[] = [];
   for (const tx of recent) {
-    const history = ctx.sql
-      .exec<{ count: number; avg: number; std: number }>(
-        `SELECT COUNT(*) AS count, AVG(ABS(amount)) AS avg,
-                COALESCE(
-                  (SELECT SQRT(AVG((ABS(amount) - sub.avg) * (ABS(amount) - sub.avg)))
-                   FROM transactions, (SELECT AVG(ABS(amount)) AS avg FROM transactions
-                                       WHERE normalized_payee = ? AND posted < ? AND posted >= ? AND amount < 0) sub
-                   WHERE normalized_payee = ? AND posted < ? AND posted >= ? AND amount < 0),
-                  0
-                ) AS std
-         FROM transactions
-         WHERE normalized_payee = ? AND posted < ? AND posted >= ? AND amount < 0`,
-        tx.normalized_payee, recentSince, historySince,
-        tx.normalized_payee, recentSince, historySince,
-        tx.normalized_payee, recentSince, historySince
-      )
-      .toArray()[0]!;
-
+    const history = historyByMerchant.get(tx.normalized_payee) ?? { count: 0, avg: 0, std: 0 };
     if (history.count === 0) {
       flagged.push({ tx, reason: 'new merchant' });
       continue;
@@ -306,7 +321,11 @@ function toolGetTransactionsRaw(
   ctx: FinanceToolCtx
 ): string {
   const days = Math.max(1, Math.min(730, args.days ?? 90));
-  const limit = Math.max(1, Math.min(5000, args.limit ?? 2000));
+  // Capped at 500 — anything larger blows the LLM context window. 2000 rows
+  // at ~100 tokens each is ~200K tokens, which exceeds the input limit on
+  // most models. Tool callers wanting analytics should use the aggregate
+  // tools (top_merchants, period_total) instead of asking for raw rows.
+  const limit = Math.max(1, Math.min(500, args.limit ?? 200));
   const since = nowSec() - days * 86_400;
 
   const filters = ['posted >= ?'];

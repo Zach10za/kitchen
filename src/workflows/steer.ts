@@ -5,42 +5,13 @@ import { DiscordAPI } from '../discord/api';
 import { MAX_TOOL_ROUNDS, runAgentRound, type RoundResult } from '../agent/round';
 import { emptyUsage, addUsage, type RoundUsage } from '../runtime/agent-round';
 import { computeCost, formatUsd } from '../runtime/pricing';
+import { withTypingRefresh } from '../runtime/typing';
 
 interface SteerParams {
   weekOf: string;
   userMessage: string;
   /** Channel id to post the reply into — always a thread channel id now. */
   replyChannelId: string;
-}
-
-// Discord's /typing call shows the indicator for ~10s. Refresh well before it
-// expires so the indicator stays continuously visible while real work runs.
-// If the workflow crashes, the loop stops and the indicator dies ~10s later
-// with no message — that absence is the user-visible failure signal.
-const TYPING_REFRESH_MS = 7_000;
-
-async function withTypingRefresh<T>(
-  discord: DiscordAPI,
-  channelId: string,
-  fn: () => Promise<T>,
-): Promise<T> {
-  let stopped = false;
-  const refresh = (async () => {
-    while (!stopped) {
-      await discord.postTyping(channelId).catch(() => {});
-      const start = Date.now();
-      while (!stopped && Date.now() - start < TYPING_REFRESH_MS) {
-        await new Promise((r) => setTimeout(r, 250));
-      }
-    }
-  })();
-
-  try {
-    return await fn();
-  } finally {
-    stopped = true;
-    await refresh.catch(() => {});
-  }
 }
 
 // RoundResult from agent/round provides the same shape; alias kept for clarity.
@@ -106,9 +77,14 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const inputMessages = messages;
+      // No step-level retries: a round's tool executions have already-applied
+      // side effects in the DO. Retrying would re-call OpenAI (which is
+      // stochastic), produce different tool calls, and re-execute the prior
+      // tools. The OpenAI client has its own internal maxRetries for
+      // transient network failures.
       const result: AgentTurnResult = await step.do(
         `round-${round}`,
-        { retries: { limit: 2, delay: '2 seconds', backoff: 'linear' } },
+        { retries: { limit: 0, delay: '1 second', backoff: 'constant' } },
         async () => {
           // Keep typing live for the whole round — LLM + tool execution can
           // easily exceed Discord's ~10s indicator timeout.
@@ -135,16 +111,24 @@ export class SteerWorkflow extends WorkflowEntrypoint<Env, SteerParams> {
     // Same pattern as FinanceSteerWorkflow — the DO computes thread totals
     // from raw counts so retroactive pricing changes flow through.
     const threadId = replyChannelId;
+    // record-usage is observability — never let a transient failure block
+    // delivery of the user's reply. Falls back to the local turnUsage so the
+    // footer still renders something sensible.
     const turnTotals = await step.do('record-usage', async () => {
-      const res = await stub.fetch('https://internal/workflow/record-usage', {
-        method: 'POST',
-        body: JSON.stringify({
-          thread_id: threadId,
-          model: this.env.OPENAI_MODEL,
-          ...turnUsage,
-        }),
-      });
-      return (await res.json()) as { thread_total_usage: RoundUsage };
+      try {
+        const res = await stub.fetch('https://internal/workflow/record-usage', {
+          method: 'POST',
+          body: JSON.stringify({
+            thread_id: threadId,
+            model: this.env.OPENAI_MODEL,
+            ...turnUsage,
+          }),
+        });
+        if (!res.ok) return { thread_total_usage: turnUsage };
+        return (await res.json()) as { thread_total_usage: RoundUsage };
+      } catch {
+        return { thread_total_usage: turnUsage };
+      }
     });
 
     const turnCost = computeCost(turnUsage, this.env);

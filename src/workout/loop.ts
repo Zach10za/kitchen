@@ -287,6 +287,19 @@ function toolLogWorkout(
   } catch (err) {
     return (err as Error).message;
   }
+
+  // Refuse to open a second concurrent workout. Without this guard,
+  // subsequent `add_set` calls (which default to "most recent open
+  // workout") would silently mix sets between sessions.
+  const existingOpen = ctx.sql
+    .exec<{ id: string; name: string | null }>(
+      'SELECT id, name FROM workouts WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1',
+    )
+    .toArray()[0];
+  if (existingOpen) {
+    return `Workout [${existingOpen.id}]${existingOpen.name ? ` "${existingOpen.name}"` : ''} is still open. End it first with end_workout, or pass workout_id to add sets to it.`;
+  }
+
   const id = shortId('w');
 
   if (args.routine_id) {
@@ -501,13 +514,26 @@ function toolFindPRs(args: { exercise?: string; limit?: number }, ctx: WorkoutTo
     let bestEpleySet: SetRow | null = null;
     for (const set of rows) {
       const est = epley1RM(set.weight_lbs!, set.reps);
-      if (est > bestEpley) { bestEpley = est; bestEpleySet = set; }
+      // Tie-break: equal e1RM → more recent set wins. Without this the
+      // displayed PR date was whichever row SQL happened to return first.
+      if (
+        est > bestEpley ||
+        (est === bestEpley && bestEpleySet !== null && set.logged_at > bestEpleySet.logged_at)
+      ) {
+        bestEpley = est;
+        bestEpleySet = set;
+      }
     }
     let buckets_found = 0;
     for (const b of repBuckets) {
       const exactReps = rows.filter((r) => r.reps === b.reps);
       if (exactReps.length === 0) continue;
-      const top = exactReps.reduce((a, b2) => (b2.weight_lbs! > a.weight_lbs! ? b2 : a));
+      // Same tie-break: equal weight → most recent date.
+      const top = exactReps.reduce((a, b2) => {
+        if (b2.weight_lbs! > a.weight_lbs!) return b2;
+        if (b2.weight_lbs! === a.weight_lbs! && b2.logged_at > a.logged_at) return b2;
+        return a;
+      });
       const date = new Date(top.logged_at).toISOString().slice(0, 10);
       lines.push(`  ${b.label}: ${top.weight_lbs} × ${top.reps} (${date})`);
       buckets_found++;
@@ -1002,62 +1028,70 @@ export interface PRRow {
 
 /**
  * Best estimated 1RM per exercise (or all sets of a single exercise).
- * Warmups excluded; bodyweight (NULL weight) excluded. Single JOIN query —
- * grouping happens client-side so we don't issue one SELECT per exercise.
+ * Warmups excluded; bodyweight (NULL weight) excluded. The previous version
+ * pulled every weighted set into JS for grouping — this is a full-table
+ * scan that runs on every prompt build and summary embed. Now: a single
+ * window-function query computes the per-exercise best in SQL.
+ *
+ * Tie-break: equal estimated_1rm → most recent set wins (previously the
+ * first row encountered by SQL order won, which was arbitrary).
  */
 export function topPRs(sql: SqlStorage, exerciseFilter: string | null, limit = 10): PRRow[] {
   const filterName = exerciseFilter ? normalizeExerciseName(exerciseFilter) : null;
   const filterClause = filterName ? 'AND e.name = ?' : '';
+  const query = `
+    WITH ranked AS (
+      SELECT
+        s.exercise_id,
+        e.display_name AS exercise_display,
+        s.weight_lbs,
+        s.reps,
+        s.logged_at,
+        s.workout_id,
+        s.weight_lbs * (1.0 + s.reps / 30.0) AS est,
+        ROW_NUMBER() OVER (
+          PARTITION BY s.exercise_id
+          ORDER BY (s.weight_lbs * (1.0 + s.reps / 30.0)) DESC, s.logged_at DESC, s.id DESC
+        ) AS rn
+      FROM sets s
+      JOIN exercises e ON e.id = s.exercise_id
+      WHERE s.is_warmup = 0 AND s.weight_lbs IS NOT NULL ${filterClause}
+    )
+    SELECT exercise_id, exercise_display, weight_lbs, reps, logged_at, workout_id, est
+    FROM ranked
+    WHERE rn = 1
+    ORDER BY est DESC
+    LIMIT ?
+  `;
   const rows = filterName
-    ? sql
-        .exec<{
-          exercise_id: string;
-          exercise_display: string;
-          weight_lbs: number;
-          reps: number;
-          logged_at: number;
-          workout_id: string;
-        }>(
-          `SELECT s.exercise_id, e.display_name AS exercise_display, s.weight_lbs, s.reps, s.logged_at, s.workout_id
-           FROM sets s JOIN exercises e ON e.id = s.exercise_id
-           WHERE s.is_warmup = 0 AND s.weight_lbs IS NOT NULL ${filterClause}`,
-          filterName
-        )
-        .toArray()
-    : sql
-        .exec<{
-          exercise_id: string;
-          exercise_display: string;
-          weight_lbs: number;
-          reps: number;
-          logged_at: number;
-          workout_id: string;
-        }>(
-          `SELECT s.exercise_id, e.display_name AS exercise_display, s.weight_lbs, s.reps, s.logged_at, s.workout_id
-           FROM sets s JOIN exercises e ON e.id = s.exercise_id
-           WHERE s.is_warmup = 0 AND s.weight_lbs IS NOT NULL`
-        )
-        .toArray();
+    ? sql.exec<{
+        exercise_id: string;
+        exercise_display: string;
+        weight_lbs: number;
+        reps: number;
+        logged_at: number;
+        workout_id: string;
+        est: number;
+      }>(query, filterName, limit).toArray()
+    : sql.exec<{
+        exercise_id: string;
+        exercise_display: string;
+        weight_lbs: number;
+        reps: number;
+        logged_at: number;
+        workout_id: string;
+        est: number;
+      }>(query, limit).toArray();
 
-  const bestByExercise = new Map<string, PRRow>();
-  for (const r of rows) {
-    const est = epley1RM(r.weight_lbs, r.reps);
-    const current = bestByExercise.get(r.exercise_id);
-    if (!current || est > current.estimated_1rm) {
-      bestByExercise.set(r.exercise_id, {
-        exercise_id: r.exercise_id,
-        exercise_display: r.exercise_display,
-        weight_lbs: r.weight_lbs,
-        reps: r.reps,
-        estimated_1rm: est,
-        logged_at: r.logged_at,
-        workout_id: r.workout_id,
-      });
-    }
-  }
-  const prs = Array.from(bestByExercise.values());
-  prs.sort((a, b) => b.estimated_1rm - a.estimated_1rm);
-  return prs.slice(0, limit);
+  return rows.map((r) => ({
+    exercise_id: r.exercise_id,
+    exercise_display: r.exercise_display,
+    weight_lbs: r.weight_lbs,
+    reps: r.reps,
+    estimated_1rm: r.est,
+    logged_at: r.logged_at,
+    workout_id: r.workout_id,
+  }));
 }
 
 export interface WeeklyVolume {
@@ -1070,51 +1104,66 @@ export interface WeeklyVolume {
 
 export function weeklyVolume(sql: SqlStorage, days: number): WeeklyVolume {
   const since = Date.now() - days * 86_400_000;
-  const sets = sql
-    .exec<{
-      exercise_id: string;
-      display_name: string;
-      primary_muscle: string | null;
-      weight_lbs: number | null;
-      reps: number;
-    }>(
-      `SELECT s.exercise_id, e.display_name, e.primary_muscle, s.weight_lbs, s.reps
-       FROM sets s JOIN exercises e ON e.id = s.exercise_id
+
+  // Aggregations pushed into SQL — previously every set in the window was
+  // materialized into JS and bucketed by hand. With a year of logging that
+  // was thousands of rows per call, and this runs on every prompt build.
+  const totals = sql
+    .exec<{ total_sets: number; total_tonnage: number }>(
+      `SELECT
+         COUNT(*) AS total_sets,
+         COALESCE(SUM(COALESCE(s.weight_lbs, 0) * s.reps), 0) AS total_tonnage
+       FROM sets s
        WHERE s.is_warmup = 0 AND s.logged_at >= ?`,
-      since
+      since,
     )
-    .toArray();
+    .toArray()[0] ?? { total_sets: 0, total_tonnage: 0 };
 
-  const byMuscleMap = new Map<string, { sets: number; tonnage: number }>();
-  const byExerciseMap = new Map<string, { exercise_display: string; sets: number; tonnage: number }>();
-  let totalSets = 0;
-  let totalTonnage = 0;
+  const byMuscle = sql
+    .exec<{ muscle: string; sets: number; tonnage: number }>(
+      `SELECT
+         COALESCE(e.primary_muscle, 'unspecified') AS muscle,
+         COUNT(*) AS sets,
+         COALESCE(SUM(COALESCE(s.weight_lbs, 0) * s.reps), 0) AS tonnage
+       FROM sets s
+       JOIN exercises e ON e.id = s.exercise_id
+       WHERE s.is_warmup = 0 AND s.logged_at >= ?
+       GROUP BY COALESCE(e.primary_muscle, 'unspecified')
+       ORDER BY sets DESC`,
+      since,
+    )
+    .toArray()
+    .map((r) => ({ muscle: r.muscle, sets: r.sets, tonnage: Math.round(r.tonnage) }));
 
-  for (const s of sets) {
-    totalSets++;
-    const tonnage = (s.weight_lbs ?? 0) * s.reps;
-    totalTonnage += tonnage;
+  const byExercise = sql
+    .exec<{ exercise_id: string; exercise_display: string; sets: number; tonnage: number }>(
+      `SELECT
+         s.exercise_id,
+         e.display_name AS exercise_display,
+         COUNT(*) AS sets,
+         COALESCE(SUM(COALESCE(s.weight_lbs, 0) * s.reps), 0) AS tonnage
+       FROM sets s
+       JOIN exercises e ON e.id = s.exercise_id
+       WHERE s.is_warmup = 0 AND s.logged_at >= ?
+       GROUP BY s.exercise_id, e.display_name
+       ORDER BY sets DESC`,
+      since,
+    )
+    .toArray()
+    .map((r) => ({
+      exercise_id: r.exercise_id,
+      exercise_display: r.exercise_display,
+      sets: r.sets,
+      tonnage: Math.round(r.tonnage),
+    }));
 
-    const muscle = s.primary_muscle ?? 'unspecified';
-    const m = byMuscleMap.get(muscle) ?? { sets: 0, tonnage: 0 };
-    m.sets++;
-    m.tonnage += tonnage;
-    byMuscleMap.set(muscle, m);
-
-    const e = byExerciseMap.get(s.exercise_id) ?? { exercise_display: s.display_name, sets: 0, tonnage: 0 };
-    e.sets++;
-    e.tonnage += tonnage;
-    byExerciseMap.set(s.exercise_id, e);
-  }
-
-  const byMuscle = Array.from(byMuscleMap.entries())
-    .map(([muscle, v]) => ({ muscle, sets: v.sets, tonnage: Math.round(v.tonnage) }))
-    .sort((a, b) => b.sets - a.sets);
-  const byExercise = Array.from(byExerciseMap.entries())
-    .map(([exercise_id, v]) => ({ exercise_id, exercise_display: v.exercise_display, sets: v.sets, tonnage: Math.round(v.tonnage) }))
-    .sort((a, b) => b.sets - a.sets);
-
-  return { totalSets, totalTonnageLbs: Math.round(totalTonnage), byMuscle, byExercise, windowDays: days };
+  return {
+    totalSets: totals.total_sets,
+    totalTonnageLbs: Math.round(totals.total_tonnage),
+    byMuscle,
+    byExercise,
+    windowDays: days,
+  };
 }
 
 export interface FullWorkout {
@@ -1130,26 +1179,74 @@ export function fullWorkout(sql: SqlStorage, workoutId: string): FullWorkout {
   const workout = sql.exec<WorkoutRow>('SELECT * FROM workouts WHERE id = ?', workoutId).toArray()[0];
   if (!workout) throw new Error(`Workout "${workoutId}" not found.`);
 
-  // Pull all sets + their exercises, grouped client-side by exercise_id in
-  // the order each exercise was first seen.
-  const sets = sql
-    .exec<SetRow>('SELECT * FROM sets WHERE workout_id = ? ORDER BY id ASC', workoutId)
+  // Single JOINed query — previously fired one `SELECT * FROM exercises
+  // WHERE id = ?` per distinct exercise in the workout. Sets carry the
+  // joined exercise columns (prefixed `ex_`) and we partition them
+  // client-side preserving first-seen order.
+  type Joined = SetRow & {
+    ex_id: string;
+    ex_name: string;
+    ex_display_name: string;
+    ex_category: string | null;
+    ex_primary_muscle: string | null;
+    ex_equipment: string | null;
+    ex_notes: string | null;
+    ex_created_at: number;
+    ex_updated_at: number;
+  };
+  const joined = sql
+    .exec<Joined>(
+      `SELECT s.*,
+              e.id AS ex_id,
+              e.name AS ex_name,
+              e.display_name AS ex_display_name,
+              e.category AS ex_category,
+              e.primary_muscle AS ex_primary_muscle,
+              e.equipment AS ex_equipment,
+              e.notes AS ex_notes,
+              e.created_at AS ex_created_at,
+              e.updated_at AS ex_updated_at
+       FROM sets s
+       JOIN exercises e ON e.id = s.exercise_id
+       WHERE s.workout_id = ?
+       ORDER BY s.id ASC`,
+      workoutId,
+    )
     .toArray();
+
   const order: string[] = [];
-  const byEx = new Map<string, SetRow[]>();
-  for (const s of sets) {
-    if (!byEx.has(s.exercise_id)) {
-      order.push(s.exercise_id);
-      byEx.set(s.exercise_id, []);
+  const setsByEx = new Map<string, SetRow[]>();
+  const exerciseById = new Map<string, ExerciseRow>();
+  for (const row of joined) {
+    if (!setsByEx.has(row.exercise_id)) {
+      order.push(row.exercise_id);
+      setsByEx.set(row.exercise_id, []);
+      exerciseById.set(row.exercise_id, {
+        id: row.ex_id,
+        name: row.ex_name,
+        display_name: row.ex_display_name,
+        category: row.ex_category,
+        primary_muscle: row.ex_primary_muscle,
+        equipment: row.ex_equipment as ExerciseRow['equipment'],
+        notes: row.ex_notes,
+        created_at: row.ex_created_at,
+        updated_at: row.ex_updated_at,
+      });
     }
-    byEx.get(s.exercise_id)!.push(s);
+    // Strip the ex_ join columns so SetRow shape is preserved.
+    const {
+      ex_id: _eid, ex_name: _en, ex_display_name: _ed,
+      ex_category: _ec, ex_primary_muscle: _epm, ex_equipment: _eeq,
+      ex_notes: _eno, ex_created_at: _eca, ex_updated_at: _eu,
+      ...setRow
+    } = row;
+    setsByEx.get(row.exercise_id)!.push(setRow as SetRow);
   }
 
-  const exercises = order.map((id) => {
-    const exercise = sql.exec<ExerciseRow>('SELECT * FROM exercises WHERE id = ?', id).toArray()[0]!;
-    const exSets = byEx.get(id)!.slice().sort((a, b) => a.set_index - b.set_index);
-    return { exercise, sets: exSets };
-  });
+  const exercises = order.map((id) => ({
+    exercise: exerciseById.get(id)!,
+    sets: setsByEx.get(id)!.slice().sort((a, b) => a.set_index - b.set_index),
+  }));
 
   return { workout, exercises };
 }

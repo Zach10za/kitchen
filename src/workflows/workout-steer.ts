@@ -11,36 +11,12 @@ import {
 } from '../runtime/agent-round';
 import { makeOpenAIClient } from '../runtime/openai';
 import { computeCost, formatUsd } from '../runtime/pricing';
+import { withTypingRefresh } from '../runtime/typing';
 import { WORKOUT_TOOLS } from '../workout/tools';
 
 interface WorkoutSteerParams {
   userMessage: string;
   replyChannelId: string;
-}
-
-const TYPING_REFRESH_MS = 7_000;
-
-async function withTypingRefresh<T>(
-  discord: DiscordAPI,
-  channelId: string,
-  fn: () => Promise<T>,
-): Promise<T> {
-  let stopped = false;
-  const refresh = (async () => {
-    while (!stopped) {
-      await discord.postTyping(channelId).catch(() => {});
-      const start = Date.now();
-      while (!stopped && Date.now() - start < TYPING_REFRESH_MS) {
-        await new Promise((r) => setTimeout(r, 250));
-      }
-    }
-  })();
-  try {
-    return await fn();
-  } finally {
-    stopped = true;
-    await refresh.catch(() => {});
-  }
 }
 
 /**
@@ -97,9 +73,11 @@ export class WorkoutSteerWorkflow extends WorkflowEntrypoint<Env, WorkoutSteerPa
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const inputMessages = messages;
+      // retries:0 — see comment in steer.ts. Tool side effects make a
+      // round-level retry unsafe.
       const result: RoundResult = await step.do(
         `round-${round}`,
-        { retries: { limit: 2, delay: '2 seconds', backoff: 'linear' } },
+        { retries: { limit: 0, delay: '1 second', backoff: 'constant' } },
         async () => withTypingRefresh(discord, replyChannelId, () => this.runOneRound(inputMessages, threadId)),
       );
 

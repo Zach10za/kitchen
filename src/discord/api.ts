@@ -14,6 +14,10 @@
 import type { Embed, MessagePayload } from './types';
 
 const DISCORD_API = 'https://discord.com/api/v10';
+// Discord's hard cap is 2000 chars. We keep a 10-char buffer because the
+// chunking logic below cuts on paragraph/sentence boundaries — having a
+// little slack avoids hitting the cap exactly when an edge case lands a
+// chunk one char short.
 const MESSAGE_CHAR_LIMIT = 1990;
 
 type Sendable = string | MessagePayload;

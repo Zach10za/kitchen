@@ -202,10 +202,24 @@ function handleDispatch(eventType: string, data: any): void {
  * we've classified a thread we don't need to ask again. Negative results
  * (channel is unrelated to a watched parent) are cached as null to avoid
  * re-querying every relay event for chatty unrelated channels.
+ *
+ * Bounded by THREAD_CACHE_MAX with simple FIFO eviction — otherwise this
+ * grows unbounded for the lifetime of the process as new threads are
+ * created and old ones archive.
  */
+const THREAD_CACHE_MAX = 1000;
 const threadParentCache = new Map<string, string | null>();
 /** Channel types from Discord docs: 10/11/12 are thread types. */
 const THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
+
+function cacheThreadParent(channelId: string, parent: string | null): void {
+  if (threadParentCache.size >= THREAD_CACHE_MAX) {
+    // FIFO: drop the oldest entry. Map preserves insertion order.
+    const oldest = threadParentCache.keys().next().value;
+    if (oldest !== undefined) threadParentCache.delete(oldest);
+  }
+  threadParentCache.set(channelId, parent);
+}
 
 async function resolveThreadParent(channelId: string): Promise<string | null> {
   if (threadParentCache.has(channelId)) {
@@ -217,12 +231,12 @@ async function resolveThreadParent(channelId: string): Promise<string | null> {
     });
     if (!res.ok) {
       // 403/404 happen for channels in guilds we're not in, etc. Cache null.
-      threadParentCache.set(channelId, null);
+      cacheThreadParent(channelId, null);
       return null;
     }
     const json = (await res.json()) as { type: number; parent_id?: string | null };
     const parent = THREAD_CHANNEL_TYPES.has(json.type) ? json.parent_id ?? null : null;
-    threadParentCache.set(channelId, parent);
+    cacheThreadParent(channelId, parent);
     return parent;
   } catch (err) {
     console.warn(`resolveThreadParent failed for ${channelId}:`, err);
@@ -297,6 +311,19 @@ function sendResume(): void {
 }
 
 function sendHeartbeat(): void {
+  // Discord spec: if we don't receive a HEARTBEAT_ACK between heartbeats, the
+  // connection is zombied and we must close it with a non-1000 code so the
+  // session can be resumed. Without this check a silently-dead socket would
+  // sit indefinitely.
+  if (
+    state.lastHeartbeatAck !== null &&
+    state.heartbeatInterval !== null &&
+    Date.now() - state.lastHeartbeatAck > state.heartbeatInterval + 5_000
+  ) {
+    console.warn('Gateway: zombied (no ACK within heartbeat interval), forcing reconnect');
+    try { state.ws?.close(4000, 'zombied connection'); } catch {}
+    return;
+  }
   send({ op: OP_HEARTBEAT, d: state.lastSequence });
 }
 
@@ -326,19 +353,25 @@ const healthPort = parseInt(process.env.PORT || '8080', 10);
 Bun.serve({
   port: healthPort,
   fetch(_req) {
-    const healthy = state.ws?.readyState === WebSocket.OPEN && (
-      !state.lastHeartbeatAck || Date.now() - state.lastHeartbeatAck < 90_000
-    );
+    // Healthy only if we're connected AND have seen at least one ACK AND that
+    // ACK is recent. The previous `!state.lastHeartbeatAck` short-circuit
+    // made the check pass at startup before any ACK had been received.
+    const connected = state.ws?.readyState === WebSocket.OPEN;
+    const recentAck =
+      state.lastHeartbeatAck !== null &&
+      Date.now() - state.lastHeartbeatAck < 90_000;
+    const healthy = connected && recentAck;
     return Response.json(
       {
         status: healthy ? 'ok' : 'unhealthy',
-        connected: state.ws?.readyState === WebSocket.OPEN,
+        connected,
         sessionId: state.sessionId,
         lastSequence: state.lastSequence,
         lastHeartbeatAck: state.lastHeartbeatAck
           ? new Date(state.lastHeartbeatAck).toISOString()
           : null,
         reconnectAttempts: state.reconnectAttempts,
+        threadCacheSize: threadParentCache.size,
       },
       { status: healthy ? 200 : 503 }
     );

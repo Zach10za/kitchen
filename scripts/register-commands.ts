@@ -209,7 +209,16 @@ async function loadDevVars(): Promise<void> {
       const eq = trimmed.indexOf('=');
       if (eq === -1) continue;
       const key = trimmed.slice(0, eq).trim();
-      const val = trimmed.slice(eq + 1).trim();
+      let val = trimmed.slice(eq + 1).trim();
+      // Strip optional surrounding quotes so values like
+      // `FOO="bar baz"` resolve to `bar baz`, not `"bar baz"`.
+      if (val.length >= 2) {
+        const first = val[0];
+        const last = val[val.length - 1];
+        if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+          val = val.slice(1, -1);
+        }
+      }
       if (!process.env[key]) process.env[key] = val;
     }
   } catch {

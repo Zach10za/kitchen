@@ -15,6 +15,7 @@ import {
   ensureRelayRateSchema,
 } from './runtime/relay-rate-limit';
 import { runMigrations, type Migration } from './runtime/migrations';
+import { maybePruneConversationByWeek } from './runtime/conversation';
 import {
   ensureUsageSchema,
   recordUsage,
@@ -26,8 +27,6 @@ import {
 
 /** Keep this many of the most recent conversation rows per week_of when pruning. */
 const CONVERSATION_PRUNE_PER_WEEK = 200;
-/** Run conversation prune at most once per this many ms per DO instance. */
-const CONVERSATION_PRUNE_INTERVAL_MS = 24 * 3600 * 1000;
 
 /**
  * KitchenDO holds all household state. One instance per household
@@ -159,6 +158,7 @@ export class KitchenDO extends DurableObject<Env> {
       return Response.json({
         week_of: week.week_of,
         status: week.status,
+        drafted_at: week.drafted_at,
         meals: JSON.parse(week.meals_json),
       });
     }
@@ -404,6 +404,11 @@ export class KitchenDO extends DurableObject<Env> {
     ).toArray();
 
     for (const reminder of due) {
+      // Stamp sent_at BEFORE the network call so this is at-most-once.
+      // A duplicate reminder every hour while Discord is down would be
+      // worse than a single missed reminder; the user can always check
+      // `/reminders` to see what's coming.
+      this.sql.exec('UPDATE reminders SET sent_at = ? WHERE id = ?', now, reminder.id);
       try {
         const title = reminder.type === 'defrost'
           ? '🧊 Defrost reminder'
@@ -422,14 +427,12 @@ export class KitchenDO extends DurableObject<Env> {
             color: EmbedColor.reminder,
           })],
         });
-        this.sql.exec('UPDATE reminders SET sent_at = ? WHERE id = ?', now, reminder.id);
       } catch (err) {
         console.error('reminder dispatch failed', { id: reminder.id, err });
         await captureError(this.env, err, {
           source: 'reminders:dispatch',
           tags: { reminder_id: reminder.id },
         });
-        // Leave sent_at NULL so we retry on the next heartbeat.
       }
     }
   }
@@ -561,7 +564,12 @@ export class KitchenDO extends DurableObject<Env> {
     }
 
     let userMessage: string;
-    const weekOf = currentOrNextMondayISO(this.env.TIMEZONE);
+    // Use the same "active week" picker that /steer, /plan, and /approve use,
+    // so conversation rows and tool effects from /now, /pantry, /profile land
+    // on the same week_of. Otherwise on Thursdays the agent would write to
+    // next-Monday's week while /steer wrote to this-Monday's.
+    const activeWeek = findActiveWeek(this.sql);
+    const weekOf = activeWeek?.week_of ?? currentOrNextMondayISO(this.env.TIMEZONE);
 
     // /steer runs as a Workflow — each agent loop iteration is its own step
     // with retries, so slow LLM calls don't take down the whole conversation.
@@ -575,13 +583,9 @@ export class KitchenDO extends DurableObject<Env> {
         return;
       }
 
-      // Pick the active week (same as /plan + /approve) so they all agree.
-      const recent = findActiveWeek(this.sql);
-      const targetWeek = recent?.week_of ?? weekOf;
-
       const replyChannelId = await this.openReplyThread(interaction, userMsg);
       await this.env.STEER_WORKFLOW.create({
-        params: { weekOf: targetWeek, replyChannelId, userMessage: userMsg },
+        params: { weekOf, replyChannelId, userMessage: userMsg },
       });
       return;
     }
@@ -873,19 +877,14 @@ export class KitchenDO extends DurableObject<Env> {
    * heartbeat on it.
    */
   private maybePruneConversation(): void {
-    const now = Date.now();
-    if (now - this.lastConversationPruneAt < CONVERSATION_PRUNE_INTERVAL_MS) return;
-    this.lastConversationPruneAt = now;
-    this.sql.exec(`
-      DELETE FROM conversation
-      WHERE id NOT IN (
-        SELECT id FROM (
-          SELECT id, ROW_NUMBER() OVER (PARTITION BY week_of ORDER BY id DESC) AS rn
-          FROM conversation
-        )
-        WHERE rn <= ${CONVERSATION_PRUNE_PER_WEEK}
-      )
-    `);
+    // Per-week prune via shared helper. Bound parameter (not template
+    // interpolation) so configurability is safe even if the constant
+    // later moves into settings.
+    this.lastConversationPruneAt = maybePruneConversationByWeek(
+      (sql, ...params) => this.sql.exec(sql, ...params),
+      this.lastConversationPruneAt,
+      CONVERSATION_PRUNE_PER_WEEK,
+    );
   }
 }
 

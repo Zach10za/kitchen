@@ -140,7 +140,25 @@ export async function runAgentRound(args: RunRoundArgs): Promise<RoundResult> {
   const newMessages: any[] = [...args.messages, ...(response.output as any[])];
 
   for (const toolCall of toolCalls) {
-    let parsed = JSON.parse(toolCall.arguments);
+    // Malformed JSON from the model used to throw and crash the whole round —
+    // which under retry caused the round to re-run and tools that had already
+    // succeeded to execute again. Catch it, return the parse error as the
+    // tool output, and let the model self-correct on the next turn.
+    let parsed: any;
+    try {
+      parsed = JSON.parse(toolCall.arguments);
+    } catch (err) {
+      const output = `Error: arguments were not valid JSON: ${(err as Error).message}. Re-issue the tool call with corrected JSON.`;
+      newMessages.push({
+        type: 'function_call_output',
+        call_id: toolCall.call_id,
+        output,
+      });
+      if (args.onToolCall) {
+        await args.onToolCall({ name: toolCall.name, args: {}, output });
+      }
+      continue;
+    }
     if (args.fillDefaultArgs) parsed = args.fillDefaultArgs(toolCall.name, parsed);
     const result = await args.executeTool(toolCall.name, parsed);
     const output = typeof result === 'string' ? result : result.output;

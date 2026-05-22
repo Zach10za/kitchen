@@ -29,16 +29,23 @@ export function runMigrations(sql: SqlStorage, migrations: readonly Migration[])
     .exec<{ value: string }>("SELECT value FROM settings WHERE key = 'schema_version'")
     .toArray()[0];
   const current = row ? Number(row.value) || 0 : 0;
-  let applied = current;
+  // Run each migration in its own transaction together with the
+  // schema_version bump, so a partial migration can't leave the DO with
+  // half-applied DDL but an unchanged schema_version (which would cause
+  // the broken migration to re-run on next cold start).
   for (const m of migrations) {
     if (m.version <= current) continue;
-    m.up(sql);
-    applied = m.version;
-  }
-  if (applied !== current) {
-    sql.exec(
-      "INSERT INTO settings (key, value, updated_at) VALUES ('schema_version', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-      String(applied), Date.now()
-    );
+    sql.exec('BEGIN');
+    try {
+      m.up(sql);
+      sql.exec(
+        "INSERT INTO settings (key, value, updated_at) VALUES ('schema_version', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        String(m.version), Date.now()
+      );
+      sql.exec('COMMIT');
+    } catch (err) {
+      sql.exec('ROLLBACK');
+      throw err;
+    }
   }
 }
