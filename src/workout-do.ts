@@ -15,12 +15,7 @@ import {
  * richer /dump payload.
  */
 export class WorkoutDO extends AgentDOBase<Env> {
-  protected readonly spec = WORKOUT_SPEC;
-
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.ensureSchema();
-  }
+  protected getSpec() { return WORKOUT_SPEC; }
 
   protected async dispatchCommand(interaction: Interaction): Promise<void> {
     const commandName = interaction.data?.name ?? '';

@@ -10,12 +10,7 @@ import { buildTaskStats } from './tasks/loop';
  * concerns here are limited to slash-command dispatch and a richer /dump.
  */
 export class TasksDO extends AgentDOBase<Env> {
-  protected readonly spec = TASKS_SPEC;
-
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.ensureSchema();
-  }
+  protected getSpec() { return TASKS_SPEC; }
 
   protected async dispatchCommand(interaction: Interaction): Promise<void> {
     const commandName = interaction.data?.name ?? '';

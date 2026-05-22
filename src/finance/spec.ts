@@ -21,10 +21,10 @@ export const FINANCE_SPEC: BotSpec = {
     'spending',
     'merchant',
     'accounts',
-    'sync-finance',
   ]),
   tools: FINANCE_TOOLS,
   resetTables: ['transactions', 'accounts', 'conversation'],
+  scopeColumn: 'thread_id',
 
   buildSystemPrompt: (sql, env) => buildFinanceSystemPrompt(sql, env.TIMEZONE),
 

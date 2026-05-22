@@ -48,6 +48,7 @@ export const WORKOUT_SPEC: BotSpec = {
     'profile',
     'conversation',
   ],
+  scopeColumn: 'thread_id',
 
   buildSystemPrompt: (sql, env) => buildWorkoutSystemPrompt(sql, env.TIMEZONE),
 

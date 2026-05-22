@@ -9,7 +9,8 @@
     "tail": "wrangler tail",
     "register-commands": "bun run scripts/register-commands.ts",
     "simplefin-claim": "bun run scripts/simplefin-claim.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify": "bun run scripts/verify-specs.ts"
   },
   "dependencies": {
     "openai": "^6.36.0"

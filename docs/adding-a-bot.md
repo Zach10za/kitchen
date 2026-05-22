@@ -545,7 +545,9 @@ async alarm(): Promise<void> {
   try {
     // do your scheduled work
   } finally {
-    await this.armNext();  // re-arm so this fires again
+    // Re-arm so this fires again. Define your own helper — kitchen's is
+    // `armNextDraft()`, computed from `nextDraftTime()`.
+    await this.armNextDraft();
   }
 }
 ```

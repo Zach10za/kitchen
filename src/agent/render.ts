@@ -61,7 +61,7 @@ export function planEmbed(week: WeekRow, opts?: { includeFooterHint?: boolean })
 
   const footer = opts?.includeFooterHint
     ? status === 'draft'
-      ? 'Use /steer to refine · /approve to lock it in'
+      ? 'Use /chat to refine · /approve to lock it in'
       : status === 'approved'
         ? 'Use /grocery to see the list · /now for what to cook'
         : undefined

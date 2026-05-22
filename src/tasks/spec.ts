@@ -20,6 +20,7 @@ export const TASKS_SPEC: BotSpec = {
   ]),
   tools: TASKS_TOOLS,
   resetTables: ['tasks', 'task_deps', 'conversation'],
+  scopeColumn: 'thread_id',
 
   buildSystemPrompt: (sql, env) => buildTasksSystemPrompt(sql, env.TIMEZONE),
 

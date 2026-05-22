@@ -17,12 +17,7 @@ import { FINANCE_SPEC } from './finance/spec';
  *  - `/dump` extends the base's payload with finance-specific snapshots.
  */
 export class FinanceDO extends AgentDOBase<Env> {
-  protected readonly spec = FINANCE_SPEC;
-
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.ensureSchema();
-  }
+  protected getSpec() { return FINANCE_SPEC; }
 
   protected async onHeartbeat(): Promise<void> {
     await this.runScheduledSync();

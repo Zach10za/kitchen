@@ -66,10 +66,14 @@ export interface BotSpec {
   /** Tables wiped by /admin/reset (in deletion order). The base class iterates
    *  this list, then issues a /reset:after hook for any per-bot post-cleanup. */
   readonly resetTables: readonly string[];
+  /** Which `conversation` column the bot partitions by. Must match whatever
+   *  `defaultScope()` returns. Centralized here so the base's prune path
+   *  doesn't have to call `defaultScope(env, 'unused')` for its side-channel. */
+  readonly scopeColumn: 'thread_id' | 'week_of';
 
   buildSystemPrompt(sql: SqlStorage, env: Env, scope: ConversationScope): string;
 
-  executeTool(name: string, args: any, ctx: ToolExecCtx): Promise<ToolResult> | ToolResult;
+  executeTool(name: string, args: Record<string, unknown>, ctx: ToolExecCtx): Promise<ToolResult> | ToolResult;
 
   /** Synchronous read-only command handler. Return null for unknown commands
    *  so the base class can surface a clear error. */
@@ -83,8 +87,13 @@ export interface BotSpec {
 
   /** Optional: rewrite parsed tool args before execution to backfill context
    *  the model commonly omits. Kitchen uses this to inject `week_of` into
-   *  meal-plan tools whose schema declares it required. */
-  fillDefaultArgs?(toolName: string, parsed: any, scope: ConversationScope): any;
+   *  meal-plan tools whose schema declares it required. Returning the parsed
+   *  args unchanged is the no-op path; never return `undefined`. */
+  fillDefaultArgs?(
+    toolName: string,
+    parsed: Record<string, unknown>,
+    scope: ConversationScope,
+  ): Record<string, unknown>;
 }
 
 /** Resolve a DO stub by spec id. Single-tenant for now — every bot uses the

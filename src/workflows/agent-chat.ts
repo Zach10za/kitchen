@@ -13,7 +13,9 @@ import { makeOpenAIClient } from '../runtime/openai';
 import { computeCost, formatUsd } from '../runtime/pricing';
 import { withTypingRefresh } from '../runtime/typing';
 import type { AgentChatParams, ConversationScope } from '../runtime/bot-spec';
+import { getStubFor } from '../runtime/bot-spec';
 import { getBotSpec } from '../runtime/bot-registry';
+import { captureError } from '../error-triage';
 
 /**
  * Unified chat workflow used by every bot. Resolves its spec at run time from
@@ -28,11 +30,12 @@ import { getBotSpec } from '../runtime/bot-registry';
  *                             retries unsafe; the OpenAI client retries
  *                             network errors internally.
  *   5. record-usage         — best-effort; failure never blocks delivery
- *   6. save-assistant       — persist the final reply text
- *   7. post-final           — post into the Discord thread; if delivery fails,
- *                             surface `[delivery_failed]` into the conversation
- *                             log so the next turn doesn't replay a phantom
- *                             assistant turn.
+ *   6. post-final           — post into the Discord thread
+ *   7. save-assistant       — persist the final reply text. Runs AFTER
+ *                             post-final on purpose: if delivery throws, the
+ *                             workflow aborts before the assistant turn is
+ *                             persisted, so the next turn can't replay a
+ *                             message the user never saw.
  *
  * Replaces the four bot-specific `*SteerWorkflow` classes. URL prefix moved
  * from `/workflow/<bot>/…` to the bot-agnostic `/workflow/agent/…` since each
@@ -42,7 +45,7 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
   async run(event: WorkflowEvent<AgentChatParams>, step: WorkflowStep) {
     const { botId, replyChannelId, userMessage, scope } = event.payload;
     const discord = new DiscordAPI(this.env.DISCORD_BOT_TOKEN, this.env.DISCORD_APP_ID);
-    const stub = stubFor(this.env, botId);
+    const stub = getStubFor(this.env, botId);
 
     await step.do('initial-typing', async () => {
       await discord.postTyping(replyChannelId).catch(() => {});
@@ -51,6 +54,9 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
     const ctx = await step.do('load-context', async () => {
       const qs = new URLSearchParams({ scope_column: scope.column, scope_value: scope.value });
       const res = await stub.fetch(`https://internal/workflow/agent/load-context?${qs.toString()}`);
+      if (!res.ok) {
+        throw new Error(`load-context: HTTP ${res.status} ${await res.text()}`);
+      }
       return (await res.json()) as {
         systemPrompt: string;
         history: { role: 'user' | 'assistant'; content: string }[];
@@ -58,7 +64,7 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
     });
 
     await step.do('save-user-turn', async () => {
-      await stub.fetch('https://internal/workflow/agent/save-turn', {
+      const res = await stub.fetch('https://internal/workflow/agent/save-turn', {
         method: 'POST',
         body: JSON.stringify({
           role: 'user',
@@ -67,6 +73,9 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
           scope_value: scope.value,
         }),
       });
+      if (!res.ok) {
+        throw new Error(`save-user-turn: HTTP ${res.status} ${await res.text()}`);
+      }
     });
 
     let messages: any[] = [
@@ -77,6 +86,7 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
 
     let finalText: string | null = null;
     let turnUsage: RoundUsage = emptyUsage();
+    let roundsRun = 0;
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const inputMessages = messages;
@@ -90,6 +100,7 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
 
       messages = result.newMessages;
       turnUsage = addUsage(turnUsage, result.usage);
+      roundsRun = round + 1;
       if (result.type === 'final') {
         finalText = result.finalText ?? '(no text)';
         break;
@@ -97,6 +108,13 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
     }
 
     if (!finalText) {
+      // Blew through MAX_TOOL_ROUNDS without a final assistant message. The
+      // user still gets the fallback below, but capture so we can see which
+      // bot is repeatedly getting stuck.
+      await captureError(this.env, new Error('agent-chat: exceeded MAX_TOOL_ROUNDS'), {
+        source: `${botId}-agent-chat:tool-loop`,
+        tags: { bot_id: botId, rounds_run: roundsRun },
+      });
       finalText = 'I got stuck in a tool loop. Try again with a simpler request.';
     }
 
@@ -125,9 +143,16 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
     const footer = `\n\n_${formatUsd(turnCost.total_usd)} this turn · ${formatUsd(threadCost.total_usd)} thread total_`;
     const finalWithCost = finalText + footer;
 
-    await step.do('save-assistant', async () => {
+    // Post BEFORE persisting the assistant turn. If Discord delivery throws,
+    // the workflow aborts and the assistant turn is never saved — so the next
+    // turn never sees a message the user didn't receive.
+    await step.do('post-final', async () => {
       await discord.postTyping(replyChannelId).catch(() => {});
-      await stub.fetch('https://internal/workflow/agent/save-turn', {
+      await discord.postMessage(replyChannelId, finalWithCost);
+    });
+
+    await step.do('save-assistant', async () => {
+      const res = await stub.fetch('https://internal/workflow/agent/save-turn', {
         method: 'POST',
         body: JSON.stringify({
           role: 'assistant',
@@ -136,26 +161,8 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
           scope_value: scope.value,
         }),
       });
-    });
-
-    await step.do('post-final', async () => {
-      await discord.postTyping(replyChannelId).catch(() => {});
-      try {
-        await discord.postMessage(replyChannelId, finalWithCost);
-      } catch (err) {
-        // Last-resort: if the reply truly cannot land, surface that into the
-        // conversation log so the next turn can see "delivery_failed" instead
-        // of replaying a phantom assistant turn.
-        await stub.fetch('https://internal/workflow/agent/save-turn', {
-          method: 'POST',
-          body: JSON.stringify({
-            role: 'system',
-            content: `[delivery_failed] ${(err as Error).message}`,
-            scope_column: scope.column,
-            scope_value: scope.value,
-          }),
-        }).catch(() => {});
-        throw err;
+      if (!res.ok) {
+        throw new Error(`save-assistant: HTTP ${res.status} ${await res.text()}`);
       }
     });
   }
@@ -166,7 +173,7 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
     messages: any[],
   ): Promise<RoundResult> {
     const spec = getBotSpec(botId);
-    const stub = stubFor(this.env, botId);
+    const stub = getStubFor(this.env, botId);
     return runAgentRound({
       client: makeOpenAIClient(this.env),
       model: this.env.OPENAI_MODEL,
@@ -185,6 +192,12 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
             scope_value: scope.value,
           }),
         });
+        if (!res.ok) {
+          // Feed the failure back to the model as a string output rather than
+          // throwing — keeps the round-N step alive so the user still gets a
+          // reply (and we surface the error inside the conversation).
+          return `[tool ${name} failed: HTTP ${res.status}]`;
+        }
         const payload = (await res.json()) as { output: string; usage: RoundUsage | null };
         // Round runner accepts either string or {output, usage}. Returning the
         // structured form lets tool-internal LLM spend (kitchen's draft/swap)
@@ -194,6 +207,7 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
           : payload.output;
       },
       onToolCall: async ({ name, args, output }) => {
+        // Best-effort: failing to persist a tool row shouldn't kill the round.
         await stub.fetch('https://internal/workflow/agent/save-turn', {
           method: 'POST',
           body: JSON.stringify({
@@ -203,17 +217,8 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
             scope_column: scope.column,
             scope_value: scope.value,
           }),
-        });
+        }).catch(() => {});
       },
     });
   }
-}
-
-function stubFor(env: Env, botId: AgentChatParams['botId']): DurableObjectStub {
-  const ns =
-    botId === 'kitchen' ? env.KITCHEN
-    : botId === 'finance' ? env.FINANCE
-    : botId === 'tasks' ? env.TASKS
-    : env.WORKOUT;
-  return ns.get(ns.idFromName('default-household'));
 }

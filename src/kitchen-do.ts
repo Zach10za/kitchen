@@ -27,12 +27,7 @@ import { KITCHEN_SPEC } from './kitchen/spec';
  * AgentChatWorkflow via `dispatchChatInteraction`.
  */
 export class KitchenDO extends AgentDOBase<Env> {
-  protected readonly spec = KITCHEN_SPEC;
-
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    this.ensureSchema();
-  }
+  protected getSpec() { return KITCHEN_SPEC; }
 
   protected async onHeartbeat(): Promise<void> {
     await this.ensureAlarmSet();

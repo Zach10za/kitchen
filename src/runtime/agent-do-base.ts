@@ -14,14 +14,14 @@
  *   /workflow/agent/cost-summary
  *   /workflow/agent/exec-tool
  *
- * Subclasses point to their `BotSpec` and may:
+ * Subclasses point to their `BotSpec` via `getSpec()` and may:
  *  - override `onHeartbeat()` for bot-specific heartbeat work (kitchen alarms +
  *    reminder dispatch),
  *  - override `handleCustomRoute()` to add bot-specific endpoints (kitchen has
  *    /ensure-alarm, /get-grocery, /clear-grocery, /workflow/load-draft, …),
  *  - override `dispatchCommand()` to handle slash-command interactions that
- *    aren't a plain `<bot> message:` chat (kitchen has /approve, /draft,
- *    /pantry-write, /grocery, /now, /profile-write, …),
+ *    aren't a plain `<bot> message:` chat (kitchen has /now, /pantry, /profile,
+ *    /draft, /approve, /grocery),
  *  - add an `alarm()` method (kitchen's weekly draft alarm).
  *
  * The base intentionally doesn't know about alarms, reminders, or any
@@ -49,6 +49,7 @@ import {
   type RecordUsageBody,
 } from './usage';
 import { makeOpenAIClient } from './openai';
+import type { RoundUsage } from './agent-round';
 import type { BotSpec, ConversationScope, ToolExecCtx } from './bot-spec';
 import { dispatchChat } from './bot-registry';
 
@@ -62,25 +63,27 @@ const TOOL_TIMEOUT_MS = 60_000;
 export abstract class AgentDOBase<E extends Env> extends DurableObject<E> {
   protected sql: SqlStorage;
   protected discord: DiscordAPI;
-  protected abstract readonly spec: BotSpec;
   private lastConversationPruneAt = 0;
+
+  /** Subclasses return their module-level `BotSpec` constant. Implemented as
+   *  a method (not a field) so the base constructor can invoke it via virtual
+   *  dispatch — TS class-field initializers haven't run when `super()` does. */
+  protected abstract getSpec(): BotSpec;
+
+  /** Convenience getter so the rest of the base can read `this.spec` instead
+   *  of calling `this.getSpec()` repeatedly. */
+  protected get spec(): BotSpec {
+    return this.getSpec();
+  }
 
   constructor(ctx: DurableObjectState, env: E) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.discord = new DiscordAPI(env.DISCORD_BOT_TOKEN, env.DISCORD_APP_ID);
-    // Migrations run from the subclass constructor via ensureSchema() so the
-    // abstract `spec` field is initialized first (TS class-field init order
-    // forces this — the base can't read `this.spec` here).
-  }
-
-  /**
-   * Subclasses MUST call this from their constructor (after `super()`) so the
-   * spec is initialized when migrations run. Centralizes the migration call
-   * even though the subclass has to trigger it.
-   */
-  protected ensureSchema(): void {
-    runMigrations(this.sql, this.spec.migrations);
+    // Runs against the subclass's spec via virtual dispatch on getSpec(). This
+    // eliminates the foot-gun where a subclass forgot to call ensureSchema()
+    // and crashed on its first SQL query.
+    runMigrations(this.sql, this.getSpec().migrations);
   }
 
   /** Hook: bot-specific heartbeat work after universal prune. Default no-op. */
@@ -131,7 +134,14 @@ export abstract class AgentDOBase<E extends Env> extends DurableObject<E> {
     }
 
     if (url.pathname === '/heartbeat') {
-      await this.onHeartbeat();
+      // onHeartbeat throws shouldn't skip the prune below — both run on the
+      // hourly cron and shedding one isn't worth losing the other.
+      try {
+        await this.onHeartbeat();
+      } catch (err) {
+        console.error(`${this.spec.id} onHeartbeat failed`, err);
+        await captureError(this.env, err, { source: `${this.spec.id}:heartbeat` });
+      }
       this.maybePruneConversation();
       return new Response('ok');
     }
@@ -244,6 +254,7 @@ export abstract class AgentDOBase<E extends Env> extends DurableObject<E> {
       if (!scope) {
         return Response.json({ error: 'exec-tool: missing/invalid scope' }, { status: 400 });
       }
+      const toolName = body.name;
       const client = makeOpenAIClient(this.env, { timeoutMs: TOOL_TIMEOUT_MS });
       const toolCtx: ToolExecCtx = {
         env: this.env,
@@ -252,12 +263,30 @@ export abstract class AgentDOBase<E extends Env> extends DurableObject<E> {
         timezone: this.env.TIMEZONE,
         scope,
       };
-      const result = await this.spec.executeTool(body.name, body.args ?? {}, toolCtx);
-      // Always return the structured form so the workflow can fold tool-internal
-      // LLM usage (kitchen's generate_draft / swap_meal) into the round footer.
-      const payload = typeof result === 'string'
-        ? { output: result, usage: null }
-        : { output: result.output, usage: result.usage ?? null };
+      // Each spec.executeTool wraps its inner handlers in try/catch and
+      // returns a string error — but a bug *outside* that inner try (bad ctx
+      // shape, an unmatched tool case, a rejected promise from executeTool
+      // itself) would otherwise bubble a 500 with no body. The workflow turns
+      // that into a JSON-parse failure and the user gets nothing. Wrapping
+      // here keeps the round alive: the model sees the failure string and
+      // can either retry or apologize.
+      let payload: { output: string; usage: RoundUsage | null };
+      try {
+        const result = await this.spec.executeTool(
+          toolName,
+          (body.args ?? {}) as Record<string, unknown>,
+          toolCtx,
+        );
+        payload = typeof result === 'string'
+          ? { output: result, usage: null }
+          : { output: result.output, usage: result.usage ?? null };
+      } catch (err) {
+        console.error(`${this.spec.id} exec-tool ${toolName} failed`, err);
+        this.ctx.waitUntil(captureError(this.env, err, {
+          source: `${this.spec.id}-exec-tool:${toolName}`,
+        }));
+        payload = { output: `[tool ${toolName} failed: ${(err as Error).message}]`, usage: null };
+      }
       return Response.json(payload);
     }
 
@@ -324,9 +353,8 @@ export abstract class AgentDOBase<E extends Env> extends DurableObject<E> {
   }
 
   private maybePruneConversation(): void {
-    const column = this.spec.defaultScope(this.env, 'unused').column;
     const runner = (sql: string, ...params: any[]) => this.sql.exec(sql, ...params);
-    if (column === 'week_of') {
+    if (this.spec.scopeColumn === 'week_of') {
       this.lastConversationPruneAt = maybePruneConversationByWeek(
         runner, this.lastConversationPruneAt, CONVERSATION_PRUNE_KEEP_DEFAULT,
       );

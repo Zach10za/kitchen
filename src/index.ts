@@ -253,7 +253,7 @@ function isFastReadCommand(interaction: Interaction): boolean {
     case 'pantry':
       return !hasMessage;     // /pantry (alone) = read; with message = write
     case 'plan':
-      return true;            // /plan always reads existing; use /steer to create
+      return true;            // /plan always reads existing; use /chat to create
     case 'grocery':
       return false;           // routed through DO so it can split into multiple messages
     case 'reminders':

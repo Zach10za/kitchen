@@ -32,6 +32,7 @@ export const KITCHEN_SPEC: BotSpec = {
   // schema_version + cooking_profile + other config keys). KitchenDO overrides
   // onReset() to re-arm the weekly draft alarm.
   resetTables: ['weeks', 'conversation', 'pantry', 'preferences', 'grocery_lists', 'reminders'],
+  scopeColumn: 'week_of',
 
   buildSystemPrompt: (sql, env, scope) => {
     // Kitchen's prompt is week-scoped. Scope value IS the week_of identifier;
