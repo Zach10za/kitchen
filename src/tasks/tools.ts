@@ -17,7 +17,7 @@ export const TASKS_TOOLS = [
     type: 'function' as const,
     function: {
       name: 'list_tasks',
-      description: 'List tasks with optional filters. Returns id, title, status, type, parent, dependency count. Use when the user asks to see tasks by status, type, or project (parent).',
+      description: 'List tasks with optional filters. Returns id, title, status, type, priority, due date, parent, dependency count. Always ordered: in-progress → todo → blocked, then urgent → low, then soonest due.',
       parameters: {
         type: 'object',
         properties: {
@@ -31,6 +31,11 @@ export const TASKS_TOOLS = [
             enum: ['short', 'long'],
             description: 'Filter by task type. Omit for all.',
           },
+          priority: {
+            type: 'string',
+            enum: ['low', 'normal', 'high', 'urgent'],
+            description: 'Filter by priority. Omit for all.',
+          },
           parent_id: {
             type: 'string',
             description: 'Only return subtasks of this parent task ID. Omit for top-level tasks.',
@@ -38,6 +43,10 @@ export const TASKS_TOOLS = [
           include_done: {
             type: 'boolean',
             description: 'Include done/cancelled tasks. Default false unless status is explicitly set.',
+          },
+          due_within_days: {
+            type: 'number',
+            description: 'Only return tasks due within this many days. 0 means overdue + due today.',
           },
         },
       },
@@ -61,7 +70,7 @@ export const TASKS_TOOLS = [
     type: 'function' as const,
     function: {
       name: 'add_task',
-      description: 'Create a new task. Returns the new task ID. For subtasks, provide parent_id. Short tasks are quick single-session items; long tasks span multiple sessions or have subtasks.',
+      description: 'Create a new task. Returns the new task ID. For subtasks, provide parent_id. Short tasks are quick single-session items; long tasks span multiple sessions or have subtasks. Set priority and due_date when the user signals urgency or a deadline.',
       parameters: {
         type: 'object',
         properties: {
@@ -71,8 +80,17 @@ export const TASKS_TOOLS = [
             enum: ['short', 'long'],
             description: 'short = quick, single-session. long = multi-session, may have subtasks. Default short.',
           },
+          priority: {
+            type: 'string',
+            enum: ['low', 'normal', 'high', 'urgent'],
+            description: 'Default normal. Use urgent only for true emergencies. high = important and time-sensitive. low = nice-to-have.',
+          },
           notes: { type: 'string', description: 'Optional details, context, or acceptance criteria.' },
           parent_id: { type: 'string', description: 'Parent task ID to make this a subtask. Omit for top-level.' },
+          due_date: {
+            type: 'string',
+            description: 'Optional deadline. Accepts YYYY-MM-DD (interpreted as end-of-day UTC) or full ISO-8601 datetime.',
+          },
         },
         required: ['title'],
       },
@@ -82,7 +100,7 @@ export const TASKS_TOOLS = [
     type: 'function' as const,
     function: {
       name: 'update_task',
-      description: 'Update a task\'s status, title, type, or notes. Only provide fields you want to change. To complete a task, set status to "done". To cancel, set "cancelled". To start, set "in_progress".',
+      description: 'Update a task\'s status, title, type, priority, notes, or due date. Only provide fields you want to change. To complete a task, set status to "done". To cancel, set "cancelled". To start, set "in_progress". Pass due_date as null to clear an existing deadline.',
       parameters: {
         type: 'object',
         properties: {
@@ -94,7 +112,16 @@ export const TASKS_TOOLS = [
             description: 'New status.',
           },
           type: { type: 'string', enum: ['short', 'long'], description: 'New type.' },
+          priority: {
+            type: 'string',
+            enum: ['low', 'normal', 'high', 'urgent'],
+            description: 'New priority.',
+          },
           notes: { type: 'string', description: 'New notes (replaces existing).' },
+          due_date: {
+            type: ['string', 'null'],
+            description: 'YYYY-MM-DD or ISO-8601 datetime. Pass null to clear the existing due date.',
+          },
         },
         required: ['id'],
       },
@@ -139,8 +166,10 @@ export interface TaskRow {
   title: string;
   status: 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
   type: 'short' | 'long';
+  priority: 'low' | 'normal' | 'high' | 'urgent';
   parent_id: string | null;
   notes: string | null;
+  due_at: number | null;
   created_at: number;
   updated_at: number;
   [key: string]: SqlStorageValue;

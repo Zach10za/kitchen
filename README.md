@@ -65,7 +65,7 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/plan`, `/draft`, `/steer`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked` registered.
+You should see `/plan`, `/draft`, `/steer`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due` registered.
 
 ### 6. Deploy the Worker
 
@@ -162,11 +162,12 @@ In your `#finance` channel:
 In your `#tasks` channel:
 
 ```
-/tasks                   task summary (open, ready, blocked counts)
-/tasks message:...       add tasks, update status, ask what to work on next
+/tasks                   task summary (open, ready, blocked, overdue counts)
+/tasks message:...       add tasks, update status, set priority/due dates, ask what to work on next
 /tasks-open              list all open tasks
 /tasks-next              show tasks with no unfinished blockers (ready to start)
 /tasks-blocked           show tasks waiting on other tasks
+/tasks-due               show overdue tasks and anything due within 7 days
 ```
 
 …or just talk in any channel. The Fly.io relay forwards messages to the right bot based on channel ID, so plain messages work without slash commands. Per-channel rate limit: `RELAY_RATE_LIMIT_PER_HOUR` (default 30/hr) prevents unbounded LLM spend.

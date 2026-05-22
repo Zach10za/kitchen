@@ -292,6 +292,8 @@ function isFastReadCommand(interaction: Interaction): boolean {
       return true;            // pure read
     case 'tasks-blocked':
       return true;            // pure read
+    case 'tasks-due':
+      return true;            // pure read
     default:
       return false;
   }

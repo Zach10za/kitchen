@@ -17,8 +17,14 @@ import {
   countTurnsByThread,
 } from './runtime/usage';
 import { buildTasksSystemPrompt } from './tasks/prompts';
-import { executeTasksTool, buildTaskStats, type TaskRow } from './tasks/loop';
-import { taskSummaryEmbed, tasksListEmbed } from './tasks/render';
+import {
+  executeTasksTool,
+  buildTaskStats,
+  TASK_ORDER_SQL,
+  DUE_SOON_WINDOW_MS,
+  type TaskRow,
+} from './tasks/loop';
+import { taskSummaryEmbed, tasksListEmbed, tasksDueEmbed } from './tasks/render';
 
 /** Keep this many of the most recent conversation rows when pruning. */
 const CONVERSATION_PRUNE_KEEP = 400;
@@ -156,12 +162,34 @@ export class TasksDO extends DurableObject<Env> {
     }
 
     if (url.pathname === '/dump') {
-      const taskCount = this.sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM tasks').toArray()[0]?.n ?? 0;
+      const stats = buildTaskStats(this.sql);
       const recentTasks = this.sql.exec('SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 30').toArray();
       const deps = this.sql.exec('SELECT * FROM task_deps').toArray();
       const recentConv = this.sql.exec('SELECT id, role, ts, substr(content, 1, 200) AS preview FROM conversation ORDER BY id DESC LIMIT 30').toArray();
       return new Response(
-        JSON.stringify({ now: Date.now(), task_count: taskCount, recent_tasks: recentTasks, deps, recent_conversation: recentConv }, null, 2),
+        JSON.stringify(
+          {
+            now: Date.now(),
+            stats: {
+              total: stats.total,
+              by_status: stats.byStatus,
+              by_priority: stats.byPriority,
+              overdue_count: stats.overdueTasks.length,
+              ready_count: stats.readyTasks.length,
+              blocked_count: stats.blockedTasks.length,
+              in_progress_count: stats.inProgressTasks.length,
+            },
+            in_progress: stats.inProgressTasks,
+            ready: stats.readyTasks,
+            blocked: stats.blockedTasks,
+            overdue: stats.overdueTasks,
+            recent_tasks: recentTasks,
+            deps,
+            recent_conversation: recentConv,
+          },
+          null,
+          2
+        ),
         { headers: { 'content-type': 'application/json' } }
       );
     }
@@ -207,7 +235,9 @@ export class TasksDO extends DurableObject<Env> {
     if (cmd === 'tasks-open') {
       const tasks = this.sql
         .exec<TaskRow>(
-          `SELECT * FROM tasks WHERE status NOT IN ('done','cancelled') ORDER BY status ASC, created_at ASC`
+          `SELECT t.* FROM tasks t
+           WHERE t.status NOT IN ('done','cancelled')
+           ORDER BY ${TASK_ORDER_SQL}`
         )
         .toArray();
       return { embeds: [tasksListEmbed('📋 Open Tasks', tasks)] };
@@ -223,7 +253,7 @@ export class TasksDO extends DurableObject<Env> {
                JOIN tasks blocker ON blocker.id = d.depends_on_id
                WHERE d.task_id = t.id AND blocker.status NOT IN ('done', 'cancelled')
              )
-           ORDER BY t.status DESC, t.created_at ASC`
+           ORDER BY ${TASK_ORDER_SQL}`
         )
         .toArray();
       return { embeds: [tasksListEmbed('✅ Ready to Work On', tasks)] };
@@ -237,10 +267,27 @@ export class TasksDO extends DurableObject<Env> {
            JOIN tasks blocker ON blocker.id = d.depends_on_id
            WHERE t.status NOT IN ('done', 'cancelled')
              AND blocker.status NOT IN ('done', 'cancelled')
-           ORDER BY t.created_at ASC`
+           ORDER BY ${TASK_ORDER_SQL}`
         )
         .toArray();
       return { embeds: [tasksListEmbed('⛔ Blocked Tasks', tasks)] };
+    }
+
+    if (cmd === 'tasks-due') {
+      // Overdue + due within the next 7d. Done/cancelled excluded — past-due
+      // tasks you already closed aren't actionable.
+      const cutoff = Date.now() + DUE_SOON_WINDOW_MS;
+      const tasks = this.sql
+        .exec<TaskRow>(
+          `SELECT t.* FROM tasks t
+           WHERE t.status NOT IN ('done','cancelled')
+             AND t.due_at IS NOT NULL
+             AND t.due_at <= ?
+           ORDER BY t.due_at ASC, ${TASK_ORDER_SQL}`,
+          cutoff
+        )
+        .toArray();
+      return { embeds: [tasksDueEmbed(tasks)] };
     }
 
     return { content: `Unknown fast-read tasks command: ${cmd}` };
@@ -317,6 +364,26 @@ export class TasksDO extends DurableObject<Env> {
     {
       version: 3,
       up: (sql) => ensureUsageSchema(sql),
+    },
+    {
+      // v4 adds priority + due_at. Migrations are append-only — we never
+      // mutate v1 — so new installs also reach these columns via this step.
+      // SQLite has no `ALTER TABLE ADD COLUMN IF NOT EXISTS`, so probe first.
+      version: 4,
+      up: (sql) => {
+        const existingColumns = sql
+          .exec<{ name: string }>("PRAGMA table_info(tasks)")
+          .toArray()
+          .map((r) => r.name);
+        if (!existingColumns.includes('priority')) {
+          sql.exec("ALTER TABLE tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'");
+        }
+        if (!existingColumns.includes('due_at')) {
+          sql.exec("ALTER TABLE tasks ADD COLUMN due_at INTEGER");
+        }
+        sql.exec("CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_at) WHERE due_at IS NOT NULL");
+        sql.exec("CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority)");
+      },
     },
   ];
 }

@@ -117,6 +117,10 @@ const COMMANDS = [
     name: 'tasks-blocked',
     description: 'Show tasks blocked by unfinished dependencies',
   },
+  {
+    name: 'tasks-due',
+    description: 'Show overdue tasks and anything due within the next 7 days',
+  },
 ];
 
 async function main() {
