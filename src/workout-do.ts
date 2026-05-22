@@ -33,6 +33,7 @@ import {
   workoutPRsEmbed,
   workoutWeekEmbed,
   workoutProgramEmbed,
+  workoutProfileEmbed,
 } from './workout/render';
 
 const CONVERSATION_PRUNE_KEEP = 400;
@@ -120,10 +121,15 @@ export class WorkoutDO extends DurableObject<Env> {
       this.sql.exec('DELETE FROM routines');
       this.sql.exec('DELETE FROM programs');
       this.sql.exec('DELETE FROM exercises');
+      this.sql.exec('DELETE FROM gym_equipment');
+      this.sql.exec('DELETE FROM profile');
       this.sql.exec('DELETE FROM conversation');
       return Response.json({
         status: 'ok',
-        cleared: ['sets', 'workouts', 'routine_exercises', 'routines', 'programs', 'exercises', 'conversation'],
+        cleared: [
+          'sets', 'workouts', 'routine_exercises', 'routines', 'programs',
+          'exercises', 'gym_equipment', 'profile', 'conversation',
+        ],
       });
     }
 
@@ -334,6 +340,13 @@ export class WorkoutDO extends DurableObject<Env> {
       return { embeds: [workoutProgramEmbed(active, routinesWithExercises)] };
     }
 
+    if (cmd === 'workout-profile') {
+      // buildWorkoutStats already loads both — reuse so the singleton profile
+      // row is auto-created on first read if it doesn't exist.
+      const stats = buildWorkoutStats(this.sql);
+      return { embeds: [workoutProfileEmbed(stats.profile, stats.equipment)] };
+    }
+
     return { content: `Unknown fast-read workout command: ${cmd}` };
   }
 
@@ -470,6 +483,36 @@ export class WorkoutDO extends DurableObject<Env> {
     {
       version: 3,
       up: (sql) => ensureUsageSchema(sql),
+    },
+    {
+      // v4: profile (singleton free-text doc) + gym_equipment (structured list).
+      // Injuries / niggles live as free text in profile.health_notes — formal
+      // injury tables were overkill for "tweaked my knee Tuesday" volume.
+      version: 4,
+      up: (sql) => {
+        sql.exec(`
+          CREATE TABLE IF NOT EXISTS profile (
+            id TEXT PRIMARY KEY,
+            bio TEXT,
+            goals TEXT,
+            preferences TEXT,
+            health_notes TEXT,
+            updated_at INTEGER NOT NULL
+          );
+
+          CREATE TABLE IF NOT EXISTS gym_equipment (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            category TEXT,
+            details TEXT,
+            notes TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_gym_equipment_category ON gym_equipment(category);
+        `);
+      },
     },
   ];
 }

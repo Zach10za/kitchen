@@ -320,6 +320,8 @@ function isFastReadCommand(interaction: Interaction): boolean {
       return true;            // pure read
     case 'workout-program':
       return true;            // pure read
+    case 'workout-profile':
+      return true;            // pure read
     default:
       return false;
   }

@@ -302,6 +302,93 @@ export const WORKOUT_TOOLS = [
       },
     },
   },
+  // ─── Profile / gym equipment / injuries ─────────────────────────────
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_profile',
+      description: 'Read the current lifter profile (bio, goals, preferences) plus owned equipment and active injuries. Use when you need the full context (the prompt already includes a snapshot, but this returns the canonical values).',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'update_profile',
+      description: 'Update lifter profile. Each field is independently optional and REPLACES the existing value when provided — to add a new note, read the current value (from the prompt header or get_profile) and pass the merged text. Pass empty string to clear a field.\n\nhealth_notes is the catch-all for injuries, niggles, and recent tweaks. Append things like "tweaked right knee 2026-05-21 — avoid bilateral squats until pain-free" rather than spinning up structured records; keep older items chronologically with a date stamp so you can see what\'s active.',
+      parameters: {
+        type: 'object',
+        properties: {
+          bio: { type: 'string', description: 'Free-form bio: age, bodyweight, training years, background.' },
+          goals: { type: 'string', description: 'What the user is training for: strength, hypertrophy, performance, longevity, etc.' },
+          preferences: { type: 'string', description: 'Schedule, frequency, training style preferences, dislikes.' },
+          health_notes: { type: 'string', description: 'Injuries, niggles, movement restrictions. Date-stamp new entries; keep historic ones so the agent can see trends.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'add_equipment',
+      description: 'Add a piece of equipment the user owns. Name must be unique (case-insensitive). Category is freeform — useful values: "barbell", "plates", "dumbbells", "rack", "bench", "machine", "cable", "kettlebell", "band", "cardio", "accessory". Use details for capacity ("315 lb in plates", "adjustable 5–100 lb"). This is the user\'s home-gym inventory — use it to constrain exercise suggestions.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Equipment name, e.g. "Barbell", "Adjustable Dumbbells", "Power Rack".' },
+          category: { type: 'string', description: 'Optional category for grouping.' },
+          details: { type: 'string', description: 'Capacity / specs, e.g. "olympic 45lb", "5-100lb adjustable", "315lb in plates".' },
+          notes: { type: 'string', description: 'Optional notes (brand, condition, etc).' },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'update_equipment',
+      description: 'Update an existing equipment entry. Use to fix categorization, update capacity ("now 365 lb in plates"), or rename.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Equipment id (starts with eq_).' },
+          name: { type: 'string', description: 'New name (must remain unique).' },
+          category: { type: 'string' },
+          details: { type: 'string' },
+          notes: { type: 'string' },
+        },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'remove_equipment',
+      description: 'Hard-delete a piece of equipment from the inventory. Use when the user sold/got rid of something.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Equipment id (starts with eq_).' },
+        },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'list_equipment',
+      description: 'List all owned equipment, optionally filtered by category. Returns name, category, details, notes per item.',
+      parameters: {
+        type: 'object',
+        properties: {
+          category: { type: 'string', description: 'Optional category filter.' },
+        },
+      },
+    },
+  },
 ] as const;
 
 // ─── TypeScript Row Types ─────────────────────────────────────────────
@@ -379,5 +466,27 @@ export interface RoutineExerciseRow {
   target_weight_lbs: number | null;
   target_rpe: number | null;
   notes: string | null;
+  [key: string]: SqlStorageValue;
+}
+
+export interface ProfileRow {
+  id: string;
+  bio: string | null;
+  goals: string | null;
+  preferences: string | null;
+  health_notes: string | null;
+  updated_at: number;
+  [key: string]: SqlStorageValue;
+}
+
+export interface GymEquipmentRow {
+  id: string;
+  name: string;
+  display_name: string;
+  category: string | null;
+  details: string | null;
+  notes: string | null;
+  created_at: number;
+  updated_at: number;
   [key: string]: SqlStorageValue;
 }

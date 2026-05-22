@@ -66,7 +66,7 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/plan`, `/draft`, `/steer`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program` registered.
+You should see `/plan`, `/draft`, `/steer`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
 
 ### 6. Deploy the Worker
 
@@ -181,7 +181,14 @@ In your `#workout` channel:
 /workout-prs             top estimated 1RMs across all lifts (optional exercise filter)
 /workout-week            sets + tonnage by muscle group for the last 7 days (configurable)
 /workout-program         active training program with all routines and planned exercises
+/workout-profile         your bio/goals/preferences/health-notes + home-gym inventory
 ```
+
+The bot reads four kinds of context on every reply:
+- **Profile**: bio, goals, preferences (free text — set via chat)
+- **Health notes**: injuries, current niggles, movement restrictions. Mention a tweak in chat ("my back's been iffy") and the agent appends a date-stamped entry; it then steers around it in future suggestions.
+- **Home gym inventory**: what you actually own. The bot will only suggest movements you can actually do; if you don't have a cable stack, no cable rows.
+- **Training state**: active program, recent workouts, weekly volume, PRs.
 
 …or just talk in any channel. The Fly.io relay forwards messages to the right bot based on channel ID, so plain messages work without slash commands. Per-channel rate limit: `RELAY_RATE_LIMIT_PER_HOUR` (default 30/hr) prevents unbounded LLM spend.
 

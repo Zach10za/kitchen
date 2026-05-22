@@ -6,9 +6,15 @@
  * All weights are pounds. Bodyweight exercises have NULL weight.
  */
 
-import type { ExerciseRow, WorkoutRow, SetRow, ProgramRow, RoutineRow } from './tools';
+import type {
+  ExerciseRow, WorkoutRow, SetRow, ProgramRow, RoutineRow,
+  ProfileRow, GymEquipmentRow,
+} from './tools';
 
-export type { ExerciseRow, WorkoutRow, SetRow, ProgramRow, RoutineRow };
+export type {
+  ExerciseRow, WorkoutRow, SetRow, ProgramRow, RoutineRow,
+  ProfileRow, GymEquipmentRow,
+};
 
 export interface WorkoutToolCtx {
   sql: SqlStorage;
@@ -44,6 +50,12 @@ export function executeWorkoutTool(name: string, args: any, ctx: WorkoutToolCtx)
       case 'list_programs':        return toolListPrograms(ctx);
       case 'get_program':          return toolGetProgram(args, ctx);
       case 'set_active_program':   return toolSetActiveProgram(args, ctx);
+      case 'get_profile':          return toolGetProfile(ctx);
+      case 'update_profile':       return toolUpdateProfile(args, ctx);
+      case 'add_equipment':        return toolAddEquipment(args, ctx);
+      case 'update_equipment':     return toolUpdateEquipment(args, ctx);
+      case 'remove_equipment':     return toolRemoveEquipment(args, ctx);
+      case 'list_equipment':       return toolListEquipment(args, ctx);
       default:                     return `Unknown workout tool: ${name}`;
     }
   } catch (err) {
@@ -796,6 +808,186 @@ function toolSetActiveProgram(args: { id?: string | null }, ctx: WorkoutToolCtx)
   return `Activated program [${p.id}] "${p.name}".`;
 }
 
+// ─── Profile / gym equipment ─────────────────────────────────────────
+
+const PROFILE_ID = 'singleton';
+
+function loadProfile(sql: SqlStorage): ProfileRow {
+  let row = sql.exec<ProfileRow>('SELECT * FROM profile WHERE id = ?', PROFILE_ID).toArray()[0];
+  if (row) return row;
+  const now = Date.now();
+  sql.exec(
+    'INSERT INTO profile (id, bio, goals, preferences, health_notes, updated_at) VALUES (?, NULL, NULL, NULL, NULL, ?)',
+    PROFILE_ID, now
+  );
+  row = sql.exec<ProfileRow>('SELECT * FROM profile WHERE id = ?', PROFILE_ID).toArray()[0]!;
+  return row;
+}
+
+function toolGetProfile(ctx: WorkoutToolCtx): string {
+  const p = loadProfile(ctx.sql);
+  const lines: string[] = [];
+  lines.push(p.bio ? `Bio: ${p.bio}` : 'Bio: (empty)');
+  lines.push(p.goals ? `Goals: ${p.goals}` : 'Goals: (empty)');
+  lines.push(p.preferences ? `Preferences: ${p.preferences}` : 'Preferences: (empty)');
+  lines.push(p.health_notes ? `Health notes: ${p.health_notes}` : 'Health notes: (empty)');
+
+  const equip = ctx.sql
+    .exec<GymEquipmentRow>('SELECT * FROM gym_equipment ORDER BY category, name')
+    .toArray();
+  lines.push('');
+  if (equip.length === 0) {
+    lines.push('Owned equipment: (none)');
+  } else {
+    lines.push(`Owned equipment (${equip.length}):`);
+    for (const e of equip) {
+      const cat = e.category ? ` · ${e.category}` : '';
+      const det = e.details ? ` — ${e.details}` : '';
+      lines.push(`  [${e.id}] ${e.display_name}${cat}${det}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function toolUpdateProfile(
+  args: { bio?: string; goals?: string; preferences?: string; health_notes?: string },
+  ctx: WorkoutToolCtx
+): string {
+  // Make sure the singleton row exists first.
+  loadProfile(ctx.sql);
+
+  const updates: string[] = [];
+  const params: SqlStorageValue[] = [];
+  const changed: string[] = [];
+
+  // Empty string → clear (store NULL). Undefined → leave alone.
+  const apply = (key: 'bio' | 'goals' | 'preferences' | 'health_notes', value: string | undefined) => {
+    if (value === undefined) return;
+    const stored = value === '' ? null : value;
+    updates.push(`${key} = ?`);
+    params.push(stored);
+    changed.push(stored === null ? `${key}=cleared` : key);
+  };
+  apply('bio', args.bio);
+  apply('goals', args.goals);
+  apply('preferences', args.preferences);
+  apply('health_notes', args.health_notes);
+
+  if (updates.length === 0) return 'No fields to update.';
+
+  updates.push('updated_at = ?');
+  params.push(Date.now());
+  params.push(PROFILE_ID);
+  const stmt = 'UPDATE profile SET ' + updates.join(', ') + ' WHERE id = ?';
+  ctx.sql.exec(stmt, ...params);
+  return `Updated profile: ${changed.join(', ')}.`;
+}
+
+function normalizeEquipmentName(raw: string): string {
+  return raw.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function toolAddEquipment(
+  args: { name: string; category?: string; details?: string; notes?: string },
+  ctx: WorkoutToolCtx
+): string {
+  if (!args.name?.trim()) return 'Equipment name is required.';
+  const name = normalizeEquipmentName(args.name);
+  const existing = ctx.sql
+    .exec<GymEquipmentRow>('SELECT * FROM gym_equipment WHERE name = ?', name)
+    .toArray()[0];
+  if (existing) {
+    return `Already in inventory: [${existing.id}] ${existing.display_name}. Use update_equipment to modify.`;
+  }
+  const id = shortId('eq');
+  const now = Date.now();
+  ctx.sql.exec(
+    `INSERT INTO gym_equipment (id, name, display_name, category, details, notes, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    id, name, args.name.trim(),
+    args.category ? args.category.toLowerCase() : null,
+    args.details ?? null,
+    args.notes ?? null,
+    now, now
+  );
+  const extras = [args.category ? `category=${args.category}` : null, args.details ? `details="${args.details}"` : null]
+    .filter(Boolean)
+    .join(', ');
+  return `Added equipment [${id}]: ${args.name.trim()}${extras ? ` (${extras})` : ''}.`;
+}
+
+function toolUpdateEquipment(
+  args: { id: string; name?: string; category?: string; details?: string; notes?: string },
+  ctx: WorkoutToolCtx
+): string {
+  const row = ctx.sql.exec<GymEquipmentRow>('SELECT * FROM gym_equipment WHERE id = ?', args.id).toArray()[0];
+  if (!row) return `Equipment "${args.id}" not found.`;
+
+  const updates: string[] = [];
+  const params: SqlStorageValue[] = [];
+  const bits: string[] = [];
+
+  if (args.name !== undefined) {
+    const newName = normalizeEquipmentName(args.name);
+    if (newName !== row.name) {
+      const collision = ctx.sql
+        .exec<{ id: string }>('SELECT id FROM gym_equipment WHERE name = ? AND id != ?', newName, args.id)
+        .toArray()[0];
+      if (collision) return `Another equipment entry already uses the name "${args.name}".`;
+    }
+    updates.push('name = ?'); params.push(newName);
+    updates.push('display_name = ?'); params.push(args.name.trim());
+    bits.push(`name="${args.name.trim()}"`);
+  }
+  if (args.category !== undefined) {
+    updates.push('category = ?'); params.push(args.category === '' ? null : args.category.toLowerCase());
+    bits.push(`category=${args.category || 'cleared'}`);
+  }
+  if (args.details !== undefined) {
+    updates.push('details = ?'); params.push(args.details === '' ? null : args.details);
+    bits.push(args.details === '' ? 'details=cleared' : 'details');
+  }
+  if (args.notes !== undefined) {
+    updates.push('notes = ?'); params.push(args.notes === '' ? null : args.notes);
+    bits.push(args.notes === '' ? 'notes=cleared' : 'notes');
+  }
+  if (updates.length === 0) return 'No fields to update.';
+
+  updates.push('updated_at = ?');
+  params.push(Date.now());
+  params.push(args.id);
+  const stmt = 'UPDATE gym_equipment SET ' + updates.join(', ') + ' WHERE id = ?';
+  ctx.sql.exec(stmt, ...params);
+  return `Updated equipment [${args.id}]: ${bits.join(', ')}.`;
+}
+
+function toolRemoveEquipment(args: { id: string }, ctx: WorkoutToolCtx): string {
+  const row = ctx.sql.exec<GymEquipmentRow>('SELECT * FROM gym_equipment WHERE id = ?', args.id).toArray()[0];
+  if (!row) return `Equipment "${args.id}" not found.`;
+  ctx.sql.exec('DELETE FROM gym_equipment WHERE id = ?', args.id);
+  return `Removed equipment [${args.id}] "${row.display_name}" from inventory.`;
+}
+
+function toolListEquipment(args: { category?: string }, ctx: WorkoutToolCtx): string {
+  const rows = args.category
+    ? ctx.sql
+        .exec<GymEquipmentRow>(
+          'SELECT * FROM gym_equipment WHERE category = ? ORDER BY name',
+          args.category.toLowerCase()
+        )
+        .toArray()
+    : ctx.sql.exec<GymEquipmentRow>('SELECT * FROM gym_equipment ORDER BY category, name').toArray();
+  if (rows.length === 0) return args.category ? `No equipment in category "${args.category}".` : 'No equipment recorded.';
+  const lines = [`${rows.length} item(s):`];
+  for (const e of rows) {
+    const cat = e.category ? ` · ${e.category}` : '';
+    const det = e.details ? ` — ${e.details}` : '';
+    const notes = e.notes ? ` (${e.notes})` : '';
+    lines.push(`  [${e.id}] ${e.display_name}${cat}${det}${notes}`);
+  }
+  return lines.join('\n');
+}
+
 // ─── Shared queries (used by DO fast-read paths + prompt snapshot) ───
 
 export interface PRRow {
@@ -973,6 +1165,8 @@ export interface WorkoutStats {
   recentPRs: PRRow[];
   totalWorkouts: number;
   totalSets: number;
+  profile: ProfileRow;
+  equipment: GymEquipmentRow[];
 }
 
 /** Snapshot used by the prompt and the /workout fast-read summary embed. */
@@ -995,6 +1189,11 @@ export function buildWorkoutStats(sql: SqlStorage): WorkoutStats {
   const totalSets = sql
     .exec<{ n: number }>('SELECT COUNT(*) AS n FROM sets WHERE is_warmup = 0').toArray()[0]?.n ?? 0;
 
+  const profile = loadProfile(sql);
+  const equipment = sql
+    .exec<GymEquipmentRow>('SELECT * FROM gym_equipment ORDER BY category, name')
+    .toArray();
+
   return {
     lastWorkout,
     openWorkout,
@@ -1006,5 +1205,7 @@ export function buildWorkoutStats(sql: SqlStorage): WorkoutStats {
     recentPRs,
     totalWorkouts,
     totalSets,
+    profile,
+    equipment,
   };
 }

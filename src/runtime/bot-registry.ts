@@ -72,6 +72,7 @@ const WORKOUT: BotEntry = {
     'workout-prs',
     'workout-week',
     'workout-program',
+    'workout-profile',
   ]),
   getStub(env) {
     return env.WORKOUT.get(env.WORKOUT.idFromName('default-household'));

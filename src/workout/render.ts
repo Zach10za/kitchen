@@ -5,7 +5,7 @@
  */
 
 import { EmbedColor, type Embed } from '../discord/types';
-import type { WorkoutStats, PRRow, WeeklyVolume, FullWorkout } from './loop';
+import type { WorkoutStats, PRRow, WeeklyVolume, FullWorkout, ProfileRow, GymEquipmentRow } from './loop';
 
 function fmtLbs(n: number | null): string {
   if (n === null) return 'BW';
@@ -66,6 +66,17 @@ export function workoutSummaryEmbed(stats: WorkoutStats): Embed {
         .slice(0, 1024),
     });
   }
+
+  // Profile footer — count of equipment + whether health notes are set.
+  // Detailed view lives in /workout-profile; this is just a presence hint.
+  const profileBits: string[] = [];
+  profileBits.push(`🏋️ ${stats.equipment.length} item${stats.equipment.length === 1 ? '' : 's'} owned`);
+  if (stats.profile.health_notes) profileBits.push('🩹 health notes set');
+  if (!stats.profile.bio && !stats.profile.goals) profileBits.push('⚠️ profile empty');
+  fields.push({
+    name: '👤 Profile (`/workout-profile` for details)',
+    value: profileBits.join(' · '),
+  });
 
   return {
     title: `🏋️ Workouts — ${stats.totalWorkouts} session(s), ${stats.totalSets} working sets`,
@@ -215,6 +226,61 @@ export function workoutProgramEmbed(
     title: `⭐ ${program.name}`,
     description: `\`${program.id}\`${program.description ? `\n_${program.description.slice(0, 300)}_` : ''}`,
     color: EmbedColor.approved,
+    fields,
+  };
+}
+
+export function workoutProfileEmbed(profile: ProfileRow, equipment: GymEquipmentRow[]): Embed {
+  const fields = [];
+
+  fields.push({
+    name: 'Bio',
+    value: (profile.bio ?? '_(empty — tell the bot about yourself)_').slice(0, 1024),
+  });
+  fields.push({
+    name: 'Goals',
+    value: (profile.goals ?? '_(empty)_').slice(0, 1024),
+  });
+  fields.push({
+    name: 'Preferences',
+    value: (profile.preferences ?? '_(empty)_').slice(0, 1024),
+  });
+  fields.push({
+    name: '🩹 Health notes',
+    value: (profile.health_notes ?? '_(empty — log injuries / niggles here)_').slice(0, 1024),
+  });
+
+  if (equipment.length === 0) {
+    fields.push({
+      name: '🏋️ Home gym inventory',
+      value: '_(empty — tell the bot what you own so it can plan workouts that fit)_',
+    });
+  } else {
+    const byCat = new Map<string, GymEquipmentRow[]>();
+    for (const e of equipment) {
+      const cat = e.category ?? 'other';
+      if (!byCat.has(cat)) byCat.set(cat, []);
+      byCat.get(cat)!.push(e);
+    }
+    const sorted = Array.from(byCat.entries()).sort(([a], [b]) => a.localeCompare(b));
+    const value = sorted
+      .map(([cat, items]) => {
+        const inner = items
+          .map((e) => `• **${e.display_name}**${e.details ? ` — ${e.details}` : ''} \`${e.id}\``)
+          .join('\n');
+        return `__${cat}__\n${inner}`;
+      })
+      .join('\n\n')
+      .slice(0, 1024);
+    fields.push({
+      name: `🏋️ Home gym inventory (${equipment.length})`,
+      value,
+    });
+  }
+
+  return {
+    title: '👤 Lifter Profile',
+    color: EmbedColor.inProgress,
     fields,
   };
 }

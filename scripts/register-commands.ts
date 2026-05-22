@@ -152,6 +152,10 @@ const COMMANDS = [
     name: 'workout-program',
     description: 'Show the active training program with all routines and planned exercises',
   },
+  {
+    name: 'workout-profile',
+    description: 'Show your lifter profile (bio, goals, preferences, health notes) and home-gym inventory',
+  },
 ];
 
 async function main() {
