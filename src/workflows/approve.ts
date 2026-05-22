@@ -244,15 +244,20 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     // Record the cumulative cost of all 15+ LLM calls in this approve flow,
     // and grab the running thread total for the footer on the final message.
     const turnTotals = await step.do('record-usage', async () => {
-      const res = await this.kitchen().fetch('https://internal/workflow/record-usage', {
-        method: 'POST',
-        body: JSON.stringify({
-          thread_id: replyChannelId,
-          model: this.env.OPENAI_MODEL_EXTRACT,
-          ...turnUsage,
-        }),
-      });
-      return (await res.json()) as { thread_total_usage: RoundUsage };
+      try {
+        const res = await this.kitchen().fetch('https://internal/workflow/agent/record-usage', {
+          method: 'POST',
+          body: JSON.stringify({
+            thread_id: replyChannelId,
+            model: this.env.OPENAI_MODEL_EXTRACT,
+            ...turnUsage,
+          }),
+        });
+        if (!res.ok) return { thread_total_usage: turnUsage };
+        return (await res.json()) as { thread_total_usage: RoundUsage };
+      } catch {
+        return { thread_total_usage: turnUsage };
+      }
     });
 
     const turnCost = computeCost(turnUsage, this.env);

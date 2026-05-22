@@ -1,6 +1,6 @@
 /**
  * Shared context loaders. Both the in-process agent (`runAgent` in loop.ts)
- * and the durable SteerWorkflow build their system prompt from the same
+ * and the durable AgentChatWorkflow build their system prompt from the same
  * snapshot of the household state — keeping the queries here means the two
  * paths can't drift.
  */

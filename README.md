@@ -66,7 +66,7 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/plan`, `/draft`, `/steer`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
+You should see `/plan`, `/draft`, `/chat`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
 
 ### 6. Deploy the Worker
 
@@ -105,7 +105,7 @@ In the Discord developer portal under your application's **General Information**
 
 ### 8. Deploy the gateway relay (Fly.io)
 
-The relay forwards plain-text messages in the kitchen channel to the Worker, so you can steer without typing `/steer` every time.
+The relay forwards plain-text messages in the kitchen channel to the Worker, so you can chat without typing `/chat` every time.
 
 ```bash
 cd gateway-relay
@@ -139,7 +139,7 @@ In your Discord channel, either slash commands:
 ```
 /plan                    show the current plan
 /draft notes:<optional>  generate a fresh plan for next week (~10–15s, live progress)
-/steer message:swap tue for something with the salmon, and thu needs to be 20 min
+/chat message:swap tue for something with the salmon, and thu needs to be 20 min
 /now                     what should I be cooking right now?
 /pantry message:bought salmon, bok choy, scallions
 /pantry                  (no message) show current pantry

@@ -49,7 +49,7 @@ ${recentMeals.length > 0
     : '(no recent history)'}
 
 RULES:
-- **Bias HARD toward action over asking questions.** Discord slash commands are not a conversation — every "do you want me to..." question forces the user to issue another /steer just to say "yes." When the user expresses intent that implies a plan change ("avoid X", "swap Y", "make it lighter Tuesday"), MAKE THE CHANGE in the same turn. Don't ask permission for actions that are clearly implied by their message.
+- **Bias HARD toward action over asking questions.** Discord slash commands are not a conversation — every "do you want me to..." question forces the user to issue another /chat just to say "yes." When the user expresses intent that implies a plan change ("avoid X", "swap Y", "make it lighter Tuesday"), MAKE THE CHANGE in the same turn. Don't ask permission for actions that are clearly implied by their message.
 - Specifically: if the user says "avoid X" / "no more X" / "remove X" and the current plan contains a meal matching X, swap that meal automatically AND record the preference. Same for "use more X" / "more like that one" — apply it now, learn it for later.
 - The COOKING PROFILE above is law for hard rules (allergies, equipment they don't have, diets). Never violate it. Soft preferences in the profile are strong defaults.
 - If the user shares profile-level info (equipment, diet, default servings, cuisines they live in or avoid, time budget), call update_profile to merge it. Do not record those as record_preference — those go in the profile.

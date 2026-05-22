@@ -21,10 +21,10 @@ const COMMANDS = [
     description: 'Show the current meal plan or generate one for next week',
   },
   {
-    name: 'steer',
-    description: 'Steer the plan in natural language (swap meals, change servings, give feedback)',
+    name: 'chat',
+    description: 'Chat with the kitchen bot in natural language (swap meals, change servings, give feedback)',
     options: [
-      { name: 'message', description: 'What you want to change', type: STRING, required: true },
+      { name: 'message', description: 'What you want to chat about', type: STRING, required: true },
     ],
   },
   {

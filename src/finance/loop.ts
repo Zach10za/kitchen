@@ -1,7 +1,7 @@
 /**
- * Finance tool implementations. The workflow runner (FinanceSteerWorkflow)
- * drives the agent loop via runtime/agent-round; tool execution lives here
- * and is called from the DO's /workflow/finance/exec-tool endpoint.
+ * Finance tool implementations. AgentChatWorkflow drives the agent loop via
+ * runtime/agent-round; tool execution lives here and is called from the
+ * universal `/workflow/agent/exec-tool` endpoint on FinanceDO.
  */
 
 import type OpenAI from 'openai';

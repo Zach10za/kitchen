@@ -4,7 +4,7 @@ import { InteractionType, InteractionResponseType, type Interaction } from './di
 import { DiscordAPI } from './discord/api';
 import { prepareChatThread } from './discord/thread';
 import { captureError } from './error-triage';
-import { ALL_BOTS, botForChannel, botForCommand } from './runtime/bot-registry';
+import { ALL_BOTS, botForChannel, botForCommand, getStub, dispatchChat } from './runtime/bot-registry';
 import { constantTimeEquals } from './runtime/timing-safe';
 
 export { KitchenDO } from './kitchen-do';
@@ -12,10 +12,7 @@ export { FinanceDO } from './finance-do';
 export { TasksDO } from './tasks-do';
 export { WorkoutDO } from './workout-do';
 export { ApproveWorkflow } from './workflows/approve';
-export { SteerWorkflow } from './workflows/steer';
-export { FinanceSteerWorkflow } from './workflows/finance-steer';
-export { TasksSteerWorkflow } from './workflows/tasks-steer';
-export { WorkoutSteerWorkflow } from './workflows/workout-steer';
+export { AgentChatWorkflow } from './workflows/agent-chat';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -35,7 +32,7 @@ export default {
    */
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     for (const bot of ALL_BOTS) {
-      const stub = bot.getStub(env);
+      const stub = getStub(env, bot.id);
       ctx.waitUntil(stub.fetch('https://internal/heartbeat', { method: 'POST' }));
     }
   },
@@ -85,7 +82,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       return new Response('channel not registered', { status: 404 });
     }
 
-    const stub = bot.getStub(env);
+    const stub = getStub(env, bot.id);
     const rateRes = await stub.fetch('https://internal/relay-allowed', {
       method: 'POST',
       body: JSON.stringify({ channelId: ownerChannelId }),
@@ -116,9 +113,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       }
     }
 
-    // Dispatch via the bot registry — each bot owns its workflow binding so
-    // this stays a single registry lookup instead of an if/else ladder.
-    ctx.waitUntil(bot.dispatchRelay(env, body.userMessage, replyChannelId));
+    // Dispatch into the unified AgentChatWorkflow. The registry resolves the
+    // bot's default conversation scope (kitchen → week_of, others → thread_id).
+    ctx.waitUntil(dispatchChat(env, bot.id, body.userMessage, replyChannelId));
 
     return Response.json({ ok: true });
   }
@@ -204,7 +201,7 @@ async function handleDiscordInteraction(
   // branch here. Until then a single lookup covers both paths.
   const commandName = interaction.data?.name ?? '';
   const bot = botForCommand(commandName);
-  const stub = bot.getStub(env);
+  const stub = getStub(env, bot.id);
 
   // Fast path: pure-read commands with sub-3s budget skip the defer roundtrip
   // and respond inline. Saves ~600-800ms of perceived latency.
@@ -256,7 +253,7 @@ function isFastReadCommand(interaction: Interaction): boolean {
     case 'pantry':
       return !hasMessage;     // /pantry (alone) = read; with message = write
     case 'plan':
-      return true;            // /plan always reads existing; use /steer to create
+      return true;            // /plan always reads existing; use /chat to create
     case 'grocery':
       return false;           // routed through DO so it can split into multiple messages
     case 'reminders':
