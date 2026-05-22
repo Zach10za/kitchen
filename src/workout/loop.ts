@@ -73,7 +73,54 @@ function epley1RM(weight: number, reps: number): number {
   return Math.round(weight * (1 + reps / 30) * 10) / 10;
 }
 
-// ─── Exercise resolution (used by add_set, add_sets_bulk, exercise_history, find_prs) ──
+/**
+ * Coerce an LLM-provided weight to `number | null` (null = bodyweight).
+ * Rejects NaN, negatives, and 0 (use omission for bodyweight, not 0) so
+ * garbage doesn't propagate into Epley/tonnage aggregates.
+ * Returns `{ ok: true, value }` or `{ ok: false, error }`.
+ */
+function parseWeight(input: unknown): { ok: true; value: number | null } | { ok: false; error: string } {
+  if (input === undefined || input === null) return { ok: true, value: null };
+  const n = typeof input === 'number' ? input : Number(input);
+  if (!Number.isFinite(n)) {
+    return { ok: false, error: `weight_lbs must be a finite number (got "${String(input)}"). Omit for bodyweight.` };
+  }
+  if (n < 0) {
+    return { ok: false, error: `weight_lbs cannot be negative (got ${n}).` };
+  }
+  if (n === 0) {
+    return { ok: false, error: 'weight_lbs=0 is ambiguous — omit weight_lbs entirely for bodyweight exercises.' };
+  }
+  return { ok: true, value: n };
+}
+
+/**
+ * Coerce an LLM-provided started_at to ms epoch. Accepts numbers (ms epoch),
+ * numeric strings, and ISO-8601 datetime/date strings. Returns null if the
+ * field was omitted; throws on unparseable input so the LLM can self-correct.
+ */
+function parseStartedAt(input: unknown): number | null {
+  if (input === undefined || input === null || input === '') return null;
+  if (typeof input === 'number') {
+    if (!Number.isFinite(input)) {
+      throw new Error(`started_at must be a finite number (got ${input}).`);
+    }
+    return input;
+  }
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    // YYYY-MM-DD → treat as start-of-day UTC.
+    const bareDate = /^\d{4}-\d{2}-\d{2}$/.test(trimmed);
+    const ms = Date.parse(bareDate ? `${trimmed}T00:00:00Z` : trimmed);
+    if (!Number.isFinite(ms)) {
+      throw new Error(`Could not parse started_at "${input}" — use ms epoch or YYYY-MM-DD / ISO-8601.`);
+    }
+    return ms;
+  }
+  throw new Error(`started_at must be a number or string (got ${typeof input}).`);
+}
+
+// ─── Exercise resolution (used by add_set, add_sets_bulk, exercise_history, find_prs, add_routine_exercise) ──
 
 interface ResolveOptions {
   equipment?: string;
@@ -81,6 +128,18 @@ interface ResolveOptions {
   createIfMissing?: boolean;
 }
 
+/**
+ * Resolve an exercise by exact normalized name (lowercase + whitespace-collapsed).
+ * No substring matching — silent substring fallback was causing "row" to attach
+ * sets to whatever ex_<...> happened to contain "row".
+ *
+ * On exact-match hit, backfills missing `equipment` / `primary_muscle` from
+ * the LLM-provided hints (only overwrites NULLs — update_exercise is the
+ * explicit path for corrections).
+ *
+ * On miss + createIfMissing, inserts a fresh row preserving the raw display
+ * casing (auto-title-casing was mangling "RDL" → "Rdl").
+ */
 function resolveExercise(
   sql: SqlStorage,
   rawName: string,
@@ -89,24 +148,46 @@ function resolveExercise(
   const name = normalizeExerciseName(rawName);
   if (!name) return null;
 
-  let row = sql.exec<ExerciseRow>('SELECT * FROM exercises WHERE name = ?', name).toArray()[0];
-  if (row) return row;
-
-  // Soft match: try simple substring fallback before creating.
-  const like = sql
-    .exec<ExerciseRow>('SELECT * FROM exercises WHERE name LIKE ? LIMIT 1', `%${name}%`)
+  const existing = sql
+    .exec<ExerciseRow>('SELECT * FROM exercises WHERE name = ?', name)
     .toArray()[0];
-  if (like) return like;
+
+  if (existing) {
+    // Backfill missing metadata only — never overwrite an existing value.
+    const updates: string[] = [];
+    const params: SqlStorageValue[] = [];
+    if (opts.equipment && !existing.equipment) {
+      updates.push('equipment = ?');
+      params.push(opts.equipment.toLowerCase());
+    }
+    if (opts.primary_muscle && !existing.primary_muscle) {
+      updates.push('primary_muscle = ?');
+      params.push(opts.primary_muscle.toLowerCase());
+    }
+    if (updates.length > 0) {
+      const now = Date.now();
+      updates.push('updated_at = ?');
+      params.push(now);
+      params.push(existing.id);
+      const stmt = 'UPDATE exercises SET ' + updates.join(', ') + ' WHERE id = ?';
+      sql.exec(stmt, ...params);
+      return sql.exec<ExerciseRow>('SELECT * FROM exercises WHERE id = ?', existing.id).toArray()[0]!;
+    }
+    return existing;
+  }
 
   if (!opts.createIfMissing) return null;
 
   const now = Date.now();
   const id = shortId('ex');
-  const display = rawName.trim().replace(/\b\w/g, (c) => c.toUpperCase());
+  const display = rawName.trim();
   sql.exec(
     `INSERT INTO exercises (id, name, display_name, category, primary_muscle, equipment, notes, created_at, updated_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    id, name, display, null, opts.primary_muscle ?? null, opts.equipment ?? null, null, now, now
+    id, name, display, null,
+    opts.primary_muscle ? opts.primary_muscle.toLowerCase() : null,
+    opts.equipment ? opts.equipment.toLowerCase() : null,
+    null, now, now
   );
   return sql.exec<ExerciseRow>('SELECT * FROM exercises WHERE id = ?', id).toArray()[0]!;
 }
@@ -114,7 +195,7 @@ function resolveExercise(
 /**
  * Pick the workout this set should attach to:
  *   1. explicit id, if provided
- *   2. most recent workout with no ended_at (today's open session)
+ *   2. most recent workout with no ended_at (may be from a prior day if never closed)
  *   3. else create a fresh workout
  */
 function resolveOrCreateWorkout(sql: SqlStorage, workoutId: string | undefined): WorkoutRow {
@@ -184,11 +265,16 @@ function toolShowSummary(ctx: WorkoutToolCtx): string {
 }
 
 function toolLogWorkout(
-  args: { name?: string; routine_id?: string; started_at?: number; is_deload?: boolean; notes?: string },
+  args: { name?: string; routine_id?: string; started_at?: number | string; is_deload?: boolean; notes?: string },
   ctx: WorkoutToolCtx
 ): string {
   const now = Date.now();
-  const startedAt = args.started_at && Number.isFinite(args.started_at) ? args.started_at : now;
+  let startedAt: number;
+  try {
+    startedAt = parseStartedAt(args.started_at) ?? now;
+  } catch (err) {
+    return (err as Error).message;
+  }
   const id = shortId('w');
 
   if (args.routine_id) {
@@ -230,7 +316,7 @@ function toolEndWorkout(args: { id?: string; notes?: string }, ctx: WorkoutToolC
 function toolAddSet(
   args: {
     exercise: string;
-    weight_lbs?: number;
+    weight_lbs?: number | string;
     reps: number;
     rpe?: number;
     is_warmup?: boolean;
@@ -244,6 +330,11 @@ function toolAddSet(
   if (!args.exercise || !args.exercise.trim()) return 'Exercise name is required.';
   if (!Number.isFinite(args.reps) || args.reps <= 0) return 'Reps must be a positive number.';
 
+  const parsed = parseWeight(args.weight_lbs);
+  if (!parsed.ok) return parsed.error;
+  const weight = parsed.value;
+  const isWarmup = args.is_warmup ? 1 : 0;
+
   const exercise = resolveExercise(ctx.sql, args.exercise, {
     equipment: args.equipment,
     primary_muscle: args.primary_muscle,
@@ -252,11 +343,12 @@ function toolAddSet(
 
   const workout = resolveOrCreateWorkout(ctx.sql, args.workout_id);
 
-  // Compute set_index within this workout for this exercise.
+  // set_index numbers warmups and working sets separately so users see
+  // "Set 1, Set 2, Set 3" for working sets instead of "Set 4" after 3 warmups.
   const existing = ctx.sql
     .exec<{ n: number }>(
-      'SELECT COUNT(*) AS n FROM sets WHERE workout_id = ? AND exercise_id = ?',
-      workout.id, exercise.id
+      'SELECT COUNT(*) AS n FROM sets WHERE workout_id = ? AND exercise_id = ? AND is_warmup = ?',
+      workout.id, exercise.id, isWarmup
     )
     .toArray()[0]?.n ?? 0;
   const setIndex = existing + 1;
@@ -265,14 +357,13 @@ function toolAddSet(
   ctx.sql.exec(
     `INSERT INTO sets (workout_id, exercise_id, set_index, weight_lbs, reps, rpe, is_warmup, notes, logged_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    workout.id, exercise.id, setIndex,
-    args.weight_lbs === undefined || args.weight_lbs === null ? null : Number(args.weight_lbs),
-    args.reps, args.rpe ?? null, args.is_warmup ? 1 : 0, args.notes ?? null, now
+    workout.id, exercise.id, setIndex, weight,
+    args.reps, args.rpe ?? null, isWarmup, args.notes ?? null, now
   );
 
-  const weightStr = args.weight_lbs === undefined ? 'BW' : `${args.weight_lbs} lbs`;
+  const weightStr = weight === null ? 'BW' : `${weight} lbs`;
   const rpeStr = args.rpe !== undefined ? ` @ RPE ${args.rpe}` : '';
-  const warmupStr = args.is_warmup ? ' (warmup)' : '';
+  const warmupStr = isWarmup ? ' (warmup)' : '';
   return `Logged ${exercise.display_name} #${setIndex}: ${weightStr} × ${args.reps}${rpeStr}${warmupStr} → workout [${workout.id}].`;
 }
 
@@ -281,7 +372,7 @@ function toolAddSetsBulk(
     exercise: string;
     sets: number;
     reps: number;
-    weight_lbs?: number;
+    weight_lbs?: number | string;
     rpe?: number;
     is_warmup?: boolean;
     workout_id?: string;
@@ -295,6 +386,11 @@ function toolAddSetsBulk(
   if (!Number.isFinite(args.reps) || args.reps <= 0) return 'Reps must be a positive number.';
   if (args.sets > 30) return 'Refusing to log more than 30 sets at once — sanity check.';
 
+  const parsed = parseWeight(args.weight_lbs);
+  if (!parsed.ok) return parsed.error;
+  const weight = parsed.value;
+  const isWarmup = args.is_warmup ? 1 : 0;
+
   const exercise = resolveExercise(ctx.sql, args.exercise, {
     equipment: args.equipment,
     primary_muscle: args.primary_muscle,
@@ -302,20 +398,20 @@ function toolAddSetsBulk(
   })!;
   const workout = resolveOrCreateWorkout(ctx.sql, args.workout_id);
 
+  // set_index numbers warmups and working sets separately (see toolAddSet).
   const existing = ctx.sql
     .exec<{ n: number }>(
-      'SELECT COUNT(*) AS n FROM sets WHERE workout_id = ? AND exercise_id = ?',
-      workout.id, exercise.id
+      'SELECT COUNT(*) AS n FROM sets WHERE workout_id = ? AND exercise_id = ? AND is_warmup = ?',
+      workout.id, exercise.id, isWarmup
     )
     .toArray()[0]?.n ?? 0;
 
   const now = Date.now();
-  const weight = args.weight_lbs === undefined || args.weight_lbs === null ? null : Number(args.weight_lbs);
   for (let i = 1; i <= args.sets; i++) {
     ctx.sql.exec(
       `INSERT INTO sets (workout_id, exercise_id, set_index, weight_lbs, reps, rpe, is_warmup, notes, logged_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
-      workout.id, exercise.id, existing + i, weight, args.reps, args.rpe ?? null, args.is_warmup ? 1 : 0, now
+      workout.id, exercise.id, existing + i, weight, args.reps, args.rpe ?? null, isWarmup, now
     );
   }
 
@@ -378,13 +474,15 @@ function toolFindPRs(args: { exercise?: string; limit?: number }, ctx: WorkoutTo
       .toArray();
     if (rows.length === 0) return `No working sets for ${exercise.display_name} yet.`;
 
-    const repBuckets: Array<{ label: string; min: number; max: number }> = [
-      { label: '1RM', min: 1, max: 1 },
-      { label: '3RM', min: 2, max: 3 },
-      { label: '5RM', min: 4, max: 5 },
-      { label: '8RM', min: 6, max: 8 },
-      { label: '10RM', min: 9, max: 10 },
-      { label: '15RM', min: 11, max: 15 },
+    // Strict-rep buckets so "5RM" means max load at exactly 5 reps (not 4–5).
+    // Previously a heavier 4-rep set would silently get labeled the "5RM."
+    const repBuckets: Array<{ label: string; reps: number }> = [
+      { label: '1RM', reps: 1 },
+      { label: '3RM', reps: 3 },
+      { label: '5RM', reps: 5 },
+      { label: '8RM', reps: 8 },
+      { label: '10RM', reps: 10 },
+      { label: '15RM', reps: 15 },
     ];
     const lines = [`${exercise.display_name} PRs:`];
     let bestEpley = 0;
@@ -393,12 +491,17 @@ function toolFindPRs(args: { exercise?: string; limit?: number }, ctx: WorkoutTo
       const est = epley1RM(set.weight_lbs!, set.reps);
       if (est > bestEpley) { bestEpley = est; bestEpleySet = set; }
     }
+    let buckets_found = 0;
     for (const b of repBuckets) {
-      const inRange = rows.filter((r) => r.reps >= b.min && r.reps <= b.max);
-      if (inRange.length === 0) continue;
-      const top = inRange.reduce((a, b2) => (b2.weight_lbs! > a.weight_lbs! ? b2 : a));
+      const exactReps = rows.filter((r) => r.reps === b.reps);
+      if (exactReps.length === 0) continue;
+      const top = exactReps.reduce((a, b2) => (b2.weight_lbs! > a.weight_lbs! ? b2 : a));
       const date = new Date(top.logged_at).toISOString().slice(0, 10);
       lines.push(`  ${b.label}: ${top.weight_lbs} × ${top.reps} (${date})`);
+      buckets_found++;
+    }
+    if (buckets_found === 0) {
+      lines.push('  (no sets at exactly 1/3/5/8/10/15 reps — see e1RM below)');
     }
     if (bestEpleySet) {
       const date = new Date(bestEpleySet.logged_at).toISOString().slice(0, 10);
@@ -538,9 +641,13 @@ function toolCreateProgram(
   ctx: WorkoutToolCtx
 ): string {
   if (!args.name?.trim()) return 'Program name is required.';
-  const status = (VALID_PROGRAM_STATUS as readonly string[]).includes(args.status ?? '')
-    ? (args.status as 'active' | 'paused' | 'archived')
-    : 'paused';
+  let status: 'active' | 'paused' | 'archived' = 'paused';
+  if (args.status !== undefined) {
+    if (!(VALID_PROGRAM_STATUS as readonly string[]).includes(args.status)) {
+      return `Invalid status "${args.status}". Use one of: ${VALID_PROGRAM_STATUS.join(', ')}.`;
+    }
+    status = args.status as 'active' | 'paused' | 'archived';
+  }
   const now = Date.now();
   const id = shortId('p');
 
@@ -663,12 +770,25 @@ function toolGetProgram(args: { id: string }, ctx: WorkoutToolCtx): string {
   return lines.join('\n');
 }
 
-function toolSetActiveProgram(args: { id: string | null }, ctx: WorkoutToolCtx): string {
+function toolSetActiveProgram(args: { id?: string | null }, ctx: WorkoutToolCtx): string {
   const now = Date.now();
-  ctx.sql.exec("UPDATE programs SET status = 'paused', updated_at = ? WHERE status = 'active'", now);
-  if (args.id === null) return 'Cleared active program.';
+  // Both undefined and explicit null clear the active program. Validate
+  // BEFORE the demote — otherwise a typo'd id silently pauses the user's
+  // current program and the response misleadingly says "not found".
+  if (args.id === undefined || args.id === null) {
+    const cleared = ctx.sql
+      .exec<ProgramRow>("SELECT id, name FROM programs WHERE status = 'active'")
+      .toArray()[0];
+    if (!cleared) return 'No active program to clear.';
+    ctx.sql.exec("UPDATE programs SET status = 'paused', updated_at = ? WHERE status = 'active'", now);
+    return `Cleared active program [${cleared.id}] "${cleared.name}".`;
+  }
+
   const p = ctx.sql.exec<ProgramRow>('SELECT * FROM programs WHERE id = ?', args.id).toArray()[0];
   if (!p) return `Program "${args.id}" not found.`;
+  if (p.status === 'active') return `Program [${p.id}] "${p.name}" is already active.`;
+
+  ctx.sql.exec("UPDATE programs SET status = 'paused', updated_at = ? WHERE status = 'active'", now);
   ctx.sql.exec(
     "UPDATE programs SET status = 'active', start_date = COALESCE(start_date, ?), updated_at = ? WHERE id = ?",
     now, now, args.id
@@ -690,45 +810,60 @@ export interface PRRow {
 
 /**
  * Best estimated 1RM per exercise (or all sets of a single exercise).
- * Warmups excluded; bodyweight (NULL weight) excluded.
+ * Warmups excluded; bodyweight (NULL weight) excluded. Single JOIN query —
+ * grouping happens client-side so we don't issue one SELECT per exercise.
  */
 export function topPRs(sql: SqlStorage, exerciseFilter: string | null, limit = 10): PRRow[] {
-  const candidates = exerciseFilter
-    ? (() => {
-        const ex = sql
-          .exec<ExerciseRow>('SELECT * FROM exercises WHERE name LIKE ? LIMIT 1', `%${normalizeExerciseName(exerciseFilter)}%`)
-          .toArray()[0];
-        if (!ex) return [] as ExerciseRow[];
-        return [ex];
-      })()
-    : sql.exec<ExerciseRow>('SELECT * FROM exercises').toArray();
+  const filterName = exerciseFilter ? normalizeExerciseName(exerciseFilter) : null;
+  const filterClause = filterName ? 'AND e.name = ?' : '';
+  const rows = filterName
+    ? sql
+        .exec<{
+          exercise_id: string;
+          exercise_display: string;
+          weight_lbs: number;
+          reps: number;
+          logged_at: number;
+          workout_id: string;
+        }>(
+          `SELECT s.exercise_id, e.display_name AS exercise_display, s.weight_lbs, s.reps, s.logged_at, s.workout_id
+           FROM sets s JOIN exercises e ON e.id = s.exercise_id
+           WHERE s.is_warmup = 0 AND s.weight_lbs IS NOT NULL ${filterClause}`,
+          filterName
+        )
+        .toArray()
+    : sql
+        .exec<{
+          exercise_id: string;
+          exercise_display: string;
+          weight_lbs: number;
+          reps: number;
+          logged_at: number;
+          workout_id: string;
+        }>(
+          `SELECT s.exercise_id, e.display_name AS exercise_display, s.weight_lbs, s.reps, s.logged_at, s.workout_id
+           FROM sets s JOIN exercises e ON e.id = s.exercise_id
+           WHERE s.is_warmup = 0 AND s.weight_lbs IS NOT NULL`
+        )
+        .toArray();
 
-  const prs: PRRow[] = [];
-  for (const ex of candidates) {
-    const sets = sql
-      .exec<SetRow>(
-        `SELECT * FROM sets WHERE exercise_id = ? AND is_warmup = 0 AND weight_lbs IS NOT NULL`,
-        ex.id
-      )
-      .toArray();
-    if (sets.length === 0) continue;
-    let best: SetRow = sets[0]!;
-    let bestEst = epley1RM(best.weight_lbs!, best.reps);
-    for (let i = 1; i < sets.length; i++) {
-      const s = sets[i]!;
-      const est = epley1RM(s.weight_lbs!, s.reps);
-      if (est > bestEst) { best = s; bestEst = est; }
+  const bestByExercise = new Map<string, PRRow>();
+  for (const r of rows) {
+    const est = epley1RM(r.weight_lbs, r.reps);
+    const current = bestByExercise.get(r.exercise_id);
+    if (!current || est > current.estimated_1rm) {
+      bestByExercise.set(r.exercise_id, {
+        exercise_id: r.exercise_id,
+        exercise_display: r.exercise_display,
+        weight_lbs: r.weight_lbs,
+        reps: r.reps,
+        estimated_1rm: est,
+        logged_at: r.logged_at,
+        workout_id: r.workout_id,
+      });
     }
-    prs.push({
-      exercise_id: ex.id,
-      exercise_display: ex.display_name,
-      weight_lbs: best.weight_lbs!,
-      reps: best.reps,
-      estimated_1rm: bestEst,
-      logged_at: best.logged_at,
-      workout_id: best.workout_id,
-    });
   }
+  const prs = Array.from(bestByExercise.values());
   prs.sort((a, b) => b.estimated_1rm - a.estimated_1rm);
   return prs.slice(0, limit);
 }
@@ -825,16 +960,6 @@ export function fullWorkout(sql: SqlStorage, workoutId: string): FullWorkout {
   });
 
   return { workout, exercises };
-}
-
-/** Recent sets for an exercise — used by render embeds when "last X" of a movement is wanted. */
-export function recentSetsForExercise(sql: SqlStorage, exerciseId: string, limit: number): SetRow[] {
-  return sql
-    .exec<SetRow>(
-      `SELECT * FROM sets WHERE exercise_id = ? AND is_warmup = 0 ORDER BY logged_at DESC LIMIT ?`,
-      exerciseId, limit
-    )
-    .toArray();
 }
 
 export interface WorkoutStats {

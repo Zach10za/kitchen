@@ -20,7 +20,6 @@ import { buildWorkoutSystemPrompt } from './workout/prompts';
 import {
   executeWorkoutTool,
   buildWorkoutStats,
-  recentSetsForExercise,
   topPRs,
   weeklyVolume,
   fullWorkout,
@@ -96,7 +95,21 @@ export class WorkoutDO extends DurableObject<Env> {
 
     if (url.pathname === '/fast-read') {
       const interaction = (await request.json()) as Interaction;
-      const payload = this.handleFastRead(interaction);
+      // Throws here would propagate to the worker entry and surface as
+      // "the application did not respond." Wrap so we always return a payload.
+      let payload: MessagePayload;
+      try {
+        payload = this.handleFastRead(interaction);
+      } catch (err) {
+        console.error('workout handleFastRead failed', err);
+        this.ctx.waitUntil(
+          captureError(this.env, err, {
+            source: `workout-fast-read:${interaction.data?.name ?? 'unknown'}`,
+            tags: { command: interaction.data?.name ?? 'unknown' },
+          })
+        );
+        payload = { content: 'Something broke loading that view — try again, or use `/workout` for a fresh summary.' };
+      }
       return Response.json(payload);
     }
 
@@ -138,20 +151,29 @@ export class WorkoutDO extends DurableObject<Env> {
 
     if (url.pathname === '/workflow/workout/save-turn' && request.method === 'POST') {
       const body = (await request.json()) as {
-        role: string;
-        content: string;
-        tool_call_json?: string;
-        thread_id?: string;
+        role?: unknown;
+        content?: unknown;
+        tool_call_json?: unknown;
+        thread_id?: unknown;
       };
-      this.sql.exec(
-        'INSERT INTO conversation (role, content, tool_call_json, thread_id, ts) VALUES (?, ?, ?, ?, ?)',
-        body.role, body.content, body.tool_call_json ?? null, body.thread_id ?? null, Date.now()
-      );
+      if (typeof body.role !== 'string' || !body.role) {
+        return Response.json({ error: 'save-turn: missing/invalid role' }, { status: 400 });
+      }
+      if (typeof body.content !== 'string') {
+        return Response.json({ error: 'save-turn: content must be a string' }, { status: 400 });
+      }
+      const toolCallJson = typeof body.tool_call_json === 'string' ? body.tool_call_json : null;
+      const threadId = typeof body.thread_id === 'string' ? body.thread_id : null;
+      const insert = 'INSERT INTO conversation (role, content, tool_call_json, thread_id, ts) VALUES (?, ?, ?, ?, ?)';
+      this.sql.exec(insert, body.role, body.content, toolCallJson, threadId, Date.now());
       return Response.json({ ok: true });
     }
 
     if (url.pathname === '/workflow/workout/record-usage' && request.method === 'POST') {
       const body = (await request.json()) as Parameters<typeof recordUsage>[1];
+      if (!body || typeof (body as any).model !== 'string') {
+        return Response.json({ error: 'record-usage: missing/invalid model' }, { status: 400 });
+      }
       const totals = recordUsage(this.sql, body);
       return Response.json({ thread_total_usage: totals });
     }
@@ -168,8 +190,11 @@ export class WorkoutDO extends DurableObject<Env> {
     }
 
     if (url.pathname === '/workflow/workout/exec-tool' && request.method === 'POST') {
-      const body = (await request.json()) as { name: string; args: any };
-      const result = executeWorkoutTool(body.name, body.args, { sql: this.sql });
+      const body = (await request.json()) as { name?: unknown; args?: unknown };
+      if (typeof body.name !== 'string' || !body.name) {
+        return Response.json({ error: 'exec-tool: missing/invalid name' }, { status: 400 });
+      }
+      const result = executeWorkoutTool(body.name, body.args ?? {}, { sql: this.sql });
       return new Response(result, { headers: { 'content-type': 'text/plain' } });
     }
 
@@ -338,6 +363,10 @@ export class WorkoutDO extends DurableObject<Env> {
    */
   private static readonly MIGRATIONS: readonly Migration[] = [
     {
+      // NOTE: REFERENCES clauses below are documentation only — DO SQLite does
+      // not enable foreign_keys PRAGMA, so cascades and FK constraints do not
+      // fire. /reset and any future tool that wants integrity must delete
+      // children before parents explicitly.
       version: 1,
       up: (sql) => {
         sql.exec(`
@@ -365,6 +394,10 @@ export class WorkoutDO extends DurableObject<Env> {
             updated_at INTEGER NOT NULL
           );
           CREATE INDEX IF NOT EXISTS idx_programs_status ON programs(status);
+          -- At most one active program at a time. Enforces the invariant at
+          -- the storage layer instead of relying on procedural demote-on-activate.
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_programs_one_active
+            ON programs(status) WHERE status = 'active';
 
           CREATE TABLE IF NOT EXISTS routines (
             id TEXT PRIMARY KEY,

@@ -1,7 +1,7 @@
 /**
  * Discord embed builders for workout fast-read commands. Agent replies are
  * plain markdown; these embeds are only for the deterministic fast paths
- * (/workout summary, /workout-last, /workout-prs, /workout-week, /workout-program).
+ * (/workout with no message, /workout-last, /workout-prs, /workout-week, /workout-program).
  */
 
 import { EmbedColor, type Embed } from '../discord/types';

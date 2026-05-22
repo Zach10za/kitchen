@@ -44,10 +44,19 @@ async function withTypingRefresh<T>(
 }
 
 /**
- * Durable workout agent flow. Mirrors TasksSteerWorkflow exactly — IO endpoints
- * are under /workflow/workout/ and the tool list is WORKOUT_TOOLS. Each agent
- * loop iteration is its own step with retries so slow LLM calls don't take
- * down the conversation.
+ * Durable workout agent flow. Same structure as TasksSteerWorkflow / FinanceSteerWorkflow
+ * — IO endpoints under /workflow/workout/, tool list is WORKOUT_TOOLS.
+ *
+ * Steps:
+ *   1. initial-typing  — show the typing indicator before doing anything slow
+ *   2. load-context    — system prompt + recent history from WorkoutDO
+ *   3. save-user-turn  — persist the user's message
+ *   4. round-{N}       — one OpenAI call + any tool executions (up to MAX_TOOL_ROUNDS)
+ *                        Each round has its own retry budget so slow LLM calls
+ *                        don't take down the conversation.
+ *   5. record-usage    — best-effort; failure does not block delivery
+ *   6. save-assistant  — persist the final reply text
+ *   7. post-final      — post the reply (with cost footer) into the Discord thread
  */
 export class WorkoutSteerWorkflow extends WorkflowEntrypoint<Env, WorkoutSteerParams> {
   async run(event: WorkflowEvent<WorkoutSteerParams>, step: WorkflowStep) {
@@ -106,16 +115,24 @@ export class WorkoutSteerWorkflow extends WorkflowEntrypoint<Env, WorkoutSteerPa
       finalText = 'I got stuck in a tool loop. Try again with a simpler request.';
     }
 
+    // record-usage is observability — never let it block delivery of the
+    // user's reply. Falls back to {thread_total_usage: turnUsage} so the
+    // footer still renders something sensible.
     const turnTotals = await step.do('record-usage', async () => {
-      const res = await stub.fetch('https://internal/workflow/workout/record-usage', {
-        method: 'POST',
-        body: JSON.stringify({
-          thread_id: threadId,
-          model: this.env.OPENAI_MODEL,
-          ...turnUsage,
-        }),
-      });
-      return (await res.json()) as { thread_total_usage: RoundUsage };
+      try {
+        const res = await stub.fetch('https://internal/workflow/workout/record-usage', {
+          method: 'POST',
+          body: JSON.stringify({
+            thread_id: threadId,
+            model: this.env.OPENAI_MODEL,
+            ...turnUsage,
+          }),
+        });
+        if (!res.ok) return { thread_total_usage: turnUsage };
+        return (await res.json()) as { thread_total_usage: RoundUsage };
+      } catch {
+        return { thread_total_usage: turnUsage };
+      }
     });
 
     const turnCost = computeCost(turnUsage, this.env);
@@ -133,7 +150,22 @@ export class WorkoutSteerWorkflow extends WorkflowEntrypoint<Env, WorkoutSteerPa
 
     await step.do('post-final', async () => {
       await discord.postTyping(replyChannelId).catch(() => {});
-      await discord.postMessage(replyChannelId, finalWithCost);
+      try {
+        await discord.postMessage(replyChannelId, finalWithCost);
+      } catch (err) {
+        // Last-resort: if the reply truly cannot land, surface that into the
+        // conversation log so the next turn can see "delivery_failed" instead
+        // of replaying a phantom assistant turn.
+        await stub.fetch('https://internal/workflow/workout/save-turn', {
+          method: 'POST',
+          body: JSON.stringify({
+            role: 'system',
+            content: `[delivery_failed] ${(err as Error).message}`,
+            thread_id: threadId,
+          }),
+        }).catch(() => {});
+        throw err;
+      }
     });
   }
 

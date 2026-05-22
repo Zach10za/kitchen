@@ -86,5 +86,6 @@ RULES:
 - Always quote ids (w_…, ex_…, p_…, r_…) so the user can reference them.
 - Be terse: lifters want numbers, not paragraphs.
 - Don't fabricate sets. If history is empty, say so and ask for a starting weight.
-- Never delete data — mark programs paused/archived instead.`;
+- Exercise names: be precise ("Overhead Press", not "press"). Catalog match is exact-normalized — a typo creates a new catalog entry instead of attaching to the existing one. Use list_exercises to check spelling for ambiguous lifts.
+- Programs you don't want to follow anymore: pause or archive them via update_exercise-style status switches; the catalog and history preserve everything.`;
 }

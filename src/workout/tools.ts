@@ -54,7 +54,7 @@ export const WORKOUT_TOOLS = [
     function: {
       name: 'add_set',
       description:
-        'Log a single set in a workout. If workout_id is omitted, the most recent open workout is used (or a fresh one is auto-created if none is open). Exercise name is fuzzy-matched against the catalog and auto-created if new; pass equipment + primary_muscle on first mention to populate the catalog.',
+        'Log a single set in a workout. If workout_id is omitted, the most recent open workout is used (or a fresh one is auto-created if none is open). Exercise name is matched against the catalog by exact normalized name (case- and whitespace-insensitive); on miss the exercise is auto-created. Use precise names ("Overhead Press", not "press") to avoid creating duplicates. Pass equipment + primary_muscle on first mention to populate the catalog — on later mentions they backfill NULL fields but never overwrite existing values.',
       parameters: {
         type: 'object',
         properties: {
@@ -84,7 +84,7 @@ export const WORKOUT_TOOLS = [
     function: {
       name: 'add_sets_bulk',
       description:
-        'Log many sets at once for a single exercise. Use this when the user says "3x5 squat at 225" — pass sets=3, reps=5, weight_lbs=225. All sets attach to the same workout (current/latest if omitted).',
+        'Log many sets at once for a single exercise. Use this when the user says "3x5 squat at 225" — pass sets=3, reps=5, weight_lbs=225. All sets attach to the same workout (current/latest if omitted). Max 30 sets per call. Exercise resolution and catalog backfill behave the same as add_set.',
       parameters: {
         type: 'object',
         properties: {
@@ -111,7 +111,7 @@ export const WORKOUT_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          exercise: { type: 'string', description: 'Exercise name (fuzzy-matched against the catalog).' },
+          exercise: { type: 'string', description: 'Exercise name (matched by exact normalized name — case- and whitespace-insensitive). Use the same precise name you used when logging.' },
           sessions: { type: 'number', description: 'How many recent workouts to include. Default 5.' },
         },
         required: ['exercise'],
@@ -123,7 +123,7 @@ export const WORKOUT_TOOLS = [
     function: {
       name: 'find_prs',
       description:
-        'Show personal records. With exercise: top set per rep range (1RM, 3RM, 5RM, 8RM, 10RM) plus estimated 1RM using Epley. Without exercise: best estimated-1RM across every exercise the user has logged. Warmups excluded.',
+        'Show personal records. With exercise: top set per strict rep count (1RM, 3RM, 5RM, 8RM, 10RM, 15RM — only exact rep counts are recognized) plus estimated 1RM using Epley. Without exercise: best estimated-1RM across every exercise the user has logged. Warmups + bodyweight sets excluded. Exercise name matched by exact normalized name.',
       parameters: {
         type: 'object',
         properties: {
@@ -138,7 +138,7 @@ export const WORKOUT_TOOLS = [
     function: {
       name: 'weekly_volume',
       description:
-        'Sets, reps × weight (tonnage), and set-count per muscle group over the last N days. Use to assess balance ("am I doing enough back work?") or weekly fatigue.',
+        'Sets, reps × weight (tonnage) per muscle group AND top exercises by set count over the last N days. Use to assess balance ("am I doing enough back work?") or spot which lifts dominate volume.',
       parameters: {
         type: 'object',
         properties: {
@@ -151,7 +151,7 @@ export const WORKOUT_TOOLS = [
     type: 'function' as const,
     function: {
       name: 'list_workouts',
-      description: 'Recent workouts (id, date, name, set count, total tonnage). Use to find an id to reference.',
+      description: 'Recent workouts (id, date, name, set count, total tonnage, status open/done, deload flag). Use to find an id to reference or check whether a session is still open.',
       parameters: {
         type: 'object',
         properties: {
@@ -164,7 +164,7 @@ export const WORKOUT_TOOLS = [
     type: 'function' as const,
     function: {
       name: 'get_workout',
-      description: 'Full details of one workout — every set grouped by exercise, in the order they were logged.',
+      description: 'Full details of one workout — every set grouped by exercise (each exercise appears in the order it was first logged), with sets within an exercise ordered by set_index.',
       parameters: {
         type: 'object',
         properties: {
@@ -238,7 +238,7 @@ export const WORKOUT_TOOLS = [
         properties: {
           program_id: { type: 'string', description: 'Program id (starts with p_).' },
           name: { type: 'string', description: 'Routine name.' },
-          day_order: { type: 'number', description: 'Position in the weekly rotation. Default 0.' },
+          day_order: { type: 'number', description: 'Integer used to sort routines within the program (lower first). Not bound to a calendar week.' },
           notes: { type: 'string', description: 'Day-level notes.' },
         },
         required: ['program_id', 'name'],
@@ -293,13 +293,12 @@ export const WORKOUT_TOOLS = [
     type: 'function' as const,
     function: {
       name: 'set_active_program',
-      description: 'Mark a program as active (and demote any currently active program to paused). Pass null to clear the active program.',
+      description: 'Mark a program as active (and demote any currently active program to paused). Omit id (or pass null) to clear the active program entirely.',
       parameters: {
         type: 'object',
         properties: {
-          id: { type: ['string', 'null'], description: 'Program id to activate, or null to clear.' },
+          id: { type: 'string', description: 'Program id to activate. Omit to clear the active program.' },
         },
-        required: ['id'],
       },
     },
   },
@@ -307,13 +306,15 @@ export const WORKOUT_TOOLS = [
 
 // ─── TypeScript Row Types ─────────────────────────────────────────────
 
+export type Equipment = 'barbell' | 'dumbbell' | 'machine' | 'cable' | 'bodyweight' | 'kettlebell' | 'band' | 'other';
+
 export interface ExerciseRow {
   id: string;
   name: string;
   display_name: string;
   category: string | null;
   primary_muscle: string | null;
-  equipment: string | null;
+  equipment: Equipment | null;
   notes: string | null;
   created_at: number;
   updated_at: number;
@@ -326,7 +327,7 @@ export interface WorkoutRow {
   name: string | null;
   started_at: number;
   ended_at: number | null;
-  is_deload: number;
+  is_deload: 0 | 1;
   notes: string | null;
   created_at: number;
   updated_at: number;
@@ -341,7 +342,7 @@ export interface SetRow {
   weight_lbs: number | null;
   reps: number;
   rpe: number | null;
-  is_warmup: number;
+  is_warmup: 0 | 1;
   notes: string | null;
   logged_at: number;
   [key: string]: SqlStorageValue;
