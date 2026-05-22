@@ -121,6 +121,37 @@ const COMMANDS = [
     name: 'tasks-due',
     description: 'Show overdue tasks and anything due within the next 7 days',
   },
+  // ─── Workout bot ──────────────────────────────────────────────────
+  // Lives in #workout. Shares the same Discord app + bot token.
+  {
+    name: 'workout',
+    description: 'Log workouts, track progression, plan programs. Without a message shows a summary.',
+    options: [
+      { name: 'message', description: 'What you want to do (omit to see a summary)', type: STRING, required: false },
+    ],
+  },
+  {
+    name: 'workout-last',
+    description: 'Show the most recent workout (every set, grouped by exercise)',
+  },
+  {
+    name: 'workout-prs',
+    description: 'Show personal records (estimated 1RMs). Optionally filter to one exercise.',
+    options: [
+      { name: 'exercise', description: 'Exercise name (omit for top PRs across all lifts)', type: STRING, required: false },
+    ],
+  },
+  {
+    name: 'workout-week',
+    description: 'Show weekly volume: sets and tonnage by muscle group',
+    options: [
+      { name: 'days', description: 'Lookback window in days (default 7)', type: INTEGER, required: false },
+    ],
+  },
+  {
+    name: 'workout-program',
+    description: 'Show the active training program with all routines and planned exercises',
+  },
 ];
 
 async function main() {

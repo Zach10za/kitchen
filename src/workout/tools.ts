@@ -1,0 +1,382 @@
+/**
+ * Workout agent tool definitions. All state mutations go through these tools;
+ * the executor lives in workout/loop.ts and is called from WorkoutDO's
+ * /workflow/workout/exec-tool endpoint.
+ *
+ * Convention: every weight is pounds (lbs). Bodyweight exercises omit weight.
+ */
+
+export const WORKOUT_TOOLS = [
+  {
+    type: 'function' as const,
+    function: {
+      name: 'show_summary',
+      description:
+        'Get a high-level snapshot: last workout, active program, weekly volume, and a few recent PRs. Call this first when the user asks an open-ended question like "what should I do today" or "how am I progressing".',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'log_workout',
+      description:
+        'Start a new workout session and return its id. If the user is following a routine (push day, leg day, etc.), pass routine_id to link the session. Optionally specify started_at as ms epoch — defaults to now.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Optional name for the workout, e.g. "Push Day A".' },
+          routine_id: { type: 'string', description: 'Routine this session is following (use list_programs to find).' },
+          started_at: { type: 'number', description: 'ms epoch when the workout began. Defaults to now.' },
+          is_deload: { type: 'boolean', description: 'Set true if this is a deload session.' },
+          notes: { type: 'string', description: 'Initial notes (mood, energy, focus).' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'end_workout',
+      description:
+        'Mark a workout finished by setting ended_at. If id is omitted, finalizes the most recent unfinished workout. Add an optional summary in notes.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Workout id to end. Defaults to most recent open workout.' },
+          notes: { type: 'string', description: 'Closing notes (how it went, soreness, etc).' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'add_set',
+      description:
+        'Log a single set in a workout. If workout_id is omitted, the most recent open workout is used (or a fresh one is auto-created if none is open). Exercise name is fuzzy-matched against the catalog and auto-created if new; pass equipment + primary_muscle on first mention to populate the catalog.',
+      parameters: {
+        type: 'object',
+        properties: {
+          exercise: { type: 'string', description: 'Exercise name, e.g. "Bench Press", "Front Squat".' },
+          weight_lbs: { type: 'number', description: 'Pounds. Omit for bodyweight exercises.' },
+          reps: { type: 'number', description: 'Reps completed.' },
+          rpe: { type: 'number', description: 'Optional RPE (1–10). RPE 10 = max effort, RPE 7 = 3 reps in reserve.' },
+          is_warmup: { type: 'boolean', description: 'True for warmup sets so they\'re excluded from PRs/volume.' },
+          workout_id: { type: 'string', description: 'Workout id; omit to append to current/latest open workout.' },
+          equipment: {
+            type: 'string',
+            enum: ['barbell', 'dumbbell', 'machine', 'cable', 'bodyweight', 'kettlebell', 'band', 'other'],
+            description: 'Used only when auto-creating the exercise in the catalog.',
+          },
+          primary_muscle: {
+            type: 'string',
+            description: 'Primary muscle worked, e.g. chest, quads, back, shoulders. Used when auto-creating.',
+          },
+          notes: { type: 'string', description: 'Set-level notes (form cue, "felt heavy", etc).' },
+        },
+        required: ['exercise', 'reps'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'add_sets_bulk',
+      description:
+        'Log many sets at once for a single exercise. Use this when the user says "3x5 squat at 225" — pass sets=3, reps=5, weight_lbs=225. All sets attach to the same workout (current/latest if omitted).',
+      parameters: {
+        type: 'object',
+        properties: {
+          exercise: { type: 'string', description: 'Exercise name.' },
+          sets: { type: 'number', description: 'Number of sets to record (each gets the same weight + reps).' },
+          reps: { type: 'number', description: 'Reps per set.' },
+          weight_lbs: { type: 'number', description: 'Weight per set. Omit for bodyweight.' },
+          rpe: { type: 'number', description: 'Optional RPE applied to every set.' },
+          is_warmup: { type: 'boolean', description: 'True for warmup sets.' },
+          workout_id: { type: 'string', description: 'Workout id; defaults to current/latest open.' },
+          equipment: { type: 'string', description: 'Used when auto-creating the exercise.' },
+          primary_muscle: { type: 'string', description: 'Used when auto-creating the exercise.' },
+        },
+        required: ['exercise', 'sets', 'reps'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'exercise_history',
+      description:
+        'Get the last N sessions for an exercise: weight × reps × RPE for each set, grouped by workout date. Use when the user asks "how\'s my bench been" or wants to pick next session\'s weight.',
+      parameters: {
+        type: 'object',
+        properties: {
+          exercise: { type: 'string', description: 'Exercise name (fuzzy-matched against the catalog).' },
+          sessions: { type: 'number', description: 'How many recent workouts to include. Default 5.' },
+        },
+        required: ['exercise'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'find_prs',
+      description:
+        'Show personal records. With exercise: top set per rep range (1RM, 3RM, 5RM, 8RM, 10RM) plus estimated 1RM using Epley. Without exercise: best estimated-1RM across every exercise the user has logged. Warmups excluded.',
+      parameters: {
+        type: 'object',
+        properties: {
+          exercise: { type: 'string', description: 'Optional exercise name. Omit for top PRs across all exercises.' },
+          limit: { type: 'number', description: 'Limit for top-PRs mode. Default 10.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'weekly_volume',
+      description:
+        'Sets, reps × weight (tonnage), and set-count per muscle group over the last N days. Use to assess balance ("am I doing enough back work?") or weekly fatigue.',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: { type: 'number', description: 'Window in days. Default 7.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'list_workouts',
+      description: 'Recent workouts (id, date, name, set count, total tonnage). Use to find an id to reference.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limit: { type: 'number', description: 'How many workouts. Default 10.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_workout',
+      description: 'Full details of one workout — every set grouped by exercise, in the order they were logged.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Workout id (starts with w_).' },
+        },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'list_exercises',
+      description: 'List the exercise catalog with primary muscle + equipment. Use before suggesting an accessory to check what the user already does.',
+      parameters: {
+        type: 'object',
+        properties: {
+          muscle: { type: 'string', description: 'Filter by primary muscle (chest, quads, back, etc).' },
+          equipment: { type: 'string', description: 'Filter by equipment.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'update_exercise',
+      description: 'Update an exercise catalog entry: fix display_name, set primary_muscle, equipment, or notes. Use when the user clarifies categorization.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Exercise id (starts with ex_).' },
+          display_name: { type: 'string' },
+          primary_muscle: { type: 'string' },
+          equipment: { type: 'string' },
+          category: { type: 'string', description: 'Movement pattern: push, pull, hinge, squat, carry, core, accessory.' },
+          notes: { type: 'string' },
+        },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'create_program',
+      description:
+        'Create a new training program (e.g. "5/3/1 Main", "PPL 6-day"). Programs hold routines (training days). Set status=active to make it the user\'s current plan — only one program is active at a time; creating an active one demotes the previous active program to paused.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Program name.' },
+          description: { type: 'string', description: 'How the program is structured.' },
+          status: {
+            type: 'string',
+            enum: ['active', 'paused', 'archived'],
+            description: 'Default paused. Use active to mark as current.',
+          },
+        },
+        required: ['name'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'add_routine',
+      description: 'Add a training day to a program (e.g. "Push A", "Lower B"). day_order controls ordering within the week.',
+      parameters: {
+        type: 'object',
+        properties: {
+          program_id: { type: 'string', description: 'Program id (starts with p_).' },
+          name: { type: 'string', description: 'Routine name.' },
+          day_order: { type: 'number', description: 'Position in the weekly rotation. Default 0.' },
+          notes: { type: 'string', description: 'Day-level notes.' },
+        },
+        required: ['program_id', 'name'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'add_routine_exercise',
+      description:
+        'Add a planned exercise to a routine, with target sets/reps/weight/RPE. target_reps is freeform: "5", "8-12", "AMRAP at RPE 8".',
+      parameters: {
+        type: 'object',
+        properties: {
+          routine_id: { type: 'string', description: 'Routine id (starts with r_).' },
+          exercise: { type: 'string', description: 'Exercise name (auto-creates if new).' },
+          target_sets: { type: 'number' },
+          target_reps: { type: 'string', description: '"5", "8-12", "AMRAP", etc.' },
+          target_weight_lbs: { type: 'number' },
+          target_rpe: { type: 'number' },
+          exercise_order: { type: 'number', description: 'Position in the routine. Default 0.' },
+          notes: { type: 'string' },
+        },
+        required: ['routine_id', 'exercise'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'list_programs',
+      description: 'List all programs with their routines. Use to find an id to reference or to show the user what programs they have set up.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_program',
+      description: 'Full program structure: every routine, every planned exercise with targets.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Program id.' },
+        },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'set_active_program',
+      description: 'Mark a program as active (and demote any currently active program to paused). Pass null to clear the active program.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: ['string', 'null'], description: 'Program id to activate, or null to clear.' },
+        },
+        required: ['id'],
+      },
+    },
+  },
+] as const;
+
+// ─── TypeScript Row Types ─────────────────────────────────────────────
+
+export interface ExerciseRow {
+  id: string;
+  name: string;
+  display_name: string;
+  category: string | null;
+  primary_muscle: string | null;
+  equipment: string | null;
+  notes: string | null;
+  created_at: number;
+  updated_at: number;
+  [key: string]: SqlStorageValue;
+}
+
+export interface WorkoutRow {
+  id: string;
+  routine_id: string | null;
+  name: string | null;
+  started_at: number;
+  ended_at: number | null;
+  is_deload: number;
+  notes: string | null;
+  created_at: number;
+  updated_at: number;
+  [key: string]: SqlStorageValue;
+}
+
+export interface SetRow {
+  id: number;
+  workout_id: string;
+  exercise_id: string;
+  set_index: number;
+  weight_lbs: number | null;
+  reps: number;
+  rpe: number | null;
+  is_warmup: number;
+  notes: string | null;
+  logged_at: number;
+  [key: string]: SqlStorageValue;
+}
+
+export interface ProgramRow {
+  id: string;
+  name: string;
+  description: string | null;
+  status: 'active' | 'paused' | 'archived';
+  start_date: number | null;
+  created_at: number;
+  updated_at: number;
+  [key: string]: SqlStorageValue;
+}
+
+export interface RoutineRow {
+  id: string;
+  program_id: string;
+  name: string;
+  day_order: number;
+  notes: string | null;
+  created_at: number;
+  [key: string]: SqlStorageValue;
+}
+
+export interface RoutineExerciseRow {
+  id: number;
+  routine_id: string;
+  exercise_id: string;
+  exercise_order: number;
+  target_sets: number | null;
+  target_reps: string | null;
+  target_weight_lbs: number | null;
+  target_rpe: number | null;
+  notes: string | null;
+  [key: string]: SqlStorageValue;
+}

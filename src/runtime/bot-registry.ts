@@ -11,7 +11,7 @@
 
 import type { Env } from '../env';
 
-export type BotId = 'kitchen' | 'finance' | 'tasks';
+export type BotId = 'kitchen' | 'finance' | 'tasks' | 'workout';
 
 export interface BotEntry {
   id: BotId;
@@ -63,11 +63,27 @@ const TASKS: BotEntry = {
   },
 };
 
+const WORKOUT: BotEntry = {
+  id: 'workout',
+  doName: 'default-household',
+  commands: new Set([
+    'workout',
+    'workout-last',
+    'workout-prs',
+    'workout-week',
+    'workout-program',
+  ]),
+  getStub(env) {
+    return env.WORKOUT.get(env.WORKOUT.idFromName('default-household'));
+  },
+};
+
 /** Resolve the bot owning a Discord channel by ID. Returns null if unknown. */
 export function botForChannel(env: Env, channelId: string): BotEntry | null {
   if (channelId === env.DISCORD_CHANNEL_ID) return KITCHEN;
   if (channelId === env.DISCORD_FINANCE_CHANNEL_ID) return FINANCE;
   if (channelId === env.DISCORD_TASKS_CHANNEL_ID) return TASKS;
+  if (channelId === env.DISCORD_WORKOUT_CHANNEL_ID) return WORKOUT;
   return null;
 }
 
@@ -76,8 +92,9 @@ export function botForChannel(env: Env, channelId: string): BotEntry | null {
 export function botForCommand(commandName: string): BotEntry {
   if (FINANCE.commands.has(commandName)) return FINANCE;
   if (TASKS.commands.has(commandName)) return TASKS;
+  if (WORKOUT.commands.has(commandName)) return WORKOUT;
   return KITCHEN;
 }
 
 /** All registered bots, useful for the cron heartbeat which fans out to each. */
-export const ALL_BOTS: readonly BotEntry[] = [KITCHEN, FINANCE, TASKS];
+export const ALL_BOTS: readonly BotEntry[] = [KITCHEN, FINANCE, TASKS, WORKOUT];

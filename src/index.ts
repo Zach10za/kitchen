@@ -10,10 +10,12 @@ import { ALL_BOTS, botForChannel, botForCommand } from './runtime/bot-registry';
 export { KitchenDO } from './kitchen-do';
 export { FinanceDO } from './finance-do';
 export { TasksDO } from './tasks-do';
+export { WorkoutDO } from './workout-do';
 export { ApproveWorkflow } from './workflows/approve';
 export { SteerWorkflow } from './workflows/steer';
 export { FinanceSteerWorkflow } from './workflows/finance-steer';
 export { TasksSteerWorkflow } from './workflows/tasks-steer';
+export { WorkoutSteerWorkflow } from './workflows/workout-steer';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -130,6 +132,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           params: { userMessage: body.userMessage, replyChannelId },
         })
       );
+    } else if (bot.id === 'workout') {
+      ctx.waitUntil(
+        env.WORKOUT_STEER_WORKFLOW.create({
+          params: { userMessage: body.userMessage, replyChannelId },
+        })
+      );
     } else {
       ctx.waitUntil(
         env.FINANCE_STEER_WORKFLOW.create({
@@ -145,25 +153,32 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   // bot token, which is a live production credential), supplied via the
   // Authorization header so it doesn't leak through CDN/proxy access logs.
   //
-  // /admin/dump and /admin/reset accept ?bot=kitchen|finance (default kitchen).
-  // Kitchen-specific endpoints (/admin/grocery, /admin/clear-grocery) target
-  // KitchenDO regardless. /admin/finance/sync forces a SimpleFin pull.
+  // /admin/dump and /admin/reset accept ?bot=kitchen|finance|tasks|workout
+  // (default kitchen). Kitchen-specific endpoints (/admin/grocery,
+  // /admin/clear-grocery) target KitchenDO regardless. /admin/finance/sync
+  // forces a SimpleFin pull.
   //
   // Usage:
   //   curl -H "Authorization: Bearer $ADMIN_TOKEN" https://.../admin/dump
-  //   curl -H "Authorization: Bearer $ADMIN_TOKEN" 'https://.../admin/dump?bot=finance'
+  //   curl -H "Authorization: Bearer $ADMIN_TOKEN" 'https://.../admin/dump?bot=workout'
   //   curl -H "Authorization: Bearer $ADMIN_TOKEN" -X POST https://.../admin/finance/sync
   if (url.pathname.startsWith('/admin/')) {
     if (!checkAdmin(request, env)) {
       return new Response('forbidden', { status: 403 });
     }
-    const botParam = url.searchParams.get('bot') === 'finance' ? 'finance'
-      : url.searchParams.get('bot') === 'tasks' ? 'tasks'
+    const rawBot = url.searchParams.get('bot');
+    const botParam: 'kitchen' | 'finance' | 'tasks' | 'workout' =
+      rawBot === 'finance' ? 'finance'
+      : rawBot === 'tasks' ? 'tasks'
+      : rawBot === 'workout' ? 'workout'
       : 'kitchen';
-    const stub = botParam === 'finance'
-      ? env.FINANCE.get(env.FINANCE.idFromName('default-household'))
-      : botParam === 'tasks'
+    const stub =
+      botParam === 'finance'
+        ? env.FINANCE.get(env.FINANCE.idFromName('default-household'))
+        : botParam === 'tasks'
         ? env.TASKS.get(env.TASKS.idFromName('default-household'))
+        : botParam === 'workout'
+        ? env.WORKOUT.get(env.WORKOUT.idFromName('default-household'))
         : env.KITCHEN.get(env.KITCHEN.idFromName('default-household'));
 
     if (url.pathname === '/admin/dump' && request.method === 'GET') {
@@ -293,6 +308,17 @@ function isFastReadCommand(interaction: Interaction): boolean {
     case 'tasks-blocked':
       return true;            // pure read
     case 'tasks-due':
+      return true;            // pure read
+    // Workout
+    case 'workout':
+      return !hasMessage;     // /workout (alone) = summary; with message = agent
+    case 'workout-last':
+      return true;            // pure read
+    case 'workout-prs':
+      return true;            // pure read
+    case 'workout-week':
+      return true;            // pure read
+    case 'workout-program':
       return true;            // pure read
     default:
       return false;
