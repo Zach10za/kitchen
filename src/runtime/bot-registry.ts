@@ -6,7 +6,7 @@
 
 import type { Env } from '../env';
 
-export type BotId = 'kitchen' | 'finance';
+export type BotId = 'kitchen' | 'finance' | 'tasks';
 
 export interface BotEntry {
   id: BotId;
@@ -31,21 +31,34 @@ const FINANCE: BotEntry = {
   },
 };
 
+const TASKS: BotEntry = {
+  id: 'tasks',
+  doName: 'default-household',
+  getStub(env) {
+    return env.TASKS.get(env.TASKS.idFromName('default-household'));
+  },
+};
+
 /** Resolve the bot owning a Discord channel by ID. Returns null if unknown. */
 export function botForChannel(env: Env, channelId: string): BotEntry | null {
   if (channelId === env.DISCORD_CHANNEL_ID) return KITCHEN;
   if (channelId === env.DISCORD_FINANCE_CHANNEL_ID) return FINANCE;
+  if (channelId === env.DISCORD_TASKS_CHANNEL_ID) return TASKS;
   return null;
 }
 
 /** Resolve the bot owning a slash-command by name. Finance commands are
- *  prefixed `finance-`; everything else routes to kitchen. */
+ *  prefixed `finance-`; tasks commands are prefixed `tasks`; everything else
+ *  routes to kitchen. */
 export function botForCommand(commandName: string): BotEntry {
   if (commandName.startsWith('finance') || commandName === 'spending' || commandName === 'merchant' || commandName === 'sync-finance') {
     return FINANCE;
+  }
+  if (commandName.startsWith('tasks')) {
+    return TASKS;
   }
   return KITCHEN;
 }
 
 /** All registered bots, useful for the cron heartbeat which fans out to each. */
-export const ALL_BOTS: readonly BotEntry[] = [KITCHEN, FINANCE];
+export const ALL_BOTS: readonly BotEntry[] = [KITCHEN, FINANCE, TASKS];

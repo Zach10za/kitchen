@@ -49,6 +49,8 @@ In the Cloudflare dashboard:
 5. In Discord, enable **Settings > Advanced > Developer Mode**, then:
    - Right-click your server → **Copy Server ID** → `DISCORD_GUILD_ID`
    - Right-click the channel the bot lives in → **Copy Channel ID** → `DISCORD_CHANNEL_ID`
+   - If you add a `#finance` channel: right-click → **Copy Channel ID** → `DISCORD_FINANCE_CHANNEL_ID`
+   - If you add a `#tasks` channel: right-click → **Copy Channel ID** → `DISCORD_TASKS_CHANNEL_ID`
 
 ### 4. Set local secrets for development
 
@@ -63,7 +65,7 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/plan`, `/draft`, `/steer`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders` registered.
+You should see `/plan`, `/draft`, `/steer`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked` registered.
 
 ### 6. Deploy the Worker
 
@@ -80,6 +82,8 @@ bunx wrangler secret put DISCORD_BOT_TOKEN
 bunx wrangler secret put DISCORD_APP_ID
 bunx wrangler secret put DISCORD_GUILD_ID
 bunx wrangler secret put DISCORD_CHANNEL_ID
+bunx wrangler secret put DISCORD_FINANCE_CHANNEL_ID  # optional; enables finance bot
+bunx wrangler secret put DISCORD_TASKS_CHANNEL_ID    # optional; enables tasks bot
 bunx wrangler secret put OPENAI_API_KEY
 bunx wrangler secret put AI_GATEWAY_URL
 bunx wrangler secret put RELAY_SECRET     # any long random string; share with Fly.io relay
@@ -106,7 +110,7 @@ cd gateway-relay
 fly launch --no-deploy           # accept defaults; app name "kitchen-gateway"
 fly secrets set \
   DISCORD_BOT_TOKEN=...          # same token as the Worker
-  DISCORD_CHANNEL_ID=...         # same channel ID
+  DISCORD_CHANNEL_IDS=<kitchen-id>,<finance-id>,<tasks-id>   # comma-separated IDs for all bots you want to relay
   WORKER_URL=https://kitchen.<your-subdomain>.workers.dev \
   RELAY_SECRET=...               # same value as the Worker secret
 fly deploy
@@ -144,15 +148,30 @@ In your Discord channel, either slash commands:
 /reminders               show upcoming defrost/prep reminders
 ```
 
-…or just talk in the channel. The Fly.io relay forwards messages to a `SteerWorkflow`, so:
+In your `#finance` channel:
 
-- "didn't make wed, push it to fri"
-- "use the leftover chicken thursday"
-- "no more soy sauce — drop the stir fry"
+```
+/finance                 quick 30d spending summary
+/finance message:...     ask anything about spending, accounts, or trends
+/spending [days:30]      spending summary with top merchants
+/merchant name:starbucks drill into one merchant
+/accounts                list linked bank/card accounts
+/finance-sync            force a SimpleFin pull (normally hourly)
+```
 
-…all work without any slash command. Per-channel rate limit: `RELAY_RATE_LIMIT_PER_HOUR` (default 30/hr) prevents a compromised relay from driving unbounded LLM spend.
+In your `#tasks` channel:
 
-The bot learns from every steering conversation. After a few weeks the drafts arrive ~80% of the way there.
+```
+/tasks                   task summary (open, ready, blocked counts)
+/tasks message:...       add tasks, update status, ask what to work on next
+/tasks-open              list all open tasks
+/tasks-next              show tasks with no unfinished blockers (ready to start)
+/tasks-blocked           show tasks waiting on other tasks
+```
+
+…or just talk in any channel. The Fly.io relay forwards messages to the right bot based on channel ID, so plain messages work without slash commands. Per-channel rate limit: `RELAY_RATE_LIMIT_PER_HOUR` (default 30/hr) prevents unbounded LLM spend.
+
+The kitchen bot learns from every steering conversation. After a few weeks the drafts arrive ~80% of the way there.
 
 ## Local development
 
@@ -169,10 +188,11 @@ For end-to-end testing of Discord interactions you'll need a tunnel (`cloudflare
 All gated on `Authorization: Bearer $ADMIN_TOKEN` (separate from the bot token so an admin curl can never leak it via URL access logs):
 
 ```
-GET  /admin/dump                       full DO state JSON
-POST /admin/reset                      wipe DO state
+GET  /admin/dump                       full DO state JSON (?bot=kitchen|finance|tasks)
+POST /admin/reset                      wipe DO state (?bot=kitchen|finance|tasks)
 GET  /admin/grocery?week_of=YYYY-MM-DD
 POST /admin/clear-grocery?week_of=YYYY-MM-DD
+POST /admin/finance/sync               force SimpleFin pull
 ```
 
 ## Files
@@ -182,6 +202,8 @@ src/
   index.ts                 Worker entry: routes /interactions, /relay/message, /admin/*
   env.ts                   Env binding types
   kitchen-do.ts            Durable Object: SQLite state + alarm + reminder dispatch + rate limit
+  finance-do.ts            Durable Object: accounts + transactions + conversation
+  tasks-do.ts              Durable Object: tasks + dependencies + conversation
   error-triage.ts          Capture → fingerprint → dedupe → file GitHub issue
   agent/
     loop.ts                OpenAI tool-use loop + tool implementations
@@ -191,6 +213,19 @@ src/
     context.ts             Builds per-command system prompts from DO state
     render.ts              Plan / recipe / grocery list → Discord embeds
     round.ts               Servings rounding helpers
+  finance/
+    loop.ts                Finance tool implementations
+    tools.ts               Finance tool schemas
+    prompts.ts             Finance system prompt builder
+    render.ts              Finance Discord embeds
+    normalize.ts           Merchant name normalization
+    simplefin.ts           SimpleFin API client
+    sync.ts                Sync pipeline (fetch → normalize → upsert)
+  tasks/
+    loop.ts                Tasks tool implementations + buildTaskStats
+    tools.ts               Tasks tool schemas + TypeScript row types
+    prompts.ts             Tasks system prompt builder
+    render.ts              Tasks Discord embeds
   discord/
     verify.ts              Ed25519 signature verification (Web Crypto, no deps)
     api.ts                 Discord REST helpers
@@ -198,6 +233,16 @@ src/
   workflows/
     approve.ts             ApproveWorkflow: per-recipe shopping → combined grocery list
     steer.ts               SteerWorkflow: chat-driven plan edits with progress updates
+    finance-steer.ts       FinanceSteerWorkflow: finance agent conversation
+    tasks-steer.ts         TasksSteerWorkflow: tasks agent conversation
+  runtime/
+    agent-round.ts         Shared OpenAI Responses-API tool-call loop
+    bot-registry.ts        Channel-to-bot routing (kitchen / finance / tasks)
+    migrations.ts          SQLite schema migration runner
+    openai.ts              OpenAI client factory
+    pricing.ts             Token cost calculator
+    relay-rate-limit.ts    Per-channel rolling-window rate limit
+    usage.ts               Per-bot cost tracking
   util/
     datetime.ts            Timezone math (next-Monday, draft alarm time, cook time)
 gateway-relay/

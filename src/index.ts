@@ -9,9 +9,11 @@ import { ALL_BOTS, botForChannel, botForCommand } from './runtime/bot-registry';
 
 export { KitchenDO } from './kitchen-do';
 export { FinanceDO } from './finance-do';
+export { TasksDO } from './tasks-do';
 export { ApproveWorkflow } from './workflows/approve';
 export { SteerWorkflow } from './workflows/steer';
 export { FinanceSteerWorkflow } from './workflows/finance-steer';
+export { TasksSteerWorkflow } from './workflows/tasks-steer';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -122,6 +124,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           },
         })
       );
+    } else if (bot.id === 'tasks') {
+      ctx.waitUntil(
+        env.TASKS_STEER_WORKFLOW.create({
+          params: { userMessage: body.userMessage, replyChannelId },
+        })
+      );
     } else {
       ctx.waitUntil(
         env.FINANCE_STEER_WORKFLOW.create({
@@ -149,10 +157,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (!checkAdmin(request, env)) {
       return new Response('forbidden', { status: 403 });
     }
-    const botParam = url.searchParams.get('bot') === 'finance' ? 'finance' : 'kitchen';
+    const botParam = url.searchParams.get('bot') === 'finance' ? 'finance'
+      : url.searchParams.get('bot') === 'tasks' ? 'tasks'
+      : 'kitchen';
     const stub = botParam === 'finance'
       ? env.FINANCE.get(env.FINANCE.idFromName('default-household'))
-      : env.KITCHEN.get(env.KITCHEN.idFromName('default-household'));
+      : botParam === 'tasks'
+        ? env.TASKS.get(env.TASKS.idFromName('default-household'))
+        : env.KITCHEN.get(env.KITCHEN.idFromName('default-household'));
 
     if (url.pathname === '/admin/dump' && request.method === 'GET') {
       return stub.fetch('https://internal/dump');
@@ -270,6 +282,15 @@ function isFastReadCommand(interaction: Interaction): boolean {
     case 'merchant':
       return true;            // pure read
     case 'accounts':
+      return true;            // pure read
+    // Tasks
+    case 'tasks':
+      return !hasMessage;     // /tasks (alone) = summary; with message = agent
+    case 'tasks-open':
+      return true;            // pure read
+    case 'tasks-next':
+      return true;            // pure read
+    case 'tasks-blocked':
       return true;            // pure read
     default:
       return false;
