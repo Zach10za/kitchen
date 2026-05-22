@@ -21,12 +21,17 @@
         "name": "TASKS",
         "class_name": "TasksDO",
       },
+      {
+        "name": "WORKOUT",
+        "class_name": "WorkoutDO",
+      },
     ],
   },
 
   // Migrations history. v1 created KitchenDO, v2 added GatewayDO (now removed),
   // v3 deletes GatewayDO (gateway connection lives on Fly.io now), v4 adds
-  // FinanceDO for the finance bot, v5 adds TasksDO for the tasks bot.
+  // FinanceDO for the finance bot, v5 adds TasksDO for the tasks bot, v6 adds
+  // WorkoutDO for the workout bot.
   "migrations": [
     {
       "tag": "v1",
@@ -47,6 +52,10 @@
     {
       "tag": "v5",
       "new_sqlite_classes": ["TasksDO"],
+    },
+    {
+      "tag": "v6",
+      "new_sqlite_classes": ["WorkoutDO"],
     },
   ],
 
@@ -72,6 +81,11 @@
       "name": "tasks-steer",
       "binding": "TASKS_STEER_WORKFLOW",
       "class_name": "TasksSteerWorkflow",
+    },
+    {
+      "name": "workout-steer",
+      "binding": "WORKOUT_STEER_WORKFLOW",
+      "class_name": "WorkoutSteerWorkflow",
     },
   ],
 
@@ -138,6 +152,7 @@
   //   DISCORD_CHANNEL_ID         — channel the kitchen bot posts proactive drafts to
   //   DISCORD_FINANCE_CHANNEL_ID — channel the finance bot posts to
   //   DISCORD_TASKS_CHANNEL_ID   — channel the tasks bot posts to
+  //   DISCORD_WORKOUT_CHANNEL_ID — channel the workout bot posts to
   //   OPENAI_API_KEY             — your OpenAI key
   //   AI_GATEWAY_URL             — e.g. https://gateway.ai.cloudflare.com/v1/<acct>/kitchen/openai
   //   RELAY_SECRET               — shared secret with the Fly.io gateway-relay

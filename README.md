@@ -51,6 +51,7 @@ In the Cloudflare dashboard:
    - Right-click the channel the bot lives in → **Copy Channel ID** → `DISCORD_CHANNEL_ID`
    - If you add a `#finance` channel: right-click → **Copy Channel ID** → `DISCORD_FINANCE_CHANNEL_ID`
    - If you add a `#tasks` channel: right-click → **Copy Channel ID** → `DISCORD_TASKS_CHANNEL_ID`
+   - If you add a `#workout` channel: right-click → **Copy Channel ID** → `DISCORD_WORKOUT_CHANNEL_ID`
 
 ### 4. Set local secrets for development
 
@@ -65,7 +66,7 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/plan`, `/draft`, `/steer`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due` registered.
+You should see `/plan`, `/draft`, `/steer`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
 
 ### 6. Deploy the Worker
 
@@ -84,6 +85,7 @@ bunx wrangler secret put DISCORD_GUILD_ID
 bunx wrangler secret put DISCORD_CHANNEL_ID
 bunx wrangler secret put DISCORD_FINANCE_CHANNEL_ID  # optional; enables finance bot
 bunx wrangler secret put DISCORD_TASKS_CHANNEL_ID    # optional; enables tasks bot
+bunx wrangler secret put DISCORD_WORKOUT_CHANNEL_ID   # optional; enables workout bot
 bunx wrangler secret put OPENAI_API_KEY
 bunx wrangler secret put AI_GATEWAY_URL
 bunx wrangler secret put RELAY_SECRET     # any long random string; share with Fly.io relay
@@ -110,7 +112,7 @@ cd gateway-relay
 fly launch --no-deploy           # accept defaults; app name "kitchen-gateway"
 fly secrets set \
   DISCORD_BOT_TOKEN=...          # same token as the Worker
-  DISCORD_CHANNEL_IDS=<kitchen-id>,<finance-id>,<tasks-id>   # comma-separated IDs for all bots you want to relay
+  DISCORD_CHANNEL_IDS=<kitchen-id>,<finance-id>,<tasks-id>,<workout-id>   # comma-separated IDs for all bots you want to relay
   WORKER_URL=https://kitchen.<your-subdomain>.workers.dev \
   RELAY_SECRET=...               # same value as the Worker secret
 fly deploy
@@ -170,6 +172,24 @@ In your `#tasks` channel:
 /tasks-due               show overdue tasks and anything due within 7 days
 ```
 
+In your `#workout` channel:
+
+```
+/workout                 summary: last workout, active program, weekly volume, top e1RMs
+/workout message:...     log sets, track progression, plan programs (e.g. "log 3x5 squat at 225")
+/workout-last            full breakdown of the most recent workout
+/workout-prs             top estimated 1RMs across all lifts (optional exercise filter)
+/workout-week            sets + tonnage by muscle group for the last 7 days (configurable)
+/workout-program         active training program with all routines and planned exercises
+/workout-profile         your bio/goals/preferences/health-notes + home-gym inventory
+```
+
+The bot reads four kinds of context on every reply:
+- **Profile**: bio, goals, preferences (free text — set via chat)
+- **Health notes**: injuries, current niggles, movement restrictions. Mention a tweak in chat ("my back's been iffy") and the agent appends a date-stamped entry; it then steers around it in future suggestions.
+- **Home gym inventory**: what you actually own. The bot will only suggest movements you can actually do; if you don't have a cable stack, no cable rows.
+- **Training state**: active program, recent workouts, weekly volume, PRs.
+
 …or just talk in any channel. The Fly.io relay forwards messages to the right bot based on channel ID, so plain messages work without slash commands. Per-channel rate limit: `RELAY_RATE_LIMIT_PER_HOUR` (default 30/hr) prevents unbounded LLM spend.
 
 The kitchen bot learns from every steering conversation. After a few weeks the drafts arrive ~80% of the way there.
@@ -189,8 +209,8 @@ For end-to-end testing of Discord interactions you'll need a tunnel (`cloudflare
 All gated on `Authorization: Bearer $ADMIN_TOKEN` (separate from the bot token so an admin curl can never leak it via URL access logs):
 
 ```
-GET  /admin/dump                       full DO state JSON (?bot=kitchen|finance|tasks)
-POST /admin/reset                      wipe DO state (?bot=kitchen|finance|tasks)
+GET  /admin/dump                       full DO state JSON (?bot=kitchen|finance|tasks|workout)
+POST /admin/reset                      wipe DO state (?bot=kitchen|finance|tasks|workout)
 GET  /admin/grocery?week_of=YYYY-MM-DD
 POST /admin/clear-grocery?week_of=YYYY-MM-DD
 POST /admin/finance/sync               force SimpleFin pull
@@ -205,6 +225,7 @@ src/
   kitchen-do.ts            Durable Object: SQLite state + alarm + reminder dispatch + rate limit
   finance-do.ts            Durable Object: accounts + transactions + conversation
   tasks-do.ts              Durable Object: tasks + dependencies + conversation
+  workout-do.ts            Durable Object: exercises + workouts + sets + programs + conversation
   error-triage.ts          Capture → fingerprint → dedupe → file GitHub issue
   agent/
     loop.ts                OpenAI tool-use loop + tool implementations
@@ -227,6 +248,11 @@ src/
     tools.ts               Tasks tool schemas + TypeScript row types
     prompts.ts             Tasks system prompt builder
     render.ts              Tasks Discord embeds
+  workout/
+    loop.ts                Workout tool implementations + Epley 1RM, weekly volume, PRs
+    tools.ts               Workout tool schemas + TypeScript row types
+    prompts.ts             Workout system prompt builder
+    render.ts              Workout Discord embeds (summary, last, PRs, week, program)
   discord/
     verify.ts              Ed25519 signature verification (Web Crypto, no deps)
     api.ts                 Discord REST helpers
@@ -236,9 +262,10 @@ src/
     steer.ts               SteerWorkflow: chat-driven plan edits with progress updates
     finance-steer.ts       FinanceSteerWorkflow: finance agent conversation
     tasks-steer.ts         TasksSteerWorkflow: tasks agent conversation
+    workout-steer.ts       WorkoutSteerWorkflow: workout agent conversation
   runtime/
     agent-round.ts         Shared OpenAI Responses-API tool-call loop
-    bot-registry.ts        Channel-to-bot routing (kitchen / finance / tasks)
+    bot-registry.ts        Channel-to-bot routing (kitchen / finance / tasks / workout)
     migrations.ts          SQLite schema migration runner
     openai.ts              OpenAI client factory
     pricing.ts             Token cost calculator
