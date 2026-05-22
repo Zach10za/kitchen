@@ -6,3 +6,6 @@ node_modules/
 *.log
 dist/
 .DS_Store
+package-lock.json
+yarn.lock
+pnpm-lock.yaml

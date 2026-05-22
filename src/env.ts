@@ -2,10 +2,12 @@ export interface Env {
   // Bindings
   KITCHEN: DurableObjectNamespace;
   FINANCE: DurableObjectNamespace;
+  TASKS: DurableObjectNamespace;
   AI: Ai;
   APPROVE_WORKFLOW: Workflow;
   STEER_WORKFLOW: Workflow;
   FINANCE_STEER_WORKFLOW: Workflow;
+  TASKS_STEER_WORKFLOW: Workflow;
 
   // Vars
   OPENAI_MODEL: string;
@@ -35,6 +37,8 @@ export interface Env {
   DISCORD_CHANNEL_ID: string;
   /** Channel ID where the FinanceDO posts. Required for the finance bot. */
   DISCORD_FINANCE_CHANNEL_ID: string;
+  /** Channel ID where the TasksDO posts. Required for the tasks bot. */
+  DISCORD_TASKS_CHANNEL_ID: string;
   OPENAI_API_KEY: string;
   AI_GATEWAY_URL: string;
   RELAY_SECRET: string;

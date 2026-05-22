@@ -8,3 +8,7 @@ DISCORD_GUILD_ID=
 DISCORD_CHANNEL_ID=
 OPENAI_API_KEY=
 AI_GATEWAY_URL=
+# Optional: set to enable the finance bot in a separate channel
+# DISCORD_FINANCE_CHANNEL_ID=
+# Optional: set to enable the tasks bot in a separate channel
+# DISCORD_TASKS_CHANNEL_ID=
