@@ -35,7 +35,11 @@ const NOISE_SUFFIXES = [
 const SPECIFIC_OVERRIDES: { match: RegExp; canonical: string }[] = [
   { match: /^amazon(\s|\*|\.com|$)/i, canonical: 'amazon' },
   { match: /^amzn\b/i,                 canonical: 'amazon' },
-  { match: /^uber\s+(eats|trip)/i,    canonical: 'uber' },
+  // `^uber\b` so bare "UBER", "UBER *", or "UBER TECHNOLOGIES" all collapse
+  // to the same canonical merchant. The previous narrower pattern only
+  // matched "UBER EATS" or "UBER TRIP", leaving "UBER TECHNOLOGIES" as a
+  // separate merchant.
+  { match: /^uber\b/i,                 canonical: 'uber' },
   { match: /^lyft\b/i,                 canonical: 'lyft' },
   { match: /^doordash\b/i,             canonical: 'doordash' },
   { match: /^netflix\b/i,              canonical: 'netflix' },

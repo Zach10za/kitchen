@@ -5,6 +5,7 @@ import { DiscordAPI } from './discord/api';
 import { prepareInteractionThread } from './discord/thread';
 import { captureError } from './error-triage';
 import { runMigrations, type Migration } from './runtime/migrations';
+import { maybePruneConversationByThread } from './runtime/conversation';
 import {
   checkRelayRateLimit as checkRelayRate,
   ensureRelayRateSchema,
@@ -37,7 +38,6 @@ import {
 } from './workout/render';
 
 const CONVERSATION_PRUNE_KEEP = 400;
-const CONVERSATION_PRUNE_INTERVAL_MS = 24 * 3600 * 1000;
 
 /**
  * WorkoutDO holds all home-gym training state: exercises catalog, programs,
@@ -360,13 +360,10 @@ export class WorkoutDO extends DurableObject<Env> {
   }
 
   private maybePruneConversation(): void {
-    const now = Date.now();
-    if (now - this.lastConversationPruneAt < CONVERSATION_PRUNE_INTERVAL_MS) return;
-    this.lastConversationPruneAt = now;
-    this.sql.exec(
-      `DELETE FROM conversation
-        WHERE id NOT IN (SELECT id FROM conversation ORDER BY id DESC LIMIT ?)`,
-      CONVERSATION_PRUNE_KEEP
+    this.lastConversationPruneAt = maybePruneConversationByThread(
+      (sql, ...params) => this.sql.exec(sql, ...params),
+      this.lastConversationPruneAt,
+      CONVERSATION_PRUNE_KEEP,
     );
   }
 

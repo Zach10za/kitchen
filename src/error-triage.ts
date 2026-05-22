@@ -136,10 +136,24 @@ function defaultTitle(error: NormalizedError, ctx: CaptureContext): string {
 
 async function findExistingIssue(env: Env, fingerprint: string): Promise<{ number: number } | null> {
   const tag = `[fp:${fingerprint}]`;
-  const q = encodeURIComponent(`repo:${env.GITHUB_REPO} in:title "${tag}"`);
-  const res = await ghFetch(env, `/search/issues?q=${q}&per_page=1`, { method: 'GET' });
-  const json = (await res.json()) as { items?: { number: number }[] };
-  return json.items?.[0] ?? null;
+  // Prefer the repo-scoped issues list over /search/issues. The search API
+  // has eventual-consistency lag (seconds to minutes), so two rapid-fire
+  // errors with the same fingerprint could both miss the index and both
+  // create issues — after which dedup is permanently broken because the
+  // search returns whichever the index sees first.
+  //
+  // The list endpoint reads the live datastore; we filter the most recent
+  // 100 issues (open or closed) by title-tag match. Older recurrences
+  // beyond the 100-issue window fall through to create-new, which is
+  // acceptable: long-quiet bugs aren't ones we need perfect dedup on.
+  const path = `/repos/${env.GITHUB_REPO}/issues?state=all&per_page=100&sort=updated&direction=desc`;
+  const res = await ghFetch(env, path, { method: 'GET' });
+  const items = (await res.json()) as Array<{ number: number; title: string; pull_request?: unknown }>;
+  for (const item of items) {
+    if (item.pull_request) continue; // /issues returns PRs too
+    if (item.title.includes(tag)) return { number: item.number };
+  }
+  return null;
 }
 
 async function appendOccurrence(
@@ -226,7 +240,11 @@ async function ghFetch(env: Env, path: string, init: RequestInit): Promise<Respo
     },
   });
   if (!res.ok) {
-    throw new Error(`GitHub API ${init.method ?? 'GET'} ${path} failed: ${res.status} ${await res.text()}`);
+    // Truncate the response body — GitHub API errors can include
+    // request payload echoes that bloat logs and aren't useful for
+    // diagnosis once the status code + first line are known.
+    const body = (await res.text()).slice(0, 300);
+    throw new Error(`GitHub API ${init.method ?? 'GET'} ${path} failed: ${res.status} ${body}`);
   }
   return res;
 }

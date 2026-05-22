@@ -9,6 +9,7 @@ import { EmbedColor } from '../discord/types';
 import { emptyUsage, addUsage, type RoundUsage } from '../runtime/agent-round';
 import { extractUsageFromResponse } from '../runtime/usage';
 import { computeCost, formatUsd } from '../runtime/pricing';
+import { makeOpenAIClient } from '../runtime/openai';
 
 interface ApproveParams {
   weekOf: string;
@@ -82,7 +83,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     // Step 1: load the draft
     const draft = await step.do('load-draft', async () => {
       const res = await stub.fetch(`https://internal/workflow/load-draft?week_of=${weekOf}`);
-      return (await res.json()) as { week_of: string; status: string; meals: MealSlot[] } | null;
+      return (await res.json()) as { week_of: string; status: string; drafted_at: number; meals: MealSlot[] } | null;
     });
 
     if (!draft) {
@@ -247,7 +248,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
         method: 'POST',
         body: JSON.stringify({
           thread_id: replyChannelId,
-          model: this.env.OPENAI_MODEL,
+          model: this.env.OPENAI_MODEL_EXTRACT,
           ...turnUsage,
         }),
       });
@@ -264,7 +265,9 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
         status: 'approved',
         meals_json: JSON.stringify(materialized),
         constraints_json: '[]',
-        drafted_at: 0,
+        // Preserve the real drafted_at so Discord doesn't render
+        // "Jan 1, 1970" on the approved-plan embed footer.
+        drafted_at: draft.drafted_at,
         approved_at: Date.now(),
       } as any);
       const groceryE = groceryEmbeds(groceryItems, weekOf);
@@ -290,13 +293,12 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     return this.env.KITCHEN.get(id);
   }
 
+  // Lazy single client per workflow instance — previously allocated 15+
+  // OpenAI clients per approve (7 materialize + 7 shop + combine).
+  private _openai: OpenAI | null = null;
   private openai(): OpenAI {
-    return new OpenAI({
-      apiKey: this.env.OPENAI_API_KEY,
-      baseURL: this.env.AI_GATEWAY_URL || undefined,
-      timeout: 180_000,
-      maxRetries: 1,
-    });
+    if (!this._openai) this._openai = makeOpenAIClient(this.env);
+    return this._openai;
   }
 
   private async materializeOne(meal: MealSlot, freezerNames: string[]): Promise<{ details: RecipeDetails; usage: RoundUsage }> {
@@ -347,7 +349,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
     try {
       const response = await this.openai().responses.create(
         {
-          model: this.env.OPENAI_MODEL,
+          model: this.env.OPENAI_MODEL_EXTRACT,
           input: [
             { role: 'system', content: SHOP_FOR_RECIPE_PROMPT },
             {
@@ -392,7 +394,7 @@ export class ApproveWorkflow extends WorkflowEntrypoint<Env, ApproveParams> {
       const flat = lists.flat();
       const response = await this.openai().responses.create(
         {
-          model: this.env.OPENAI_MODEL,
+          model: this.env.OPENAI_MODEL_EXTRACT,
           input: [
             { role: 'system', content: COMBINE_GROCERY_PROMPT },
             {

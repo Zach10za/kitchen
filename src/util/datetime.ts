@@ -73,26 +73,44 @@ export function mealCookTime(
 /**
  * Given a YYYY-MM-DD date and an hour (0-23), return UTC ms representing
  * that hour in the given IANA timezone.
+ *
+ * Works for any IANA timezone — including half-hour (India +5:30) and
+ * quarter-hour (Nepal +5:45) offsets. The previous implementation only
+ * handled whole-hour offsets because it reasoned in `diffHours`.
+ *
+ * Strategy: pick `utcGuess` as if the hour were UTC, then read back the
+ * full parts (year/month/day/hour/minute) as they appear in the target
+ * timezone, build the offset in MINUTES from the diff, and adjust.
  */
 export function localDateAtHour(localDate: string, hour: number, timezone: string): number {
-  // We need to find the UTC ms such that, when displayed in `timezone`, it
-  // shows the given date at the given hour. Compute the offset for that date.
   const [y, m, d] = localDate.split('-').map(Number) as [number, number, number];
-  // First guess: treat hour as UTC and compute difference.
   const utcGuess = Date.UTC(y, m - 1, d, hour, 0, 0);
-  // Now look at what that timestamp shows as in the timezone.
-  const formatter = new Intl.DateTimeFormat('en-US', {
+
+  const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone,
-    hour: 'numeric',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
     hour12: false,
-  });
-  const localHourStr = formatter.format(new Date(utcGuess));
-  const localHour = parseInt(localHourStr, 10) % 24;
-  // Diff between intended and actual gives us the timezone offset for that date.
-  const diffHours = (hour - localHour + 24) % 24;
-  // If diff > 12, we went the wrong way (timezone is east of UTC).
-  const offsetHours = diffHours > 12 ? diffHours - 24 : diffHours;
-  return utcGuess + offsetHours * 3_600_000;
+  }).formatToParts(new Date(utcGuess));
+
+  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? 0);
+  // Intl reports hour 24 instead of 0 in some locales when the value is midnight; normalize.
+  const tzYear = get('year');
+  const tzMonth = get('month');
+  const tzDay = get('day');
+  const tzHour = get('hour') % 24;
+  const tzMinute = get('minute');
+
+  // What the displayed timezone "thinks" utcGuess is, expressed as UTC ms.
+  const tzAsUtc = Date.UTC(tzYear, tzMonth - 1, tzDay, tzHour, tzMinute, 0);
+  // Target: hour:00 on localDate.
+  const targetAsUtc = Date.UTC(y, m - 1, d, hour, 0, 0);
+  // Offset (minutes) the timezone is from UTC on this date.
+  const offsetMinutes = (tzAsUtc - targetAsUtc) / 60_000;
+  return utcGuess - offsetMinutes * 60_000;
 }
 
 /** Compute next-cron-fire time for the weekly draft alarm. */

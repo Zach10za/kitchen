@@ -8,6 +8,9 @@ import type { TaskRow } from './tools';
 
 export interface TasksToolCtx {
   sql: SqlStorage;
+  /** IANA timezone for the household. Used to convert bare YYYY-MM-DD
+   *  due-dates into end-of-day in the user's local time instead of UTC. */
+  timezone?: string;
 }
 
 // ─── Public constants ────────────────────────────────────────────────
@@ -84,17 +87,53 @@ function newTaskId(): string {
  * epoch, or null if the input is falsy. Throws on unparseable input so the
  * LLM can self-correct from the error message.
  */
-function parseDueDate(input: string | null | undefined): number | null {
+function parseDueDate(input: string | null | undefined, timezone?: string): number | null {
   if (input === null || input === undefined || input === '') return null;
   const trimmed = String(input).trim();
-  // Bare date → end of that day so "due Friday" means by end-of-Friday.
+  // Bare date → end of that day in the user's local timezone so "due Friday"
+  // means by end-of-Friday LOCAL (not UTC midnight). The previous
+  // implementation always stored UTC midnight, which appeared as Thursday
+  // evening for any timezone west of UTC.
   const bareDate = /^\d{4}-\d{2}-\d{2}$/.test(trimmed);
-  const isoCandidate = bareDate ? `${trimmed}T23:59:59Z` : trimmed;
-  const ms = Date.parse(isoCandidate);
+  if (bareDate) {
+    if (timezone) {
+      // 23:59 local on that date.
+      return localDateAtHourMinute(trimmed, 23, 59, timezone);
+    }
+    // No timezone available: fall back to UTC end-of-day.
+    const ms = Date.parse(`${trimmed}T23:59:59Z`);
+    if (Number.isNaN(ms)) {
+      throw new Error(`Could not parse "${input}" as a date. Use YYYY-MM-DD or an ISO-8601 datetime.`);
+    }
+    return ms;
+  }
+  const ms = Date.parse(trimmed);
   if (Number.isNaN(ms)) {
     throw new Error(`Could not parse "${input}" as a date. Use YYYY-MM-DD or an ISO-8601 datetime.`);
   }
   return ms;
+}
+
+/**
+ * Inline helper: like `localDateAtHour` but with explicit minute precision.
+ * Lives here (not in util/datetime) to keep tasks/loop self-contained.
+ */
+function localDateAtHourMinute(localDate: string, hour: number, minute: number, timezone: string): number {
+  const [y, m, d] = localDate.split('-').map(Number) as [number, number, number];
+  const utcGuess = Date.UTC(y, m - 1, d, hour, minute, 0);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date(utcGuess));
+  const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? 0);
+  const tzAsUtc = Date.UTC(
+    get('year'), get('month') - 1, get('day'),
+    get('hour') % 24, get('minute'), 0,
+  );
+  const targetAsUtc = Date.UTC(y, m - 1, d, hour, minute, 0);
+  const offsetMinutes = (tzAsUtc - targetAsUtc) / 60_000;
+  return utcGuess - offsetMinutes * 60_000;
 }
 
 function formatDue(ms: number | null): string {
@@ -352,7 +391,7 @@ function toolAddTask(
   const priority = (VALID_PRIORITIES as readonly string[]).includes(args.priority ?? '')
     ? (args.priority as TaskPriority)
     : 'normal';
-  const dueAt = parseDueDate(args.due_date);
+  const dueAt = parseDueDate(args.due_date, ctx.timezone);
 
   if (args.parent_id) {
     const parent = ctx.sql.exec('SELECT id FROM tasks WHERE id = ?', args.parent_id).toArray();
@@ -433,7 +472,7 @@ function toolUpdateTask(
     changeBits.push(`notes`);
   }
   if (args.due_date !== undefined) {
-    const dueAt = args.due_date === null ? null : parseDueDate(args.due_date);
+    const dueAt = args.due_date === null ? null : parseDueDate(args.due_date, ctx.timezone);
     updates.push('due_at = ?');
     params.push(dueAt);
     changeBits.push(dueAt === null ? 'due_date=cleared' : `due_date=${new Date(dueAt).toISOString().slice(0, 10)}`);
@@ -562,10 +601,13 @@ export function buildTaskStats(sql: SqlStorage): TaskStats {
   const byPriority: Record<string, number> = {};
   for (const row of priorityCounts) byPriority[row.priority] = row.n;
 
+  // "Ready" = todo with no unfinished blockers. In-progress tasks are
+  // surfaced separately in `inProgressTasks`; including them here caused
+  // both the summary embed and the LLM prompt to list the same task twice.
   const readyTasks = sql
     .exec<TaskRow>(
       `SELECT t.* FROM tasks t
-       WHERE t.status IN ('todo', 'in_progress')
+       WHERE t.status = 'todo'
          AND NOT EXISTS (
            SELECT 1 FROM task_deps d
            JOIN tasks blocker ON blocker.id = d.depends_on_id

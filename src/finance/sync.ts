@@ -31,14 +31,20 @@ export interface SyncResult {
 export async function runSync(env: Env, sql: SqlStorage): Promise<SyncResult> {
   const client = new SimplefinClient(env.SIMPLEFIN_ACCESS_URL);
 
-  const lastSynced = sql
-    .exec<{ ts: number | null }>('SELECT MAX(last_synced_at) AS ts FROM accounts')
+  // Anchor `startDate` to the most recent transaction's `posted` (unix
+  // seconds) — not the wall-clock `last_synced_at`. Otherwise an
+  // institution that hasn't posted in weeks still triggers only the
+  // 7-day overlap window from each sync's run time, never re-pulling
+  // earlier history. With no transactions yet, fall back to the
+  // FIRST_SYNC_LOOKBACK_DAYS window from now.
+  const lastPosted = sql
+    .exec<{ ts: number | null }>('SELECT MAX(posted) AS ts FROM transactions')
     .toArray()[0]?.ts ?? 0;
-
+  const nowSec = Math.floor(Date.now() / 1000);
   const startDate =
-    lastSynced > 0
-      ? Math.floor(lastSynced / 1000) - SYNC_OVERLAP_DAYS * 86_400
-      : Math.floor(Date.now() / 1000) - FIRST_SYNC_LOOKBACK_DAYS * 86_400;
+    lastPosted > 0
+      ? lastPosted - SYNC_OVERLAP_DAYS * 86_400
+      : nowSec - FIRST_SYNC_LOOKBACK_DAYS * 86_400;
 
   const response = await client.fetchAccounts({ startDate });
 
@@ -52,6 +58,13 @@ export async function runSync(env: Env, sql: SqlStorage): Promise<SyncResult> {
 
   const now = Date.now();
   for (const account of response.accounts) {
+    // SimpleFin sometimes returns a per-account `error` field instead of (or
+    // alongside) transactions when a particular institution's connection has
+    // issues. Surface those so a single broken bank doesn't fail silently.
+    const accountError = (account as unknown as { error?: string }).error;
+    if (accountError) {
+      result.errors.push(`${account.name ?? account.id}: ${accountError}`);
+    }
     upsertAccount(sql, account, now);
     result.accountsUpdated++;
     for (const tx of account.transactions ?? []) {
@@ -95,34 +108,32 @@ function upsertTransaction(
   const amount = parseFloat(tx.amount);
   if (!Number.isFinite(amount)) return 'skipped';
 
-  const existing = sql
-    .exec<{ id: string }>('SELECT id FROM transactions WHERE id = ?', tx.id)
+  // Atomic INSERT ON CONFLICT. The previous SELECT-then-write pattern could
+  // race when two syncs (hourly cron + sync_now tool + manual /sync) ran
+  // overlapping waitUntil tasks on the same DO: both would observe no
+  // existing row and both attempt INSERT, triggering a PK conflict.
+  const existed = sql
+    .exec<{ existed: number }>(
+      'SELECT 1 AS existed FROM transactions WHERE id = ? LIMIT 1',
+      tx.id,
+    )
     .toArray()[0];
-
-  if (existing) {
-    sql.exec(
-      `UPDATE transactions SET
-         account_id=?, posted=?, amount=?, description=?, payee=?, normalized_payee=?, memo=?, pending=?, raw_json=?, updated_at=?
-       WHERE id=?`,
-      accountId,
-      tx.posted,
-      amount,
-      tx.description ?? '',
-      tx.payee ?? null,
-      normalized,
-      tx.memo ?? null,
-      tx.pending ? 1 : 0,
-      JSON.stringify(tx),
-      now,
-      tx.id
-    );
-    return 'updated';
-  }
 
   sql.exec(
     `INSERT INTO transactions
        (id, account_id, posted, amount, description, payee, normalized_payee, memo, pending, raw_json, ingested_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       account_id=excluded.account_id,
+       posted=excluded.posted,
+       amount=excluded.amount,
+       description=excluded.description,
+       payee=excluded.payee,
+       normalized_payee=excluded.normalized_payee,
+       memo=excluded.memo,
+       pending=excluded.pending,
+       raw_json=excluded.raw_json,
+       updated_at=excluded.updated_at`,
     tx.id,
     accountId,
     tx.posted,
@@ -134,7 +145,8 @@ function upsertTransaction(
     tx.pending ? 1 : 0,
     JSON.stringify(tx),
     now,
-    now
+    now,
   );
-  return 'inserted';
+
+  return existed ? 'updated' : 'inserted';
 }

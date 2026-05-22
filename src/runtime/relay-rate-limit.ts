@@ -33,13 +33,21 @@ export function checkRelayRateLimit(
 ): RateLimitDecision {
   const now = Date.now();
   const windowStart = now - 3_600_000;
-  sql.exec('DELETE FROM relay_rate WHERE hit_at < ?', windowStart);
+  // Count within the rolling window directly — no DELETE needed for the
+  // accept/deny decision. The previous code DELETEd on every check (even
+  // denied ones), creating cross-channel write contention and letting a
+  // flood from a rate-limited channel evict other channels' rows.
   const count =
-    sql.exec<{ n: number }>('SELECT COUNT(*) AS n FROM relay_rate WHERE channel_id = ?', channelId)
-      .toArray()[0]?.n ?? 0;
+    sql.exec<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM relay_rate WHERE channel_id = ? AND hit_at >= ?',
+      channelId, windowStart,
+    ).toArray()[0]?.n ?? 0;
   if (count >= limit) {
     return { allowed: false, remaining: 0, reason: 'rate_limit_exceeded' };
   }
   sql.exec('INSERT INTO relay_rate (channel_id, hit_at) VALUES (?, ?)', channelId, now);
+  // Opportunistic vacuum AFTER the accept decision so a denied request
+  // never moves the table state. Cheap because the index covers it.
+  sql.exec('DELETE FROM relay_rate WHERE hit_at < ?', windowStart);
   return { allowed: true, remaining: limit - count - 1 };
 }

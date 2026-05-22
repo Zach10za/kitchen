@@ -5,6 +5,7 @@ import { DiscordAPI } from './discord/api';
 import { prepareInteractionThread } from './discord/thread';
 import { captureError } from './error-triage';
 import { runMigrations, type Migration } from './runtime/migrations';
+import { maybePruneConversationByThread } from './runtime/conversation';
 import {
   checkRelayRateLimit as checkRelayRate,
   ensureRelayRateSchema,
@@ -26,9 +27,8 @@ import {
 } from './tasks/loop';
 import { taskSummaryEmbed, tasksListEmbed, tasksDueEmbed } from './tasks/render';
 
-/** Keep this many of the most recent conversation rows when pruning. */
+/** Keep this many most-recent conversation rows per thread when pruning. */
 const CONVERSATION_PRUNE_KEEP = 400;
-const CONVERSATION_PRUNE_INTERVAL_MS = 24 * 3600 * 1000;
 
 /**
  * TasksDO holds all task-tracking state for the user. Mirrors FinanceDO in
@@ -90,9 +90,18 @@ export class TasksDO extends DurableObject<Env> {
     }
 
     if (url.pathname === '/fast-read') {
-      const interaction = (await request.json()) as Interaction;
-      const payload = this.handleFastRead(interaction);
-      return Response.json(payload);
+      // Wrap in try/catch so a SQL or schema error doesn't return a bare 500 to
+      // the Worker (and thus a silent "did not respond" to the user) — match
+      // the workout-do pattern.
+      try {
+        const interaction = (await request.json()) as Interaction;
+        const payload = this.handleFastRead(interaction);
+        return Response.json(payload);
+      } catch (err) {
+        console.error('tasks /fast-read failed', err);
+        await captureError(this.env, err, { source: 'tasks:fast-read' });
+        return Response.json({ content: `Something broke: ${(err as Error).message}` });
+      }
     }
 
     if (url.pathname === '/reset' && request.method === 'POST') {
@@ -157,7 +166,7 @@ export class TasksDO extends DurableObject<Env> {
 
     if (url.pathname === '/workflow/tasks/exec-tool' && request.method === 'POST') {
       const body = (await request.json()) as { name: string; args: any };
-      const result = executeTasksTool(body.name, body.args, { sql: this.sql });
+      const result = executeTasksTool(body.name, body.args, { sql: this.sql, timezone: this.env.TIMEZONE });
       return new Response(result, { headers: { 'content-type': 'text/plain' } });
     }
 
@@ -304,13 +313,10 @@ export class TasksDO extends DurableObject<Env> {
   }
 
   private maybePruneConversation(): void {
-    const now = Date.now();
-    if (now - this.lastConversationPruneAt < CONVERSATION_PRUNE_INTERVAL_MS) return;
-    this.lastConversationPruneAt = now;
-    this.sql.exec(
-      `DELETE FROM conversation
-        WHERE id NOT IN (SELECT id FROM conversation ORDER BY id DESC LIMIT ?)`,
-      CONVERSATION_PRUNE_KEEP
+    this.lastConversationPruneAt = maybePruneConversationByThread(
+      (sql, ...params) => this.sql.exec(sql, ...params),
+      this.lastConversationPruneAt,
+      CONVERSATION_PRUNE_KEEP,
     );
   }
 

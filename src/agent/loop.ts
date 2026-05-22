@@ -51,6 +51,10 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
   const { env, sql, userMessage, weekOf } = args;
   const client = makeClient(env);
 
+  // Read history BEFORE persisting the new user message — otherwise the
+  // just-inserted row + the explicit user append below would send the
+  // message to the model twice.
+  const history = recentConversation(sql, weekOf, 30);
   sql.exec(
     'INSERT INTO conversation (week_of, role, content, ts) VALUES (?, ?, ?, ?)',
     weekOf, 'user', userMessage, Date.now()
@@ -58,7 +62,7 @@ export async function runAgent(args: AgentArgs): Promise<AgentResult> {
 
   let messages: any[] = [
     { role: 'system', content: buildSystemPromptFor(sql, weekOf, env.TIMEZONE) },
-    ...recentConversation(sql, weekOf, 30),
+    ...history,
     { role: 'user', content: userMessage },
   ];
 

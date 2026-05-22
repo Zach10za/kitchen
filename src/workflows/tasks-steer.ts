@@ -11,37 +11,13 @@ import {
 } from '../runtime/agent-round';
 import { makeOpenAIClient } from '../runtime/openai';
 import { computeCost, formatUsd } from '../runtime/pricing';
+import { withTypingRefresh } from '../runtime/typing';
 import { TASKS_TOOLS } from '../tasks/tools';
 
 interface TasksSteerParams {
   userMessage: string;
   /** Channel id to post the reply into — always a thread channel id. */
   replyChannelId: string;
-}
-
-const TYPING_REFRESH_MS = 7_000;
-
-async function withTypingRefresh<T>(
-  discord: DiscordAPI,
-  channelId: string,
-  fn: () => Promise<T>,
-): Promise<T> {
-  let stopped = false;
-  const refresh = (async () => {
-    while (!stopped) {
-      await discord.postTyping(channelId).catch(() => {});
-      const start = Date.now();
-      while (!stopped && Date.now() - start < TYPING_REFRESH_MS) {
-        await new Promise((r) => setTimeout(r, 250));
-      }
-    }
-  })();
-  try {
-    return await fn();
-  } finally {
-    stopped = true;
-    await refresh.catch(() => {});
-  }
 }
 
 /**
@@ -97,9 +73,11 @@ export class TasksSteerWorkflow extends WorkflowEntrypoint<Env, TasksSteerParams
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const inputMessages = messages;
+      // retries:0 — see comment in steer.ts. Tool side effects make a
+      // round-level retry unsafe.
       const result: RoundResult = await step.do(
         `round-${round}`,
-        { retries: { limit: 2, delay: '2 seconds', backoff: 'linear' } },
+        { retries: { limit: 0, delay: '1 second', backoff: 'constant' } },
         async () => withTypingRefresh(discord, replyChannelId, () => this.runOneRound(inputMessages, threadId)),
       );
 
@@ -115,16 +93,23 @@ export class TasksSteerWorkflow extends WorkflowEntrypoint<Env, TasksSteerParams
       finalText = 'I got stuck in a tool loop. Try again with a simpler request.';
     }
 
+    // record-usage is observability — never let it block delivery (matches
+    // the workout-steer pattern; tasks was previously missing this guard).
     const turnTotals = await step.do('record-usage', async () => {
-      const res = await stub.fetch('https://internal/workflow/tasks/record-usage', {
-        method: 'POST',
-        body: JSON.stringify({
-          thread_id: threadId,
-          model: this.env.OPENAI_MODEL,
-          ...turnUsage,
-        }),
-      });
-      return (await res.json()) as { thread_total_usage: RoundUsage };
+      try {
+        const res = await stub.fetch('https://internal/workflow/tasks/record-usage', {
+          method: 'POST',
+          body: JSON.stringify({
+            thread_id: threadId,
+            model: this.env.OPENAI_MODEL,
+            ...turnUsage,
+          }),
+        });
+        if (!res.ok) return { thread_total_usage: turnUsage };
+        return (await res.json()) as { thread_total_usage: RoundUsage };
+      } catch {
+        return { thread_total_usage: turnUsage };
+      }
     });
 
     const turnCost = computeCost(turnUsage, this.env);
