@@ -169,11 +169,9 @@ export const TOOLS = [
       parameters: { type: 'object', properties: {} },
     },
   },
-  // ── OpenAI server-side built-ins ──────────────────────────────────────
-  // Executes on OpenAI's side; output appears in the response alongside our
-  // function calls and we echo it forward — no executor on our side. Cooking
-  // suggestions should lean on this heavily (recipes, techniques, seasonality).
-  { type: 'web_search' as const },
+  // No web_search: meal suggestions come from the model's own culinary
+  // knowledge. Live search added latency and citation/link noise (Discord
+  // unfurls cited URLs into preview images) for no real benefit here.
 ] as const;
 
 export type MealStatus = 'planned' | 'cooked' | 'skipped' | 'out';
