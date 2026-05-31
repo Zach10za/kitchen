@@ -84,7 +84,7 @@ Two key contracts live in `src/runtime/`:
 
 | Field | Type | When to use |
 |---|---|---|
-| `fillDefaultArgs` | `(toolName, parsed, scope) => any` | Backfill args the model often omits (kitchen uses this to inject `week_of` into meal-plan tools). |
+| `fillDefaultArgs` | `(toolName, parsed, scope) => any` | Backfill args the model often omits. Optional; no bot currently uses it. Return the parsed args unchanged for the no-op path. |
 
 ### Example: minimal spec
 
@@ -216,24 +216,13 @@ export function executeReadingTool(name: string, args: any, ctx: ReadingToolCtx)
 Tools may return either:
 
 - **`string`** — the simple case. The model gets the string as the tool's output.
-- **`{ output: string, usage?: RoundUsage }`** — for tools that make their own OpenAI calls and want their token spend folded into the round's reported usage (and thus the user-visible cost footer). Kitchen's `generate_draft` and `swap_meal` use this — they call the model internally to generate a week of meal stubs, and the cost shows up in the chat reply's footer.
+- **`{ output: string, usage?: RoundUsage }`** — for tools that make their own OpenAI calls and want their token spend folded into the round's reported usage (and thus the user-visible cost footer). Use this if a tool calls the model internally; the cost then shows up in the chat reply's footer.
 
 Use the structured form when your tool calls OpenAI directly. Use the plain string otherwise.
 
 ### `fillDefaultArgs` (optional)
 
-If your tools commonly need an arg the model forgets, supply `fillDefaultArgs` on the spec. Kitchen uses this to inject `week_of` into meal-plan tools whose schema declares it required:
-
-```ts
-fillDefaultArgs: (toolName, parsed, scope) => {
-  if (scope.column !== 'week_of') return parsed;
-  if ('week_of' in parsed) return parsed;
-  if (!needsWeekOf(toolName)) return parsed;
-  return { ...parsed, week_of: scope.value };
-},
-```
-
-This runs after JSON parsing and before `executeTool`, so your tools never see an undefined `week_of`.
+If your tools commonly need an arg the model forgets, supply `fillDefaultArgs` on the spec to backfill it after JSON parsing and before `executeTool`. Return the parsed args unchanged for the no-op path (never `undefined`). No bot currently needs it — it's a hook for future bots whose tool schemas declare a required arg the model tends to omit.
 
 ---
 
@@ -260,24 +249,19 @@ export function buildReadingSystemPrompt(sql: SqlStorage, timezone: string): str
 }
 ```
 
-The scope argument is mostly useful when conversation is week-scoped (kitchen) — for thread-scoped bots you can usually ignore it.
+The scope argument is rarely needed — every bot is thread-scoped today, so you can usually ignore it.
 
 ---
 
 ## Conversation scope
 
-Each bot picks how to partition conversation history. Two choices:
+Conversation history is partitioned by `thread_id`: each Discord thread (or, for a bot's proactive top-level posts, the channel id used as the scope value) is its own context. All four bots use this.
 
-| Column | Meaning | Used by |
-|---|---|---|
-| `thread_id` | Each Discord thread is its own context | finance, tasks, workout |
-| `week_of` | Each ISO Monday string is its own context | kitchen |
+```ts
+defaultScope: (_env, replyChannelId) => ({ column: 'thread_id', value: replyChannelId }),
+```
 
-If a single Discord thread legitimately spans multiple contexts (kitchen's case: the same thread carries messages about this week and next week as Monday rolls past), use `week_of`. Otherwise use `thread_id`.
-
-The `column` field is a typed enum, so the base class can safely inline it into SQL.
-
-`defaultScope(env, replyChannelId)` is called from the worker relay path (no SQL access). The DO's slash-command path may override the scope when dispatching from `dispatchCommand` — see `KitchenDO.dispatchCommand` for an example.
+The `column` field is a typed enum (currently just `'thread_id'`), so the base class can safely inline it into SQL. `defaultScope(env, replyChannelId)` is called from the worker relay path; a DO's slash-command path may pass an explicit scope when dispatching from `dispatchCommand`.
 
 ---
 
@@ -364,10 +348,10 @@ You can override any of these in your subclass:
 |---|---|---|
 | `dispatchCommand(interaction)` | abstract — must implement | Route slash commands to chat, in-process flows, etc. |
 | `onHeartbeat()` | no-op | Hourly cron work: refreshing data, dispatching reminders, re-arming alarms. |
-| `handleCustomRoute(request, url)` | returns null | Add bot-specific endpoints not covered by the base (kitchen has `/ensure-alarm`, `/get-grocery`, `/workflow/load-draft`, etc.). Return null if the path isn't yours. |
-| `onReset()` | no-op | Post-cleanup after the base wipes `resetTables`. Kitchen uses it to re-arm the weekly draft alarm. |
+| `handleCustomRoute(request, url)` | returns null | Add bot-specific endpoints not covered by the base (kitchen has `/ensure-alarm`). Return null if the path isn't yours. |
+| `onReset()` | no-op | Post-cleanup after the base wipes `resetTables`. Kitchen uses it to re-arm the daily suggestion alarm. |
 | `customDump()` | empty object | Extend the `/dump` payload with bot-specific snapshots. |
-| `alarm()` | none (DurableObject method) | Add if you want a scheduled alarm. Kitchen uses it for the weekly draft. |
+| `alarm()` | none (DurableObject method) | Add if you want a scheduled alarm. Kitchen uses it for the daily dinner-suggestion ping. |
 
 ### Helpers available on the base
 
@@ -538,7 +522,7 @@ If your bot is shaped like kitchen, you'll need more overrides. Reference: `src/
 
 ### Scheduled work (alarms)
 
-Add an `alarm()` method on your DO and override `onHeartbeat()` to call `this.ensureAlarmSet()`. Kitchen uses this for the weekly draft.
+Add an `alarm()` method on your DO and override `onHeartbeat()` to call `this.ensureAlarmSet()`. Kitchen uses this for its daily dinner-suggestion ping.
 
 ```ts
 async alarm(): Promise<void> {
@@ -546,19 +530,19 @@ async alarm(): Promise<void> {
     // do your scheduled work
   } finally {
     // Re-arm so this fires again. Define your own helper — kitchen's is
-    // `armNextDraft()`, computed from `nextDraftTime()`.
-    await this.armNextDraft();
+    // `armNextSuggest()`, computed from `nextDailyTime()`.
+    await this.armNextSuggest();
   }
 }
 ```
 
 ### Custom routes beyond the base
 
-Override `handleCustomRoute(request, url)` to add endpoints. Return `null` if the path isn't yours. Kitchen uses this for `/ensure-alarm`, `/get-grocery`, `/clear-grocery`, and the `/workflow/load-draft` family that `ApproveWorkflow` calls.
+Override `handleCustomRoute(request, url)` to add endpoints. Return `null` if the path isn't yours. Kitchen uses this only for `/ensure-alarm`.
 
-### In-process agent flows (bypassing the chat workflow)
+### In-process flows (bypassing the chat workflow)
 
-Some commands don't need conversation history — single-shot LLM calls that just write to SQL. Kitchen's `/draft` and `/pantry message: ...` use `runDraftFlow` and `runPantryFlow` directly from `dispatchCommand` instead of routing through `AgentChatWorkflow`. The pattern:
+Some commands don't need conversation history — single-shot LLM calls that just write to SQL. Kitchen's `/pantry message: ...` uses `runPantryFlow` directly from `dispatchCommand` (one structured-extraction call) instead of routing through `AgentChatWorkflow`. The pattern:
 
 ```ts
 if (commandName === 'pantry' && optionMap.message) {
@@ -568,28 +552,11 @@ if (commandName === 'pantry' && optionMap.message) {
 }
 ```
 
-Use this when the agent loop is overkill — single-call extraction or single-call generation.
+Use this when the agent loop is overkill — single-call extraction. Everything else (`/cook`, `/now`, `/profile`, `/chat`) routes through `dispatchChatInteraction`.
 
 ### Tools that call OpenAI
 
-When a tool needs `ctx.client`, take the full `ToolExecCtx` from the spec — kitchen's tool ctx is `{ env, sql, client }`. The base passes a per-call client with a 60s timeout. Tools that call OpenAI should return the structured `{ output, usage }` shape so their spend folds into the round footer.
-
-### Conversation scope: kitchen-style `week_of`
-
-When your domain has a natural partition that isn't 1:1 with Discord threads, use `week_of`-style scoping. Your `conversation` schema needs the column:
-
-```sql
-CREATE TABLE conversation (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  week_of TEXT,  -- or whatever your partition key is named
-  role TEXT NOT NULL,
-  content TEXT NOT NULL,
-  tool_call_json TEXT,
-  ts INTEGER NOT NULL
-);
-```
-
-The `ConversationScope.column` enum currently allows `'thread_id' | 'week_of'`. If your bot needs a third option, extend the union in `runtime/bot-spec.ts` — the base SQL inlining is safe because the column is a typed enum, not a string.
+When a tool needs `ctx.client`, take the full `ToolExecCtx` from the spec — e.g. `{ env, sql, client }`. The base passes a per-call client with a 60s timeout. Tools that call OpenAI should return the structured `{ output, usage }` shape so their spend folds into the round footer. (Kitchen's tools are now pure SQL and return plain strings.)
 
 ---
 

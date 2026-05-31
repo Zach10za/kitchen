@@ -5,51 +5,104 @@ import { ensureRelayRateSchema } from '../runtime/relay-rate-limit';
 import { ensureUsageSchema } from '../runtime/usage';
 import { TOOLS as KITCHEN_TOOLS } from '../agent/tools';
 import { executeTool as runKitchenTool } from '../agent/loop';
-import { buildSystemPromptFor, findActiveWeek } from '../agent/context';
-import { needsWeekOf } from '../agent/round';
-import { planEmbed, statusEmbed } from '../agent/render';
-import { currentOrNextMondayISO } from '../util/datetime';
+import { buildSystemPromptFor } from '../agent/context';
+import { statusEmbed } from '../agent/render';
 import type { ReminderRow } from '../kitchen-do';
 
+// DDL hoisted to module-scope constants so the multi-statement schema is
+// passed to sql.exec() by reference (keeps each migration body readable).
+const SCHEMA_V1_DDL = `
+  CREATE TABLE IF NOT EXISTS weeks (
+    week_of TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'draft',
+    meals_json TEXT NOT NULL DEFAULT '[]',
+    constraints_json TEXT NOT NULL DEFAULT '[]',
+    drafted_at INTEGER NOT NULL,
+    approved_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS conversation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    week_of TEXT,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tool_call_json TEXT,
+    ts INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS preferences (
+    id TEXT PRIMARY KEY,
+    insight TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    weight INTEGER NOT NULL DEFAULT 5,
+    learned_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS pantry (
+    name TEXT PRIMARY KEY,
+    qty TEXT,
+    added_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS grocery_lists (
+    week_of TEXT PRIMARY KEY,
+    items_json TEXT NOT NULL,
+    generated_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    due_at INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    week_of TEXT,
+    day TEXT,
+    message TEXT NOT NULL,
+    sent_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_reminders_due
+    ON reminders(due_at) WHERE sent_at IS NULL;
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+`;
+
+const SCHEMA_V6_MEALS_DDL = `
+  CREATE TABLE IF NOT EXISTS meals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    name TEXT,
+    cuisine TEXT,
+    description TEXT,
+    ingredients_json TEXT,
+    steps_json TEXT,
+    requires_defrost_json TEXT,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_meals_date ON meals(date);
+`;
+
 /**
- * Kitchen bot spec. Differs from the other three bots in two ways:
- *  - Conversation is partitioned by `week_of`, not `thread_id`.
- *  - Tools may call OpenAI internally (generate_draft, swap_meal) and return
- *    `{ output, usage }` so their token spend folds into the round footer.
+ * Kitchen bot spec. Daily-first: the agent suggests dinner for today and records
+ * a decision only when the user makes one. Conversation is partitioned by
+ * `thread_id` like the other bots — there is no weekly plan, so no week scoping.
  */
 export const KITCHEN_SPEC: BotSpec = {
   id: 'kitchen',
   channelEnvKey: 'DISCORD_CHANNEL_ID',
   commands: new Set([
-    // Kitchen historically owns /chat as the catch-all chat command for the
-    // household. `botForCommand` in bot-registry uses Kitchen as the fallback
-    // when a command isn't listed in any other bot's set.
-    'plan', 'draft', 'chat', 'now', 'pantry', 'profile',
-    'approve', 'grocery', 'reminders',
+    // Kitchen owns /chat as the catch-all chat command for the household.
+    // `botForCommand` in bot-registry uses Kitchen as the fallback when a
+    // command isn't listed in any other bot's set.
+    'cook', 'chat', 'now', 'pantry', 'profile', 'reminders',
   ]),
   tools: KITCHEN_TOOLS,
-  // Order matters: drop user data tables, preserve `settings` (which holds
-  // schema_version + cooking_profile + other config keys). KitchenDO overrides
-  // onReset() to re-arm the weekly draft alarm.
-  resetTables: ['weeks', 'conversation', 'pantry', 'preferences', 'grocery_lists', 'reminders'],
-  scopeColumn: 'week_of',
+  // Drop user data tables, preserve `settings` (schema_version + cooking_profile).
+  // KitchenDO overrides onReset() to re-arm the daily suggestion alarm.
+  resetTables: ['meals', 'conversation', 'pantry', 'preferences', 'reminders'],
+  scopeColumn: 'thread_id',
 
-  buildSystemPrompt: (sql, env, scope) => {
-    // Kitchen's prompt is week-scoped. Scope value IS the week_of identifier;
-    // relay paths default to currentOrNextMondayISO via defaultScope() below.
-    const weekOf = scope.column === 'week_of' ? scope.value : currentOrNextMondayISO(env.TIMEZONE);
-    return buildSystemPromptFor(sql, weekOf, env.TIMEZONE);
-  },
+  buildSystemPrompt: (sql, env) => buildSystemPromptFor(sql, env.TIMEZONE),
 
-  executeTool: async (name, args, ctx) =>
+  executeTool: (name, args, ctx) =>
     runKitchenTool(name, args, { env: ctx.env, sql: ctx.sql, client: ctx.client }),
-
-  fillDefaultArgs: (toolName, parsed, scope) => {
-    if (scope.column !== 'week_of') return parsed;
-    if ('week_of' in parsed) return parsed;
-    if (!needsWeekOf(toolName)) return parsed;
-    return { ...parsed, week_of: scope.value };
-  },
 
   fastRead: (sql, _env, interaction): MessagePayload | null => {
     const cmd = interaction.data?.name ?? '';
@@ -70,18 +123,6 @@ export const KITCHEN_SPEC: BotSpec = {
         description: row.value.length > 4096 ? row.value.slice(0, 4093) + '…' : row.value,
         color: EmbedColor.inProgress,
       }] };
-    }
-
-    if (cmd === 'plan') {
-      const week = findActiveWeek(sql);
-      if (!week) {
-        return { embeds: [statusEmbed({
-          title: '🍴 No active plan',
-          description: 'No plan in the last 14 days. Use `/chat message: make a plan` to create one.',
-          color: EmbedColor.archived,
-        })] };
-      }
-      return { embeds: [planEmbed(week, { includeFooterHint: true })] };
     }
 
     if (cmd === 'pantry') {
@@ -141,79 +182,17 @@ export const KITCHEN_SPEC: BotSpec = {
       }] };
     }
 
-    // /grocery is intentionally NOT a fast-read — sometimes large enough to
-    // warrant the deferred + follow-up path; KitchenDO handles it directly.
-
     return null;
   },
 
-  /** Default for relay-path messages (no SQL access in the worker).
-   *  Slash-command paths have SQL and may override with findActiveWeek before
-   *  dispatching, so the agent sees the slice of history relevant to the
-   *  currently-active plan. */
-  defaultScope: (env, _replyChannelId) => ({
-    column: 'week_of',
-    value: currentOrNextMondayISO(env.TIMEZONE),
+  /** Relay + slash-command chat both land in the reply thread's own context. */
+  defaultScope: (_env, replyChannelId) => ({
+    column: 'thread_id',
+    value: replyChannelId,
   }),
 
-  // Migrations preserved verbatim from kitchen-do.ts (versions 1-5).
   migrations: [
-    {
-      version: 1,
-      up: (sql) => {
-        sql.exec(`
-          CREATE TABLE IF NOT EXISTS weeks (
-            week_of TEXT PRIMARY KEY,
-            status TEXT NOT NULL DEFAULT 'draft',
-            meals_json TEXT NOT NULL DEFAULT '[]',
-            constraints_json TEXT NOT NULL DEFAULT '[]',
-            drafted_at INTEGER NOT NULL,
-            approved_at INTEGER
-          );
-          CREATE TABLE IF NOT EXISTS conversation (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            week_of TEXT,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            tool_call_json TEXT,
-            ts INTEGER NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS preferences (
-            id TEXT PRIMARY KEY,
-            insight TEXT NOT NULL,
-            rationale TEXT NOT NULL,
-            weight INTEGER NOT NULL DEFAULT 5,
-            learned_at INTEGER NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS pantry (
-            name TEXT PRIMARY KEY,
-            qty TEXT,
-            added_at INTEGER NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS grocery_lists (
-            week_of TEXT PRIMARY KEY,
-            items_json TEXT NOT NULL,
-            generated_at INTEGER NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS reminders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            due_at INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            week_of TEXT,
-            day TEXT,
-            message TEXT NOT NULL,
-            sent_at INTEGER
-          );
-          CREATE INDEX IF NOT EXISTS idx_reminders_due
-            ON reminders(due_at) WHERE sent_at IS NULL;
-          CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at INTEGER NOT NULL
-          );
-        `);
-      },
-    },
+    { version: 1, up: (sql) => { sql.exec(SCHEMA_V1_DDL); } },
     {
       // Freezer-tracking columns on pantry. SQLite has no native "ADD COLUMN IF
       // NOT EXISTS" so we introspect via pragma_table_info.
@@ -236,7 +215,6 @@ export const KITCHEN_SPEC: BotSpec = {
       },
     },
     {
-      // Index for unbounded conversation table + the prune helper that runs hourly.
       version: 3,
       up: (sql) => {
         sql.exec(
@@ -246,5 +224,25 @@ export const KITCHEN_SPEC: BotSpec = {
     },
     { version: 4, up: (sql) => ensureRelayRateSchema(sql) },
     { version: 5, up: (sql) => ensureUsageSchema(sql) },
+    {
+      // Daily-first pivot: drop the weekly plan + grocery tables, add `meals`
+      // (one decided dish or no-cook night per date) + a thread_id column on
+      // conversation so kitchen scopes like the other bots. Existing week-scoped
+      // conversation rows are left in place — week_of is simply no longer read.
+      version: 6,
+      up: (sql) => {
+        sql.exec('DROP TABLE IF EXISTS weeks');
+        sql.exec('DROP TABLE IF EXISTS grocery_lists');
+        sql.exec(SCHEMA_V6_MEALS_DDL);
+        const cols = sql
+          .exec<{ name: string }>('SELECT name FROM pragma_table_info(?)', 'conversation')
+          .toArray()
+          .map((r) => r.name);
+        if (!cols.includes('thread_id')) {
+          sql.exec('ALTER TABLE conversation ADD COLUMN thread_id TEXT');
+          sql.exec('CREATE INDEX IF NOT EXISTS idx_conversation_thread ON conversation(thread_id, id DESC)');
+        }
+      },
+    },
   ],
 };

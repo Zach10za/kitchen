@@ -1,19 +1,19 @@
 # Kitchen
 
-A meal-planning agent that lives in your Discord. No app to open, no UI to maintain.
+A daily cooking assistant that lives in your Discord. No app to open, no UI to maintain.
 
-The bot drafts a plan every Friday evening, you steer it in chat (slash commands or plain messages), approve when ready, and a grocery list gets posted automatically. During the week you can ask "what now?" for prep instructions, update the pantry as you cook, and get defrost/prep reminders pushed to the channel.
+Ask "what should I cook today?" and the bot suggests 2–3 dishes drawn from what's actually in your pantry and freezer, your dietary profile, and what you've eaten recently — with a short "need to buy" line for anything missing. Every day at noon it proactively pings you with options, *unless you've already decided* (picked a meal or said it's a date-night / takeout day). Pick one and it saves the recipe, schedules defrost reminders, and decrements your pantry when you cook it. No rigid weekly plan to maintain.
 
 ## Architecture
 
 - **Cloudflare Worker** — Discord interaction webhook + cron heartbeat + admin endpoints
-- **Durable Object (`KitchenDO`)** — household state in SQLite, weekly draft alarm, due-reminder dispatch, relay rate limiting
-- **Cloudflare Workflows** — `ApproveWorkflow` and `SteerWorkflow` run multi-step LLM flows past the Worker CPU budget with per-step retries
+- **Durable Object (`KitchenDO`)** — household state in SQLite, daily suggestion alarm, due-reminder dispatch, relay rate limiting
+- **Cloudflare Workflow (`AgentChatWorkflow`)** — runs the multi-step LLM tool-loop past the Worker CPU budget with per-step retries; one class serves every bot
 - **OpenAI via Cloudflare AI Gateway** — three model tiers (planner / extract / fast) routed through one gateway for caching + observability
 - **Fly.io gateway relay** (`gateway-relay/`) — tiny always-on VM holding the Discord Gateway WebSocket, so plain chat messages (no slash command) reach the Worker via signed HTTPS
 - **Auto error triage** — exceptions are fingerprinted, deduped, and filed as labeled GitHub issues; no hosted tracker
 
-That's the whole thing — about 4.4k lines of TypeScript, no database, no frontend.
+No database, no frontend.
 
 ## One-time setup
 
@@ -66,7 +66,7 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/plan`, `/draft`, `/chat`, `/now`, `/pantry`, `/profile`, `/approve`, `/grocery`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
+You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
 
 ### 6. Deploy the Worker
 
@@ -82,7 +82,7 @@ bunx wrangler secret put DISCORD_PUBLIC_KEY
 bunx wrangler secret put DISCORD_BOT_TOKEN
 bunx wrangler secret put DISCORD_APP_ID
 bunx wrangler secret put DISCORD_GUILD_ID
-bunx wrangler secret put DISCORD_CHANNEL_ID
+bunx wrangler secret put DISCORD_CHANNEL_ID         # channel the kitchen bot posts daily dinner suggestions to
 bunx wrangler secret put DISCORD_FINANCE_CHANNEL_ID  # optional; enables finance bot
 bunx wrangler secret put DISCORD_TASKS_CHANNEL_ID    # optional; enables tasks bot
 bunx wrangler secret put DISCORD_WORKOUT_CHANNEL_ID   # optional; enables workout bot
@@ -93,7 +93,7 @@ bunx wrangler secret put ADMIN_TOKEN      # bearer for /admin/* endpoints
 bunx wrangler secret put GITHUB_TOKEN     # fine-grained PAT, Issues:write on the repo (optional; enables auto error triage)
 ```
 
-Public vars (model IDs, draft schedule, timezone, repo, rate limit) live in `wrangler.jsonc` under `vars` and can be edited directly.
+Public vars (model IDs, `SUGGEST_HOUR_LOCAL`, `DINNER_HOUR_LOCAL`, timezone, repo, rate limit) live in `wrangler.jsonc` under `vars` and can be edited directly.
 
 ### 7. Point Discord at your Worker
 
@@ -122,33 +122,35 @@ The 256 MB shared-CPU VM in `fly.toml` is plenty — it's just a WebSocket clien
 
 ### 9. Arm the alarm
 
-The hourly cron arms the DO's weekly draft alarm on its first tick. To force it now:
+The hourly cron arms the DO's daily suggestion alarm on its first tick. To force it now:
 
 ```bash
-curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+curl -X GET -H "Authorization: Bearer $ADMIN_TOKEN" \
   https://kitchen.<your-subdomain>.workers.dev/admin/dump
 # Any DO call wakes the instance and arms the alarm.
 ```
 
-Or just wait — the next Friday 6pm in `America/Los_Angeles` (configurable via `DRAFT_DAY` / `DRAFT_HOUR_LOCAL` / `TIMEZONE`) you'll get a draft.
+Or just wait — at the next noon in `America/Los_Angeles` (hour configurable via `SUGGEST_HOUR_LOCAL` / `TIMEZONE`) you'll get dinner suggestions, unless you've already decided that day.
 
 ## Day-to-day usage
 
 In your Discord channel, either slash commands:
 
 ```
-/plan                    show the current plan
-/draft notes:<optional>  generate a fresh plan for next week (~10–15s, live progress)
-/chat message:swap tue for something with the salmon, and thu needs to be 20 min
-/now                     what should I be cooking right now?
+/cook                       suggest 2–3 dinners from what you have right now
+/cook message:salmon, 20min suggest around given ingredients / constraints
+/chat message:I'll make the salmon one — and log that I cooked it
+/now                        what should I be doing in the kitchen right now? (or tonight's options)
 /pantry message:bought salmon, bok choy, scallions
-/pantry                  (no message) show current pantry
+/pantry                     (no message) show current pantry
 /profile message:I have a wok and don't eat pork
-/profile                 (no message) show current profile
-/approve                 lock in the plan and post a grocery list
-/grocery                 reshow the grocery list
-/reminders               show upcoming defrost/prep reminders
+/profile                    (no message) show current profile
+/reminders                  show upcoming defrost/prep reminders
 ```
+
+Tell the bot you're not cooking ("date night tonight", "ordering in") and it records a
+no-cook day — silencing that day's noon ping. Say you made a dish and it logs the recipe
+and decrements your pantry.
 
 In your `#finance` channel:
 
@@ -192,7 +194,7 @@ The bot reads four kinds of context on every reply:
 
 …or just talk in any channel. The Fly.io relay forwards messages to the right bot based on channel ID, so plain messages work without slash commands. Per-channel rate limit: `RELAY_RATE_LIMIT_PER_HOUR` (default 30/hr) prevents unbounded LLM spend.
 
-The kitchen bot learns from every steering conversation. After a few weeks the drafts arrive ~80% of the way there.
+The kitchen bot learns from every conversation. As it records preferences (cuisines you reject, your cooking cadence) the daily suggestions get sharper.
 
 ## Local development
 
@@ -211,8 +213,6 @@ All gated on `Authorization: Bearer $ADMIN_TOKEN` (separate from the bot token s
 ```
 GET  /admin/dump                       full DO state JSON (?bot=kitchen|finance|tasks|workout)
 POST /admin/reset                      wipe DO state (?bot=kitchen|finance|tasks|workout)
-GET  /admin/grocery?week_of=YYYY-MM-DD
-POST /admin/clear-grocery?week_of=YYYY-MM-DD
 POST /admin/finance/sync               force SimpleFin pull
 ```
 
@@ -222,19 +222,17 @@ POST /admin/finance/sync               force SimpleFin pull
 src/
   index.ts                 Worker entry: routes /interactions, /relay/message, /admin/*
   env.ts                   Env binding types
-  kitchen-do.ts            Durable Object: SQLite state + alarm + reminder dispatch + rate limit
+  kitchen-do.ts            Durable Object: SQLite state + daily alarm + reminder dispatch + rate limit
   finance-do.ts            Durable Object: accounts + transactions + conversation
   tasks-do.ts              Durable Object: tasks + dependencies + conversation
   workout-do.ts            Durable Object: exercises + workouts + sets + programs + conversation
   error-triage.ts          Capture → fingerprint → dedupe → file GitHub issue
   agent/
-    loop.ts                OpenAI tool-use loop + tool implementations
+    loop.ts                Tool implementations (log/cook/pantry/profile) + fast pantry flow
     tools.ts               Tool schemas (the agent's API surface)
-    schemas.ts             JSON schemas for structured-output extraction
     prompts.ts             System prompt builder
-    context.ts             Builds per-command system prompts from DO state
-    render.ts              Plan / recipe / grocery list → Discord embeds
-    round.ts               Servings rounding helpers
+    context.ts             Loads pantry/profile/recent-meals/today-decision into the prompt
+    render.ts              Recipe → Discord embed
   finance/
     loop.ts                Finance tool implementations
     tools.ts               Finance tool schemas
@@ -258,11 +256,7 @@ src/
     api.ts                 Discord REST helpers
     types.ts               Minimal interaction + embed types
   workflows/
-    approve.ts             ApproveWorkflow: per-recipe shopping → combined grocery list
-    steer.ts               SteerWorkflow: chat-driven plan edits with progress updates
-    finance-steer.ts       FinanceSteerWorkflow: finance agent conversation
-    tasks-steer.ts         TasksSteerWorkflow: tasks agent conversation
-    workout-steer.ts       WorkoutSteerWorkflow: workout agent conversation
+    agent-chat.ts          AgentChatWorkflow: one chat tool-loop serving every bot, parameterized by botId
   runtime/
     agent-round.ts         Shared OpenAI Responses-API tool-call loop
     bot-registry.ts        Channel-to-bot routing (kitchen / finance / tasks / workout)
@@ -272,7 +266,7 @@ src/
     relay-rate-limit.ts    Per-channel rolling-window rate limit
     usage.ts               Per-bot cost tracking
   util/
-    datetime.ts            Timezone math (next-Monday, draft alarm time, cook time)
+    datetime.ts            Timezone math (today's local date, next daily alarm time)
 gateway-relay/
   index.ts                 Discord Gateway WebSocket client → HTTPS forwarder
   fly.toml, Dockerfile     Fly.io deployment
@@ -291,7 +285,7 @@ Workers Logs and Workers Traces are both enabled at `head_sampling_rate: 1` (100
 ## What's NOT here (yet)
 
 - Voice (Cloudflare Voice Agents could replace `/now` with a phone call)
-- Email export (Cloudflare Email Service for the grocery list)
+- Email export (Cloudflare Email Service for a night's shopping list)
 - Pantry receipt parsing (forward Instacart receipts to an inbound email address)
 - Multi-household / sharing (single-tenant; one DO named `default-household`)
 

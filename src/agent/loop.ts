@@ -1,387 +1,128 @@
 import type OpenAI from 'openai';
 import type { Env } from '../env';
 import type {
-  Day,
-  MealSlot,
-  MealStub,
+  DefrostEntry,
+  MealRow,
   PantryItem,
-  PreferenceRow,
+  RecipeIngredient,
 } from './tools';
-import { planEmbed } from './render';
 import { EmbedColor } from '../discord/types';
-import {
-  buildSystemPromptFor,
-  loadPantry,
-  loadPreferences,
-  loadProfile,
-  loadWeek,
-} from './context';
-import { MAX_TOOL_ROUNDS, runAgentRound } from './round';
-import type { WeekRow } from '../kitchen-do';
+import { loadDayDecision, loadPantry, loadProfile, loadRecentMeals } from './context';
+import type { ToolResult } from '../runtime/agent-round';
 import type { DiscordAPI } from '../discord/api';
 import { makeOpenAIClient } from '../runtime/openai';
-import {
-  emptyUsage,
-  addUsage,
-  type RoundUsage,
-  type ToolResult,
-} from '../runtime/agent-round';
 import { extractUsageFromResponse, recordUsage, costFooter } from '../runtime/usage';
-
-interface AgentArgs {
-  env: Env;
-  sql: SqlStorage;
-  userMessage: string;
-  weekOf: string;
-}
-
-export interface AgentResult {
-  summary: string;
-  /** Aggregated token + tool usage across every LLM call this turn —
-   *  including tool-internal calls (generate_draft, swap_meal). Callers
-   *  pass this to recordUsage + costFooter for the user-visible footer. */
-  usage: RoundUsage;
-}
-
-/**
- * Run one turn of the agent: append user message, loop Responses API tool
- * calls, persist conversation + tool results, return final assistant text.
- */
-export async function runAgent(args: AgentArgs): Promise<AgentResult> {
-  const { env, sql, userMessage, weekOf } = args;
-  const client = makeClient(env);
-
-  // Read history BEFORE persisting the new user message — otherwise the
-  // just-inserted row + the explicit user append below would send the
-  // message to the model twice.
-  const history = recentConversation(sql, weekOf, 30);
-  sql.exec(
-    'INSERT INTO conversation (week_of, role, content, ts) VALUES (?, ?, ?, ?)',
-    weekOf, 'user', userMessage, Date.now()
-  );
-
-  let messages: any[] = [
-    { role: 'system', content: buildSystemPromptFor(sql, weekOf, env.TIMEZONE) },
-    ...history,
-    { role: 'user', content: userMessage },
-  ];
-
-  const ctx: ToolCtx = { env, sql, client };
-  let usage: RoundUsage = emptyUsage();
-
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const result = await runAgentRound({
-      client,
-      model: env.OPENAI_MODEL,
-      messages,
-      weekOf,
-      executeTool: (name, parsed) => executeTool(name, parsed, ctx),
-      onToolCall: async ({ name, args: parsed, output }) => {
-        sql.exec(
-          'INSERT INTO conversation (week_of, role, content, tool_call_json, ts) VALUES (?, ?, ?, ?, ?)',
-          weekOf, 'tool', output,
-          JSON.stringify({ name, args: parsed }),
-          Date.now()
-        );
-      },
-    });
-
-    messages = result.newMessages;
-    usage = addUsage(usage, result.usage);
-
-    if (result.type === 'final') {
-      const finalText = result.finalText ?? '(no text)';
-      sql.exec(
-        'INSERT INTO conversation (week_of, role, content, ts) VALUES (?, ?, ?, ?)',
-        weekOf, 'assistant', finalText, Date.now()
-      );
-      return { summary: finalText, usage };
-    }
-  }
-
-  return {
-    summary: 'I got stuck in a tool loop. Try again with a simpler request.',
-    usage,
-  };
-}
-
-function makeClient(env: Env): OpenAI {
-  // 3 min per call lets gpt-5 take its time on hard tasks (grocery list
-  // transformation, complex tool decisions) without falsely aborting.
-  return makeOpenAIClient(env);
-}
+import { todayISO, localDateAtHour } from '../util/datetime';
 
 export interface ToolCtx { env: Env; sql: SqlStorage; client: OpenAI }
 
-/** Conversation history shaped for the Responses API `input` array. */
-function recentConversation(
-  sql: SqlStorage,
-  weekOf: string,
-  limit: number
-): { role: 'user' | 'assistant'; content: string }[] {
-  const rows = sql.exec<{ role: string; content: string }>(
-    'SELECT role, content FROM conversation WHERE week_of = ? AND role IN (?, ?) ORDER BY id DESC LIMIT ?',
-    weekOf, 'user', 'assistant', limit
-  ).toArray();
-  return rows.reverse().map((r) => ({
-    role: r.role as 'user' | 'assistant',
-    content: r.content,
-  }));
-}
+const INSERT_MEAL_SQL =
+  'INSERT INTO meals (date, name, cuisine, description, ingredients_json, steps_json, requires_defrost_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
 
-export async function executeTool(name: string, args: any, ctx: ToolCtx): Promise<ToolResult> {
+/**
+ * Tool dispatch for the kitchen bot. Invoked by the unified AgentChatWorkflow
+ * via `KITCHEN_SPEC.executeTool`. All tools are pure SQL (no internal LLM
+ * calls) so they return plain strings.
+ */
+export function executeTool(name: string, args: any, ctx: ToolCtx): ToolResult {
   try {
     switch (name) {
-      // LLM-using tools — return ToolResult so their token spend rolls into
-      // the round's reported usage. Without this the footer would show only
-      // the wrapper LLM's cost and miss the recipe/swap generations.
-      case 'generate_draft':        return await toolGenerateDraft(args, ctx);
-      case 'swap_meal':             return await toolSwapMeal(args, ctx);
-      // Pure SQL tools — string return is fine.
-      case 'adjust_servings':       return toolAdjustServings(args, ctx);
-      case 'reschedule_meal':       return toolRescheduleMeal(args, ctx);
-      case 'update_pantry':         return toolUpdatePantry(args, ctx);
-      case 'record_preference':     return toolRecordPreference(args, ctx);
-      case 'mark_meal_cooked':      return toolMarkMealCooked(args, ctx);
-      case 'mark_meal_skipped':     return toolMarkMealSkipped(args, ctx);
-      case 'update_profile':        return toolUpdateProfile(args, ctx);
-      case 'show_profile':          return toolShowProfile(ctx);
-      case 'show_state':            return toolShowState(args, ctx);
-      default:                      return `Unknown tool: ${name}`;
+      case 'log_meal':          return toolLogMeal(args, ctx);
+      case 'set_no_cook':       return toolSetNoCook(args, ctx);
+      case 'mark_meal_cooked':  return toolMarkMealCooked(args, ctx);
+      case 'mark_meal_skipped': return toolMarkMealSkipped(args, ctx);
+      case 'update_pantry':     return toolUpdatePantry(args, ctx);
+      case 'record_preference': return toolRecordPreference(args, ctx);
+      case 'update_profile':    return toolUpdateProfile(args, ctx);
+      case 'show_profile':      return toolShowProfile(ctx);
+      case 'show_state':        return toolShowState(ctx);
+      default:                  return `Unknown tool: ${name}`;
     }
   } catch (err) {
     return `Tool ${name} failed: ${(err as Error).message}`;
   }
 }
 
-const STUB_SCHEMA = {
-  type: 'object',
-  properties: {
-    name: { type: 'string', description: 'Real, well-known dish name' },
-    description: { type: 'string', description: 'One-line summary, ~10-15 words' },
-    cuisine: { type: 'string', description: 'e.g. italian, thai, mexican, american' },
-    active_minutes: { type: 'integer' },
-    total_minutes: { type: 'integer' },
-    effort: { type: 'string', enum: ['easy', 'medium', 'hard'] },
-  },
-  required: ['name', 'description', 'cuisine', 'active_minutes', 'total_minutes', 'effort'],
-  additionalProperties: false,
-};
+// ─── meal decisions ───────────────────────────────────────────────────────
 
-const WEEK_STUBS_SCHEMA = {
-  type: 'object',
-  properties: {
-    meals: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          day: { type: 'string', enum: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] },
-          ...STUB_SCHEMA.properties,
-        },
-        required: ['day', ...STUB_SCHEMA.required],
-        additionalProperties: false,
-      },
-    },
-  },
-  required: ['meals'],
-  additionalProperties: false,
-};
-
-/** One LLM call generates all 7 stubs as a coherent week. */
-async function generateWeekStubs(
-  ctx: ToolCtx,
-  args: { prefs: PreferenceRow[]; pantry: PantryItem[]; constraints: string[] }
-): Promise<{ stubs: (MealStub & { day: Day })[]; usage: RoundUsage }> {
-  const response = await ctx.client.responses.create({
-    model: ctx.env.OPENAI_MODEL,
-    input: [
-      {
-        role: 'system',
-        content: 'You plan a 7-day dinner menu (Mon-Sun) for two adults. Pick real, well-known dishes. Vary cuisines and proteins across the week. Default to ~30 min weeknights (Mon-Fri) and one ~45-75 min "project" meal on a weekend. Use pantry ingredients when sensible.',
-      },
-      { role: 'user', content: buildWeekStubPrompt(args) },
-    ],
-    text: {
-      format: {
-        type: 'json_schema',
-        name: 'week_stubs',
-        schema: WEEK_STUBS_SCHEMA,
-        strict: true,
-      },
-    },
-  });
-  const content = response.output_text;
-  if (!content) throw new Error('Week stub generation returned no content');
-  return {
-    stubs: (JSON.parse(content) as { meals: (MealStub & { day: Day })[] }).meals,
-    usage: extractUsageFromResponse(response),
-  };
+interface LogMealArgs {
+  date?: string;
+  name: string;
+  cuisine?: string;
+  description?: string;
+  ingredients?: RecipeIngredient[];
+  steps?: string[];
+  requires_defrost?: DefrostEntry[];
+  status?: 'planned' | 'cooked';
 }
 
-/** Single-meal stub for swap operations. */
-async function generateMealStub(
-  ctx: ToolCtx,
-  prompt: string
-): Promise<{ stub: MealStub; usage: RoundUsage }> {
-  const response = await ctx.client.responses.create({
-    model: ctx.env.OPENAI_MODEL,
-    input: [
-      { role: 'system', content: 'You pick one real, well-known dish matching the request.' },
-      { role: 'user', content: prompt },
-    ],
-    text: {
-      format: {
-        type: 'json_schema',
-        name: 'stub',
-        schema: STUB_SCHEMA,
-        strict: true,
-      },
-    },
-  });
-  const content = response.output_text;
-  if (!content) throw new Error('Stub generation returned no content');
-  return {
-    stub: JSON.parse(content) as MealStub,
-    usage: extractUsageFromResponse(response),
-  };
-}
+function toolLogMeal(args: LogMealArgs, ctx: ToolCtx): string {
+  const date = args.date || todayISO(ctx.env.TIMEZONE);
+  const status: 'planned' | 'cooked' = args.status === 'cooked' ? 'cooked' : 'planned';
+  const ingredients = args.ingredients ?? [];
+  const steps = args.steps ?? [];
+  const defrost = args.requires_defrost ?? [];
 
-async function toolGenerateDraft(
-  args: { week_of: string; constraints?: string[] },
-  ctx: ToolCtx
-): Promise<ToolResult> {
-  const { sql } = ctx;
-  const prefs = loadPreferences(sql);
-  const pantry = loadPantry(sql);
-  const constraints = args.constraints ?? [];
+  // A day holds at most one open decision — replace any prior planned/out/skipped
+  // row for this date (the user changed their mind). Cooked rows are history; keep them.
+  clearOpenDecision(ctx.sql, date);
 
-  const { stubs, usage } = await generateWeekStubs(ctx, { prefs, pantry, constraints });
-
-  const meals: MealSlot[] = stubs.map((s) => ({
-    day: s.day,
-    name: s.name,
-    description: s.description,
-    cuisine: s.cuisine,
-    active_minutes: s.active_minutes,
-    total_minutes: s.total_minutes,
-    effort: s.effort,
-    servings: 2,
-    notes: [],
-    status: 'planned',
-  }));
-
-  sql.exec(
-    'INSERT INTO weeks (week_of, status, meals_json, constraints_json, drafted_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(week_of) DO UPDATE SET status=?, meals_json=excluded.meals_json, constraints_json=excluded.constraints_json, drafted_at=excluded.drafted_at, approved_at=NULL',
-    args.week_of, 'draft', JSON.stringify(meals), JSON.stringify(constraints), Date.now(), 'draft'
+  ctx.sql.exec(
+    INSERT_MEAL_SQL,
+    date,
+    args.name,
+    args.cuisine ?? null,
+    args.description ?? null,
+    JSON.stringify(ingredients),
+    JSON.stringify(steps),
+    JSON.stringify(defrost),
+    status,
+    Date.now(),
   );
 
-  // Archive any older lingering drafts so they can't be accidentally approved.
-  // We keep the row (history is useful) but mark it 'archived' so /approve skips.
-  sql.exec(
-    "UPDATE weeks SET status = 'archived' WHERE status = 'draft' AND week_of != ?",
-    args.week_of
+  if (status === 'cooked') {
+    const consumed = decrementPantryForMeal(ctx.sql, ingredients);
+    return `Logged ${args.name} as cooked for ${date}. Decremented from pantry: ${consumed.join(', ') || '(nothing)'}.`;
+  }
+
+  const scheduled = scheduleDefrostReminders(ctx, date, args.name, defrost);
+  return `Logged ${args.name} for ${date}.${scheduled ? ` Scheduled ${scheduled} defrost reminder(s).` : ''}`;
+}
+
+function toolSetNoCook(args: { date?: string; reason?: string }, ctx: ToolCtx): string {
+  const date = args.date || todayISO(ctx.env.TIMEZONE);
+  clearOpenDecision(ctx.sql, date);
+  cancelReminders(ctx.sql, date);
+  ctx.sql.exec(
+    INSERT_MEAL_SQL,
+    date, null, null, args.reason ?? null, null, null, null, 'out', Date.now(),
   );
-
-  return {
-    output: `Generated 7-day draft for week of ${args.week_of}. Meals: ${meals.map((m) => `${m.day}=${m.name}`).join(', ')}.`,
-    usage,
-  };
+  const when = date === todayISO(ctx.env.TIMEZONE) ? 'today' : `on ${date}`;
+  return `Got it — no cooking ${when}${args.reason ? ` (${args.reason})` : ''}. I'll stay quiet.`;
 }
 
-function buildWeekStubPrompt(args: {
-  prefs: PreferenceRow[];
-  pantry: PantryItem[];
-  constraints: string[];
-}): string {
-  return [
-    'Plan dinners for Mon-Sun (one meal per day).',
-    '',
-    'Constraints for this week:',
-    ...args.constraints.map((c) => `- ${c}`),
-    '',
-    'Preferences (high weight first):',
-    ...args.prefs.slice(0, 12).map((p) => `- [w${p.weight}] ${p.insight}`),
-    '',
-    'Pantry (use these when sensible):',
-    ...args.pantry.map((p) => `- ${p.name}`),
-    '',
-    'Vary cuisines and proteins across the week. No two meals should share the same primary cuisine. One meal can be a longer weekend project.',
-  ].filter(Boolean).join('\n');
+function toolMarkMealCooked(args: { date?: string }, ctx: ToolCtx): string {
+  const date = args.date || todayISO(ctx.env.TIMEZONE);
+  const row = plannedMealFor(ctx.sql, date);
+  if (!row) {
+    return `No planned meal for ${date} to mark cooked. If you made something, tell me what and I'll log it.`;
+  }
+  ctx.sql.exec("UPDATE meals SET status = 'cooked' WHERE id = ?", row.id);
+  const consumed = decrementPantryForMeal(ctx.sql, parseIngredients(row.ingredients_json));
+  cancelReminders(ctx.sql, date);
+  return `Marked ${row.name ?? "today's meal"} cooked. Decremented from pantry: ${consumed.join(', ') || '(nothing)'}.`;
 }
 
-async function toolSwapMeal(
-  args: { week_of: string; day: Day; criteria: string },
-  ctx: ToolCtx
-): Promise<ToolResult> {
-  const week = loadWeek(ctx.sql, args.week_of);
-  if (!week) return `No plan exists for ${args.week_of}.`;
-
-  const otherMeals = week.meals.filter((m) => m.day !== args.day);
-  const { stub, usage } = await generateMealStub(
-    ctx,
-    [
-      `Pick a dinner for ${dayLabel(args.day)} matching: ${args.criteria}.`,
-      `Servings: 2.`,
-      `Pantry: ${loadPantry(ctx.sql).map((p) => p.name).join(', ')}.`,
-      `Other meals already in this week (avoid repeating cuisine): ${otherMeals.map((m) => `${m.name} (${m.cuisine})`).join(', ')}.`,
-    ].join(' ')
-  );
-
-  const meals: MealSlot[] = week.meals.map((m) =>
-    m.day === args.day
-      ? {
-          ...m,
-          name: stub.name,
-          description: stub.description,
-          cuisine: stub.cuisine,
-          active_minutes: stub.active_minutes,
-          total_minutes: stub.total_minutes,
-          effort: stub.effort,
-          notes: [],
-          ingredients: undefined,
-          steps: undefined,
-        }
-      : m
-  );
-
-  ctx.sql.exec('UPDATE weeks SET meals_json = ? WHERE week_of = ?', JSON.stringify(meals), args.week_of);
-  return {
-    output: `Swapped ${args.day} to ${stub.name} (${stub.total_minutes} min, ${stub.cuisine}).`,
-    usage,
-  };
+function toolMarkMealSkipped(args: { date?: string }, ctx: ToolCtx): string {
+  const date = args.date || todayISO(ctx.env.TIMEZONE);
+  const row = plannedMealFor(ctx.sql, date);
+  if (!row) return `No planned meal for ${date} to skip.`;
+  ctx.sql.exec("UPDATE meals SET status = 'skipped' WHERE id = ?", row.id);
+  cancelReminders(ctx.sql, date);
+  return `Marked ${row.name ?? 'the planned meal'} skipped. Pantry untouched.`;
 }
 
-function toolAdjustServings(
-  args: { week_of: string; day: Day; servings: number },
-  ctx: ToolCtx
-): string {
-  const week = loadWeek(ctx.sql, args.week_of);
-  if (!week) return `No plan exists for ${args.week_of}.`;
-  const meals = week.meals.map((m) =>
-    m.day === args.day ? { ...m, servings: args.servings } : m
-  );
-  ctx.sql.exec('UPDATE weeks SET meals_json = ? WHERE week_of = ?', JSON.stringify(meals), args.week_of);
-  return `Set ${args.day} to ${args.servings} servings.`;
-}
-
-function toolRescheduleMeal(
-  args: { week_of: string; from: Day; to: Day },
-  ctx: ToolCtx
-): string {
-  const week = loadWeek(ctx.sql, args.week_of);
-  if (!week) return `No plan exists for ${args.week_of}.`;
-  const fromMeal = week.meals.find((m) => m.day === args.from);
-  const toMeal = week.meals.find((m) => m.day === args.to);
-  if (!fromMeal || !toMeal) return 'One of the days has no meal to swap.';
-  const meals = week.meals.map((m) => {
-    if (m.day === args.from) return { ...toMeal, day: args.from };
-    if (m.day === args.to) return { ...fromMeal, day: args.to };
-    return m;
-  });
-  ctx.sql.exec('UPDATE weeks SET meals_json = ? WHERE week_of = ?', JSON.stringify(meals), args.week_of);
-  return `Swapped ${args.from} <-> ${args.to}.`;
-}
+// ─── pantry / profile / preferences ─────────────────────────────────────────
 
 interface PantryUpdateItem {
   name: string;
@@ -428,79 +169,124 @@ function toolRecordPreference(
   return `Recorded preference: "${args.insight}" (weight ${args.weight}).`;
 }
 
-
-function toolMarkMealCooked(
-  args: { week_of: string; day: Day },
-  ctx: ToolCtx
-): string {
-  const week = loadWeek(ctx.sql, args.week_of);
-  if (!week) return `No plan exists for ${args.week_of}.`;
-  const meal = week.meals.find((m) => m.day === args.day);
-  if (!meal) return `No meal on ${args.day}.`;
-
-  const meals = week.meals.map((m) =>
-    m.day === args.day ? { ...m, status: 'cooked' as const } : m
+function toolUpdateProfile(args: { content: string }, ctx: ToolCtx): string {
+  const trimmed = args.content.trim();
+  if (!trimmed) return 'Profile content is empty.';
+  ctx.sql.exec(
+    "INSERT INTO settings (key, value, updated_at) VALUES ('cooking_profile', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+    trimmed, Date.now()
   );
-  ctx.sql.exec('UPDATE weeks SET meals_json = ? WHERE week_of = ?', JSON.stringify(meals), args.week_of);
+  return `Profile updated (${trimmed.length} chars). It will be applied to every future suggestion.`;
+}
 
-  // Decrement pantry for items consumed. Only operate on pantry rows that
-  // genuinely match the consumed quantity. If the units don't match (e.g.,
-  // pantry has "1.5 lb chicken" and recipe says "3 chicken breasts"), we skip
-  // — DON'T delete the row, since the user clearly has more than what was used.
-  // Only delete when there's no qty info on the pantry row at all (treat it
-  // as a "have/don't have" flag rather than a quantity tracker).
+function toolShowProfile(ctx: ToolCtx): string {
+  const profile = loadProfile(ctx.sql);
+  return profile ?? 'No cooking profile set yet. Use /profile with a message to create one.';
+}
+
+function toolShowState(ctx: ToolCtx): string {
+  const tz = ctx.env.TIMEZONE;
+  const today = loadDayDecision(ctx.sql, todayISO(tz));
+  const recent = loadRecentMeals(ctx.sql, 8);
+  const pantry = loadPantry(ctx.sql);
+
+  const todayLine = today.length
+    ? today.map((m) => m.status === 'out'
+        ? `not cooking${m.description ? ` (${m.description})` : ''}`
+        : `${m.status} ${m.name ?? '(unnamed)'}`).join('; ')
+    : 'nothing decided yet';
+  const recentLine = recent.length ? recent.map((m) => `${m.date}: ${m.name}`).join('; ') : 'none';
+  const pantryLine = pantry.length ? pantry.map((p) => p.name).join(', ') : 'empty';
+  return `Today: ${todayLine}.\nRecent meals: ${recentLine}.\nPantry: ${pantryLine}.`;
+}
+
+// ─── shared helpers ─────────────────────────────────────────────────────────
+
+/** Remove any non-historical decision row for a date so a new one can replace it. */
+function clearOpenDecision(sql: SqlStorage, date: string): void {
+  sql.exec("DELETE FROM meals WHERE date = ? AND status IN ('planned', 'out', 'skipped')", date);
+}
+
+function plannedMealFor(sql: SqlStorage, date: string): MealRow | null {
+  return sql
+    .exec<MealRow>("SELECT * FROM meals WHERE date = ? AND status = 'planned' ORDER BY id DESC LIMIT 1", date)
+    .toArray()[0] ?? null;
+}
+
+function cancelReminders(sql: SqlStorage, date: string): void {
+  sql.exec('UPDATE reminders SET sent_at = ? WHERE day = ? AND sent_at IS NULL', Date.now(), date);
+}
+
+function parseIngredients(json: string | null): RecipeIngredient[] {
+  if (!json) return [];
+  try {
+    const v = JSON.parse(json);
+    return Array.isArray(v) ? (v as RecipeIngredient[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Schedule a fridge-defrost reminder per frozen item, anchored to dinner hour
+ * on the meal's date. Skips entries whose defrost window has already passed.
+ * Returns the number scheduled.
+ */
+function scheduleDefrostReminders(
+  ctx: ToolCtx,
+  date: string,
+  mealName: string,
+  defrost: DefrostEntry[],
+): number {
+  ctx.sql.exec("DELETE FROM reminders WHERE day = ? AND type = 'defrost' AND sent_at IS NULL", date);
+  if (defrost.length === 0) return 0;
+
+  const dinnerHour = Number(ctx.env.DINNER_HOUR_LOCAL) || 18;
+  const cookTime = localDateAtHour(date, dinnerHour, ctx.env.TIMEZONE);
+  let count = 0;
+  for (const entry of defrost) {
+    const hours = Number.isFinite(entry.hours) && entry.hours > 0 ? entry.hours : 12;
+    const dueAt = cookTime - hours * 3_600_000;
+    if (dueAt < Date.now()) continue;
+    const message = `🧊 **Defrost reminder**: pull the ${entry.item} out of the freezer for ${mealName}.`;
+    ctx.sql.exec(
+      'INSERT INTO reminders (due_at, type, week_of, day, message) VALUES (?, ?, NULL, ?, ?)',
+      dueAt, 'defrost', date, message,
+    );
+    count++;
+  }
+  return count;
+}
+
+/**
+ * Decrement pantry inventory for consumed ingredients. Only touches rows that
+ * genuinely match the consumed quantity. If units don't match (pantry has
+ * "1.5 lb chicken", recipe says "3 chicken breasts") we skip — the user clearly
+ * has more than what was used. Rows with no qty info are treated as a
+ * have/don't-have flag and removed on use. Returns the names decremented.
+ */
+export function decrementPantryForMeal(sql: SqlStorage, ingredients: RecipeIngredient[]): string[] {
   const consumed: string[] = [];
-  for (const ing of (meal.ingredients ?? [])) {
+  for (const ing of ingredients) {
     const itemName = ing.item.toLowerCase().trim();
-    const row = ctx.sql.exec<PantryItem>('SELECT * FROM pantry WHERE name = ?', itemName).toArray()[0];
+    const row = sql.exec<PantryItem>('SELECT * FROM pantry WHERE name = ?', itemName).toArray()[0];
     if (!row) continue;
     const parsed = parseQty(ing.qty);
     if (parsed && row.qty_value != null && row.qty_unit && row.qty_unit === parsed.unit) {
-      // Units match → subtract. Delete if depleted.
       const remaining = row.qty_value - parsed.value;
       consumed.push(itemName);
       if (remaining <= 0) {
-        ctx.sql.exec('DELETE FROM pantry WHERE name = ?', itemName);
+        sql.exec('DELETE FROM pantry WHERE name = ?', itemName);
       } else {
-        ctx.sql.exec('UPDATE pantry SET qty_value = ? WHERE name = ?', remaining, itemName);
+        sql.exec('UPDATE pantry SET qty_value = ? WHERE name = ?', remaining, itemName);
       }
     } else if (row.qty_value == null && row.qty_unit == null) {
-      // Pantry row has no qty (boolean "I have this" tracker) → remove on use.
-      ctx.sql.exec('DELETE FROM pantry WHERE name = ?', itemName);
+      sql.exec('DELETE FROM pantry WHERE name = ?', itemName);
       consumed.push(itemName);
     }
-    // Otherwise: pantry has qty info but it doesn't match recipe units →
-    // skip silently. Don't delete or modify.
+    // Otherwise: pantry has qty info that doesn't match recipe units → skip.
   }
-
-  // Cancel any unsent reminders for this meal.
-  ctx.sql.exec(
-    'UPDATE reminders SET sent_at = ? WHERE week_of = ? AND day = ? AND sent_at IS NULL',
-    Date.now(), args.week_of, args.day
-  );
-
-  return `Marked ${args.day} cooked. Decremented from pantry: ${consumed.join(', ') || '(nothing)'}.`;
-}
-
-function toolMarkMealSkipped(
-  args: { week_of: string; day: Day },
-  ctx: ToolCtx
-): string {
-  const week = loadWeek(ctx.sql, args.week_of);
-  if (!week) return `No plan exists for ${args.week_of}.`;
-
-  const meals = week.meals.map((m) =>
-    m.day === args.day ? { ...m, status: 'skipped' as const } : m
-  );
-  ctx.sql.exec('UPDATE weeks SET meals_json = ? WHERE week_of = ?', JSON.stringify(meals), args.week_of);
-
-  // Cancel pending reminders.
-  ctx.sql.exec(
-    'UPDATE reminders SET sent_at = ? WHERE week_of = ? AND day = ? AND sent_at IS NULL',
-    Date.now(), args.week_of, args.day
-  );
-
-  return `Marked ${args.day} skipped. Pantry items remain available.`;
+  return consumed;
 }
 
 /**
@@ -534,97 +320,10 @@ export function parseQty(raw: string): { value: number; unit: string } | null {
   return null;
 }
 
-function toolUpdateProfile(args: { content: string }, ctx: ToolCtx): string {
-  const trimmed = args.content.trim();
-  if (!trimmed) return 'Profile content is empty.';
-  ctx.sql.exec(
-    "INSERT INTO settings (key, value, updated_at) VALUES ('cooking_profile', ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-    trimmed, Date.now()
-  );
-  return `Profile updated (${trimmed.length} chars). It will be applied on every future plan.`;
-}
-
-function toolShowProfile(ctx: ToolCtx): string {
-  const profile = loadProfile(ctx.sql);
-  return profile ?? 'No cooking profile set yet. Use /profile with a message to create one.';
-}
-
-function toolShowState(args: { week_of: string }, ctx: ToolCtx): string {
-  const week = loadWeek(ctx.sql, args.week_of);
-  if (!week) return `No plan for ${args.week_of}.`;
-  const lines = week.meals.map(
-    (m) => `${m.day}: ${m.name} (${m.cuisine}, ${m.total_minutes}min, ${m.servings} servings${m.ingredients ? ', recipe ready' : ''})`
-  );
-  return `Plan for ${args.week_of} (${week.status}):\n${lines.join('\n')}`;
-}
-
-function dayLabel(day: Day): string {
-  return { mon: 'Monday', tue: 'Tuesday', wed: 'Wednesday', thu: 'Thursday', fri: 'Friday', sat: 'Saturday', sun: 'Sunday' }[day];
-}
-
-/**
- * Direct (non-agent) /draft flow with streaming progress.
- *
- * Generates a fresh meal plan for next week without going through the agent
- * loop's pre-call and post-call LLM round-trips. Reliable in ~10-15s because
- * we're not stacking "decide tool" + "tool call" + "compose reply" within the
- * same waitUntil budget.
- */
-export async function runDraftFlow(args: {
-  env: Env;
-  sql: SqlStorage;
-  discord: DiscordAPI;
-  replyChannelId: string;
-  weekOf: string;
-  notes?: string;
-}): Promise<void> {
-  const { env, sql, discord, replyChannelId, weekOf, notes } = args;
-  const client = makeClient(env);
-  const ctx: ToolCtx = { env, sql, client };
-
-  await discord.postMessage(replyChannelId, {
-    embeds: [{
-      title: `📝 Drafting plan for week of ${weekOf}…`,
-      description: '_One LLM call to plan all 7 meals — about 10–15s._',
-      color: EmbedColor.draft,
-    }],
-  });
-
-  const constraints = notes ? [notes] : [];
-  const result = await toolGenerateDraft({ week_of: weekOf, constraints }, ctx);
-  const resultText = typeof result === 'string' ? result : result.output;
-  const turnUsage = typeof result === 'string' ? emptyUsage() : (result.usage ?? emptyUsage());
-
-  const week = sql
-    .exec<WeekRow>('SELECT * FROM weeks WHERE week_of = ?', weekOf)
-    .toArray()[0];
-  if (!week) {
-    await discord.postMessage(replyChannelId, {
-      embeds: [{
-        title: '⚠️ Draft generation failed',
-        description: resultText,
-        color: EmbedColor.error,
-      }],
-    });
-    return;
-  }
-
-  // Record usage scoped to this thread + emit the cost footer alongside the
-  // plan embed. Same shape as every other Discord-bound assistant reply.
-  const threadTotal = recordUsage(sql, {
-    thread_id: replyChannelId,
-    model: env.OPENAI_MODEL,
-    ...turnUsage,
-  });
-  await discord.postMessage(replyChannelId, {
-    embeds: [planEmbed(week, { includeFooterHint: true })],
-    content: costFooter(turnUsage, threadTotal, env).trimStart(),
-  });
-}
-
 /**
  * Direct (non-agent) /pantry flow. Parses the user's free-text into structured
- * inventory items via one LLM call, inserts them, confirms in Discord.
+ * inventory items via one LLM call, inserts them, confirms in Discord. Kept as a
+ * fast path because pantry edits don't need the full chat loop or history.
  */
 const PANTRY_PARSE_SCHEMA = {
   type: 'object',
@@ -665,7 +364,7 @@ export async function runPantryFlow(args: {
   userMessage: string;
 }): Promise<void> {
   const { env, sql, discord, replyChannelId, userMessage } = args;
-  const client = makeClient(env);
+  const client = makeOpenAIClient(env);
 
   // Use the configured extract model — pure structured-output, no creativity needed.
   const response = await client.responses.create({

@@ -20,20 +20,18 @@ export type BotId = 'kitchen' | 'finance' | 'tasks' | 'workout';
 /**
  * How a bot partitions conversation history in its `conversation` table.
  *
- * Three of the four bots use `thread_id` (each Discord thread is its own
- * context). Kitchen uses `week_of` because the same thread can carry messages
- * about multiple weeks; the agent should see the slice of history relevant to
- * the active week. The column name is a closed enum so it's safe to inline
- * into SQL.
+ * Every bot uses `thread_id` — each Discord thread (or, for proactive posts,
+ * the channel itself) is its own conversation context. The column name is a
+ * closed enum so it's safe to inline into SQL.
  */
 export interface ConversationScope {
-  column: 'thread_id' | 'week_of';
+  column: 'thread_id';
   value: string;
 }
 
 /** Context every tool implementation receives. Tools use what they need;
- *  kitchen's LLM-using tools (e.g. generate_draft) need `client`, the others
- *  only touch sql + timezone. */
+ *  some bots' tools call OpenAI internally and need `client`, others only
+ *  touch sql + timezone. */
 export interface ToolExecCtx {
   env: Env;
   sql: SqlStorage;
@@ -66,10 +64,9 @@ export interface BotSpec {
   /** Tables wiped by /admin/reset (in deletion order). The base class iterates
    *  this list, then issues a /reset:after hook for any per-bot post-cleanup. */
   readonly resetTables: readonly string[];
-  /** Which `conversation` column the bot partitions by. Must match whatever
-   *  `defaultScope()` returns. Centralized here so the base's prune path
-   *  doesn't have to call `defaultScope(env, 'unused')` for its side-channel. */
-  readonly scopeColumn: 'thread_id' | 'week_of';
+  /** Which `conversation` column the bot partitions by. Always `thread_id`
+   *  today; retained as a field so the contract stays explicit per bot. */
+  readonly scopeColumn: 'thread_id';
 
   buildSystemPrompt(sql: SqlStorage, env: Env, scope: ConversationScope): string;
 
@@ -79,16 +76,13 @@ export interface BotSpec {
    *  so the base class can surface a clear error. */
   fastRead(sql: SqlStorage, env: Env, interaction: Interaction): MessagePayload | null;
 
-  /** Default scope used when no richer context is available — e.g. the
-   *  Worker's /relay/message handler doesn't have SQL access so it can't run
-   *  kitchen's findActiveWeek. Callers with SQL access (the DO) may compute a
-   *  better scope and pass it to dispatchChat directly. */
+  /** Default scope for a reply channel — the thread (or channel) the reply
+   *  lands in. Callers may pass an explicit scope to dispatchChat instead. */
   defaultScope(env: Env, replyChannelId: string): ConversationScope;
 
   /** Optional: rewrite parsed tool args before execution to backfill context
-   *  the model commonly omits. Kitchen uses this to inject `week_of` into
-   *  meal-plan tools whose schema declares it required. Returning the parsed
-   *  args unchanged is the no-op path; never return `undefined`. */
+   *  the model commonly omits. Returning the parsed args unchanged is the
+   *  no-op path; never return `undefined`. No bot currently uses this. */
   fillDefaultArgs?(
     toolName: string,
     parsed: Record<string, unknown>,

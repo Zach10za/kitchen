@@ -1,6 +1,11 @@
 /**
- * Tool definitions for the agent. These are the *only* ways the agent can
- * mutate state. Keeping the surface small improves model selection accuracy.
+ * Tool definitions for the kitchen agent. These are the *only* ways the agent
+ * can mutate state. Keeping the surface small improves model selection accuracy.
+ *
+ * The bot is daily-first: the agent suggests dinner for *today* (or whenever the
+ * user asks), and persists a decision only when the user actually makes one —
+ * picks a dish (`log_meal`), declares a no-cook night (`set_no_cook`), or reports
+ * cooking something (`mark_meal_cooked`). There is no weekly plan.
  *
  * Schema is OpenAI tool-calling format (functions with JSON Schema params).
  */
@@ -8,67 +13,86 @@ export const TOOLS = [
   {
     type: 'function' as const,
     function: {
-      name: 'generate_draft',
-      description: 'Create or regenerate the meal plan for a week. Use when starting fresh, when the user wants a do-over, or when no draft exists yet.',
+      name: 'log_meal',
+      description: "Record that the user has decided to make a specific dish. Call this when they pick one of your suggestions or tell you what they're cooking. Include the full recipe (ingredients + steps) so it's saved for reference. Defaults to today and status 'planned'. Pass status 'cooked' if they say they already made it (this also decrements the pantry).",
       parameters: {
         type: 'object',
         properties: {
-          week_of: { type: 'string', description: 'ISO date of the Monday of the target week' },
-          constraints: {
+          date: { type: 'string', description: "ISO date YYYY-MM-DD. Omit for today." },
+          name: { type: 'string', description: 'Real, well-known dish name' },
+          cuisine: { type: 'string', description: 'e.g. italian, thai, mexican, american' },
+          description: { type: 'string', description: 'One-line summary' },
+          ingredients: {
             type: 'array',
-            items: { type: 'string' },
-            description: 'Per-week constraints from user, e.g. "guests Friday", "traveling Wed"',
+            description: 'Full ingredient list with quantities.',
+            items: {
+              type: 'object',
+              properties: {
+                item: { type: 'string', description: 'Lowercase ingredient name, normalized to match pantry rows' },
+                qty: { type: 'string', description: 'e.g. "1 lb", "2 cups", "3 count"' },
+              },
+              required: ['item', 'qty'],
+            },
           },
+          steps: { type: 'array', items: { type: 'string' }, description: 'Ordered cooking steps' },
+          requires_defrost: {
+            type: 'array',
+            description: 'Frozen items to pull ahead of cook time, so a defrost reminder can be scheduled.',
+            items: {
+              type: 'object',
+              properties: {
+                item: { type: 'string', description: 'Frozen ingredient name (lowercase, matches pantry)' },
+                hours: { type: 'integer', description: 'Hours of fridge defrost before dinner (~12 thin fish, 24 chicken/beef, 36-48 large roasts)' },
+              },
+              required: ['item', 'hours'],
+            },
+          },
+          status: { type: 'string', enum: ['planned', 'cooked'], description: "Default 'planned'. Use 'cooked' only if they already made it." },
         },
-        required: ['week_of'],
+        required: ['name', 'cuisine', 'ingredients', 'steps'],
       },
     },
   },
   {
     type: 'function' as const,
     function: {
-      name: 'swap_meal',
-      description: 'Replace one day\'s meal with a different recipe matching given criteria.',
+      name: 'set_no_cook',
+      description: "Record that the user is NOT cooking on a given day — date night, takeout, eating out, leftovers, or just skipping. This stops the daily noon suggestion ping for that day. Defaults to today.",
       parameters: {
         type: 'object',
         properties: {
-          week_of: { type: 'string' },
-          day: { type: 'string', enum: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] },
-          criteria: { type: 'string', description: 'What the new meal should be like, e.g. "uses salmon", "20 min, low effort"' },
+          date: { type: 'string', description: 'ISO date YYYY-MM-DD. Omit for today.' },
+          reason: { type: 'string', description: 'Short reason, e.g. "date night", "ordering in", "leftovers".' },
         },
-        required: ['week_of', 'day', 'criteria'],
+        required: ['reason'],
       },
     },
   },
   {
     type: 'function' as const,
     function: {
-      name: 'adjust_servings',
-      description: 'Change serving count for one meal (e.g., guests, leftovers wanted).',
+      name: 'mark_meal_cooked',
+      description: "Mark today's (or a given date's) planned meal as cooked. Decrements pantry inventory used by the recipe and cancels its defrost reminder. Use when the user says they made/finished the meal they had planned.",
       parameters: {
         type: 'object',
         properties: {
-          week_of: { type: 'string' },
-          day: { type: 'string', enum: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] },
-          servings: { type: 'integer', minimum: 1, maximum: 20 },
+          date: { type: 'string', description: 'ISO date YYYY-MM-DD. Omit for today.' },
         },
-        required: ['week_of', 'day', 'servings'],
+        required: [],
       },
     },
   },
   {
     type: 'function' as const,
     function: {
-      name: 'reschedule_meal',
-      description: 'Move a meal from one day to another (e.g., user did not cook it, push to later).',
+      name: 'mark_meal_skipped',
+      description: "Mark a planned meal as skipped (the user didn't make it). Cancels its defrost reminder; pantry is untouched. Defaults to today.",
       parameters: {
         type: 'object',
         properties: {
-          week_of: { type: 'string' },
-          from: { type: 'string', enum: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] },
-          to: { type: 'string', enum: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] },
+          date: { type: 'string', description: 'ISO date YYYY-MM-DD. Omit for today.' },
         },
-        required: ['week_of', 'from', 'to'],
+        required: [],
       },
     },
   },
@@ -76,7 +100,7 @@ export const TOOLS = [
     type: 'function' as const,
     function: {
       name: 'update_pantry',
-      description: 'Add or remove items from inventory. Track location (freezer/fridge/shelf) — freezer items get defrost reminders. Capture quantities when the user gives them ("1 lb ground beef" → qty_value=1, qty_unit=lb). Use "count" for whole items ("2 chicken breasts" → qty_value=2, qty_unit=count).',
+      description: 'Add or remove items from inventory. Track location (freezer/fridge/shelf) — freezer items get prioritized and can trigger defrost reminders. Capture quantities when given ("1 lb ground beef" → qty_value=1, qty_unit=lb). Use "count" for whole items ("2 chicken breasts" → qty_value=2, qty_unit=count).',
       parameters: {
         type: 'object',
         properties: {
@@ -103,7 +127,7 @@ export const TOOLS = [
     type: 'function' as const,
     function: {
       name: 'update_profile',
-      description: 'Update the household cooking profile — stable, declarative info: equipment, dietary rules (allergies, restrictions), cuisines liked/disliked, ingredients loved/avoided, cooking ability, time budget, default servings, anything that should always be considered when planning. Pass the COMPLETE merged content as Markdown. CRITICAL: preserve every detail the user provided verbatim — do not summarize, paraphrase, or compress their wording. Reorganize into Markdown sections (## Equipment, ## Dietary, ## Cuisines, ## Style, ## Time, ## Notes) but keep the substance intact. If a profile already exists, MERGE — never drop existing info. Distinguish hard rules (allergies, equipment they don\'t have) from soft preferences (cuisines liked).',
+      description: 'Update the household cooking profile — stable, declarative info: equipment, dietary rules (allergies, restrictions), cuisines liked/disliked, ingredients loved/avoided, cooking ability, time budget, default servings, anything that should always be considered when suggesting meals. Pass the COMPLETE merged content as Markdown. CRITICAL: preserve every detail the user provided verbatim — do not summarize, paraphrase, or compress their wording. Reorganize into Markdown sections (## Equipment, ## Dietary, ## Cuisines, ## Style, ## Time, ## Notes) but keep the substance intact. If a profile already exists, MERGE — never drop existing info. Distinguish hard rules (allergies, equipment they don\'t have) from soft preferences (cuisines liked).',
       parameters: {
         type: 'object',
         properties: {
@@ -125,49 +149,15 @@ export const TOOLS = [
     type: 'function' as const,
     function: {
       name: 'record_preference',
-      description: 'Silently record a learned preference for future planning. Call whenever user feedback reveals a pattern (likes, dislikes, dietary, schedule). Always include rationale.',
+      description: 'Silently record a learned preference for future suggestions. Call whenever user feedback reveals a pattern (likes, dislikes, dietary, schedule, cadence — e.g. "rarely cooks on Fridays"). Always include rationale.',
       parameters: {
         type: 'object',
         properties: {
           insight: { type: 'string', description: 'The preference, e.g. "deprioritize curries on weeknights"' },
-          rationale: { type: 'string', description: 'Why we believe this, e.g. "user rejected curry 3 weeks running"' },
+          rationale: { type: 'string', description: 'Why we believe this, e.g. "user rejected curry 3 times running"' },
           weight: { type: 'integer', minimum: 1, maximum: 10, description: 'How strong this preference is (1=hint, 10=hard rule)' },
         },
         required: ['insight', 'rationale', 'weight'],
-      },
-    },
-  },
-  // approve_plan and generate_grocery_list intentionally NOT exposed as tools —
-  // those run as Cloudflare Workflows triggered by `/approve`. Doing them
-  // inline from the agent loop would blow the DO request budget on the
-  // 7-recipe materialization.
-  {
-    type: 'function' as const,
-    function: {
-      name: 'mark_meal_cooked',
-      description: 'Mark a meal as cooked. Decrements pantry inventory used by the recipe. Use when user says they made/cooked a meal.',
-      parameters: {
-        type: 'object',
-        properties: {
-          week_of: { type: 'string' },
-          day: { type: 'string', enum: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] },
-        },
-        required: ['week_of', 'day'],
-      },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
-      name: 'mark_meal_skipped',
-      description: 'Mark a meal as skipped (user did not cook it). Cancels its defrost reminder. Use when user says they skipped or did not make a meal.',
-      parameters: {
-        type: 'object',
-        properties: {
-          week_of: { type: 'string' },
-          day: { type: 'string', enum: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] },
-        },
-        required: ['week_of', 'day'],
       },
     },
   },
@@ -175,53 +165,53 @@ export const TOOLS = [
     type: 'function' as const,
     function: {
       name: 'show_state',
-      description: 'Read-only: get the current plan, preferences, and pantry. Use when answering "what is in the plan", "what do I have", etc.',
-      parameters: {
-        type: 'object',
-        properties: { week_of: { type: 'string' } },
-        required: ['week_of'],
-      },
+      description: "Read-only: get today's decision (if any), recent meals, and the current pantry. Use when answering \"what am I making\", \"what have I cooked lately\", \"what do I have\", etc.",
+      parameters: { type: 'object', properties: {} },
     },
   },
 ] as const;
 
-export type Day = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun';
+export type MealStatus = 'planned' | 'cooked' | 'skipped' | 'out';
 
-export interface MealSlot {
-  day: Day;
-  // Stub fields — always present, generated by /draft and refined by /chat
-  name: string;
-  description: string;
-  cuisine: string;
-  active_minutes: number;
-  total_minutes: number;
-  effort: 'easy' | 'medium' | 'hard';
-  // Per-meal state
-  servings: number;
-  notes: string[];
-  status: 'planned' | 'cooked' | 'skipped';
-  // Lazy-materialized — populated on /approve or first /now
-  ingredients?: { item: string; qty: string }[];
-  steps?: string[];
-  requires_defrost?: { item: string; hours: number }[];
+export interface RecipeIngredient {
+  item: string;
+  qty: string;
 }
 
-/** Stub form returned by generate_draft / swap_meal. */
-export interface MealStub {
-  name: string;
-  description: string;
-  cuisine: string;
-  active_minutes: number;
-  total_minutes: number;
-  effort: 'easy' | 'medium' | 'hard';
+/** Frozen items needing defrost. The model emits these so we don't keyword-match. */
+export interface DefrostEntry {
+  item: string;
+  hours: number;
 }
 
-/** Materialized form populated by approve_plan. */
-export interface RecipeDetails {
-  ingredients: { item: string; qty: string }[];
+/** A single decided meal (or a no-cook night) for one date. Persisted in the
+ *  `meals` table; the source of truth for recipe history and the noon-ping gate. */
+export interface MealRow {
+  id: number;
+  date: string;
+  name: string | null;
+  cuisine: string | null;
+  description: string | null;
+  ingredients_json: string | null;
+  steps_json: string | null;
+  requires_defrost_json: string | null;
+  status: MealStatus;
+  created_at: number;
+  [key: string]: SqlStorageValue;
+}
+
+/** Parsed view of a MealRow, used by render + prompt builders. */
+export interface Meal {
+  id: number;
+  date: string;
+  name: string | null;
+  cuisine: string | null;
+  description: string | null;
+  ingredients: RecipeIngredient[];
   steps: string[];
-  /** Frozen items needing defrost. The model emits these so we don't keyword-match. */
-  requires_defrost: { item: string; hours: number }[];
+  requires_defrost: DefrostEntry[];
+  status: MealStatus;
+  created_at: number;
 }
 
 export interface PreferenceRow {
@@ -241,19 +231,4 @@ export interface PantryItem {
   location: string | null; // 'freezer' | 'fridge' | 'shelf'
   added_at: number;
   [key: string]: SqlStorageValue;
-}
-
-export interface GroceryItem {
-  item: string;
-  qty: string;
-  category: 'produce' | 'protein' | 'dairy' | 'pantry' | 'frozen' | 'other';
-}
-
-export interface WeekState {
-  week_of: string;
-  status: 'draft' | 'approved' | 'in_progress' | 'archived';
-  drafted_at: number;
-  approved_at: number | null;
-  meals: MealSlot[];
-  constraints: string[];
 }

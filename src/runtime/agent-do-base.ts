@@ -36,10 +36,7 @@ import { DiscordAPI } from '../discord/api';
 import { prepareInteractionThread } from '../discord/thread';
 import { captureError } from '../error-triage';
 import { runMigrations } from './migrations';
-import {
-  maybePruneConversationByThread,
-  maybePruneConversationByWeek,
-} from './conversation';
+import { maybePruneConversationByThread } from './conversation';
 import { checkRelayRateLimit } from './relay-rate-limit';
 import {
   recordUsage,
@@ -354,27 +351,17 @@ export abstract class AgentDOBase<E extends Env> extends DurableObject<E> {
 
   private maybePruneConversation(): void {
     const runner = (sql: string, ...params: any[]) => this.sql.exec(sql, ...params);
-    if (this.spec.scopeColumn === 'week_of') {
-      this.lastConversationPruneAt = maybePruneConversationByWeek(
-        runner, this.lastConversationPruneAt, CONVERSATION_PRUNE_KEEP_DEFAULT,
-      );
-    } else {
-      this.lastConversationPruneAt = maybePruneConversationByThread(
-        runner, this.lastConversationPruneAt, CONVERSATION_PRUNE_KEEP_DEFAULT,
-      );
-    }
+    this.lastConversationPruneAt = maybePruneConversationByThread(
+      runner, this.lastConversationPruneAt, CONVERSATION_PRUNE_KEEP_DEFAULT,
+    );
   }
 }
 
 function scopeFromQuery(url: URL): ConversationScope {
-  const col = url.searchParams.get('scope_column');
-  const val = url.searchParams.get('scope_value') ?? '';
-  if (col === 'week_of') return { column: 'week_of', value: val };
-  return { column: 'thread_id', value: val };
+  return { column: 'thread_id', value: url.searchParams.get('scope_value') ?? '' };
 }
 
 function scopeFromBody(body: { scope_column?: unknown; scope_value?: unknown }): ConversationScope | null {
   if (typeof body.scope_value !== 'string') return null;
-  const col = body.scope_column === 'week_of' ? 'week_of' : 'thread_id';
-  return { column: col, value: body.scope_value };
+  return { column: 'thread_id', value: body.scope_value };
 }

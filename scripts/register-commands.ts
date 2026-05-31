@@ -17,19 +17,22 @@ const INTEGER = 4;
 
 const COMMANDS = [
   {
-    name: 'plan',
-    description: 'Show the current meal plan or generate one for next week',
+    name: 'cook',
+    description: 'What should I make today? Optionally tell me ingredients or constraints.',
+    options: [
+      { name: 'message', description: 'Ingredients on hand or constraints (e.g. "salmon, 20 min")', type: STRING, required: false },
+    ],
   },
   {
     name: 'chat',
-    description: 'Chat with the kitchen bot in natural language (swap meals, change servings, give feedback)',
+    description: 'Chat with the kitchen bot in natural language (suggestions, log what you cooked, feedback)',
     options: [
       { name: 'message', description: 'What you want to chat about', type: STRING, required: true },
     ],
   },
   {
     name: 'now',
-    description: 'What should I be doing in the kitchen right now?',
+    description: "What should I be doing in the kitchen right now? (or tonight's options if undecided)",
   },
   {
     name: 'pantry',
@@ -39,25 +42,10 @@ const COMMANDS = [
     ],
   },
   {
-    name: 'approve',
-    description: 'Lock in the current draft and generate a grocery list',
-  },
-  {
-    name: 'grocery',
-    description: 'Show the grocery list for the approved plan',
-  },
-  {
     name: 'profile',
-    description: 'Show or edit your cooking profile (equipment, diet, cuisines, style — applied to every plan)',
+    description: 'Show or edit your cooking profile (equipment, diet, cuisines, style — applied to every suggestion)',
     options: [
       { name: 'message', description: 'What to add or change (omit to view current profile)', type: STRING, required: false },
-    ],
-  },
-  {
-    name: 'draft',
-    description: 'Generate a fresh meal plan for next week (~10-15s with live progress)',
-    options: [
-      { name: 'notes', description: 'Optional constraints for this week (e.g. "guests Friday")', type: STRING, required: false },
     ],
   },
   {

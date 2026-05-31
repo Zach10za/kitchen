@@ -11,7 +11,6 @@ export { KitchenDO } from './kitchen-do';
 export { FinanceDO } from './finance-do';
 export { TasksDO } from './tasks-do';
 export { WorkoutDO } from './workout-do';
-export { ApproveWorkflow } from './workflows/approve';
 export { AgentChatWorkflow } from './workflows/agent-chat';
 
 export default {
@@ -114,7 +113,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     }
 
     // Dispatch into the unified AgentChatWorkflow. The registry resolves the
-    // bot's default conversation scope (kitchen → week_of, others → thread_id).
+    // bot's default conversation scope (thread_id — the reply thread).
     ctx.waitUntil(dispatchChat(env, bot.id, body.userMessage, replyChannelId));
 
     return Response.json({ ok: true });
@@ -125,9 +124,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
   // Authorization header so it doesn't leak through CDN/proxy access logs.
   //
   // /admin/dump and /admin/reset accept ?bot=kitchen|finance|tasks|workout
-  // (default kitchen). Kitchen-specific endpoints (/admin/grocery,
-  // /admin/clear-grocery) target KitchenDO regardless. /admin/finance/sync
-  // forces a SimpleFin pull.
+  // (default kitchen). /admin/finance/sync forces a SimpleFin pull.
   //
   // Usage:
   //   curl -H "Authorization: Bearer $ADMIN_TOKEN" https://.../admin/dump
@@ -161,18 +158,6 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     if (url.pathname === '/admin/finance/sync' && request.method === 'POST') {
       const finance = env.FINANCE.get(env.FINANCE.idFromName('default-household'));
       return finance.fetch('https://internal/sync', { method: 'POST' });
-    }
-    if (url.pathname === '/admin/grocery' && request.method === 'GET') {
-      const weekOf = validateWeekOf(url.searchParams.get('week_of'));
-      if (!weekOf) return new Response('invalid week_of', { status: 400 });
-      const kitchen = env.KITCHEN.get(env.KITCHEN.idFromName('default-household'));
-      return kitchen.fetch(`https://internal/get-grocery?week_of=${weekOf}`);
-    }
-    if (url.pathname === '/admin/clear-grocery' && request.method === 'POST') {
-      const weekOf = validateWeekOf(url.searchParams.get('week_of'));
-      if (!weekOf) return new Response('invalid week_of', { status: 400 });
-      const kitchen = env.KITCHEN.get(env.KITCHEN.idFromName('default-household'));
-      return kitchen.fetch(`https://internal/clear-grocery?week_of=${weekOf}`, { method: 'POST' });
     }
     return new Response('not found', { status: 404 });
   }
@@ -252,10 +237,6 @@ function isFastReadCommand(interaction: Interaction): boolean {
       return !hasMessage;     // /profile (alone) = read; with message = write
     case 'pantry':
       return !hasMessage;     // /pantry (alone) = read; with message = write
-    case 'plan':
-      return true;            // /plan always reads existing; use /chat to create
-    case 'grocery':
-      return false;           // routed through DO so it can split into multiple messages
     case 'reminders':
       return true;            // simple list, fits in one message
     // Finance
@@ -306,12 +287,6 @@ function checkAdmin(request: Request, env: Env): boolean {
   const match = auth.match(/^Bearer\s+(.+)$/);
   if (!match) return false;
   return constantTimeEquals(match[1]!.trim(), env.ADMIN_TOKEN);
-}
-
-/** Validate week_of query params before forwarding to the DO. */
-function validateWeekOf(input: string | null): string | null {
-  if (!input) return null;
-  return /^\d{4}-\d{2}-\d{2}$/.test(input) ? input : null;
 }
 
 /** Constant-time-ish check for the shared relay secret. */
