@@ -128,7 +128,7 @@ export async function runAgentRound(args: RunRoundArgs): Promise<RoundResult> {
   if (toolCalls.length === 0) {
     return {
       type: 'final',
-      finalText: response.output_text || '(no text)',
+      finalText: stripCitationMarkers(response.output_text) || '(no text)',
       newMessages: [...args.messages, ...(response.output as any[])],
       usage,
     };
@@ -179,6 +179,33 @@ export async function runAgentRound(args: RunRoundArgs): Promise<RoundResult> {
   }
 
   return { type: 'continue', newMessages, usage };
+}
+
+/**
+ * OpenAI's web_search embeds inline citation markers in output_text, delimited
+ * by private-use-area unicode chars (U+E200 start … U+E201 end) that wrap
+ * tokens like "cite…turn0search0". Discord can't render the delimiters, so they
+ * surface as garbage boxes plus literal "citeturn0search0" text. Strip the
+ * whole block. Marker chars are built via fromCharCode so no unprintable
+ * private-use bytes live in this source file.
+ */
+const CITE_START = String.fromCharCode(0xe200);
+const CITE_END = String.fromCharCode(0xe201);
+const CITE_BLOCK = new RegExp(`${CITE_START}[^${CITE_END}]*${CITE_END}`, 'gu');
+const CITE_STRAY = new RegExp(`[${String.fromCharCode(0xe200)}-${String.fromCharCode(0xe20f)}]`, 'gu');
+
+export function stripCitationMarkers(text: string | undefined | null): string {
+  if (!text) return '';
+  return text
+    // Full citation blocks: start-marker … end-marker (incl. the ASCII tokens).
+    .replace(CITE_BLOCK, '')
+    // Any stray private-use citation/navigation markers left behind.
+    .replace(CITE_STRAY, '')
+    // Tidy whitespace the removal can leave (space before punctuation/newline).
+    .replace(/ +([.,;:!?])/g, '$1')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
 }
 
 function extractUsage(response: any): RoundUsage {
