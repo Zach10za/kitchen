@@ -80,7 +80,7 @@ export abstract class AgentDOBase<E extends Env> extends DurableObject<E> {
     // Runs against the subclass's spec via virtual dispatch on getSpec(). This
     // eliminates the foot-gun where a subclass forgot to call ensureSchema()
     // and crashed on its first SQL query.
-    runMigrations(this.sql, this.getSpec().migrations);
+    runMigrations(this.sql, this.getSpec().migrations, this.ctx.storage);
   }
 
   /** Hook: bot-specific heartbeat work after universal prune. Default no-op. */

@@ -209,10 +209,26 @@ async function handleDiscordInteraction(
     interaction.type === InteractionType.APPLICATION_COMMAND ||
     interaction.type === InteractionType.MESSAGE_COMPONENT
   ) {
+    // The DO's own handler wraps dispatchCommand in try/catch + captureError,
+    // but a failure in DO *construction* (migrations, schema bootstrap, field
+    // initializers) throws before that handler runs and rejects this subrequest.
+    // Without a catch here that rejection vanishes into waitUntil — the user
+    // gets an eternal "thinking…" and nothing is filed. Catch it so the failure
+    // is triaged and the user sees an error instead of a hang.
     ctx.waitUntil(
       stub.fetch('https://internal/interaction', {
         method: 'POST',
         body: JSON.stringify(interaction),
+      }).then(async (res) => {
+        if (!res.ok) throw new Error(`interaction subrequest: HTTP ${res.status}`);
+      }).catch(async (err) => {
+        await captureError(env, err, {
+          source: `interaction-dispatch:${interaction.data?.name ?? 'unknown'}`,
+          tags: { interaction_type: interaction.type },
+        });
+        await new DiscordAPI(env.DISCORD_BOT_TOKEN, env.DISCORD_APP_ID)
+          .editOriginal(interaction.token, `Something broke starting that up: ${(err as Error).message}`)
+          .catch(() => {});
       })
     );
 
