@@ -169,6 +169,11 @@ export const TOOLS = [
       parameters: { type: 'object', properties: {} },
     },
   },
+  // ── OpenAI server-side built-ins ──────────────────────────────────────
+  // Executes on OpenAI's side; output appears in the response alongside our
+  // function calls and we echo it forward — no executor on our side. Cooking
+  // suggestions should lean on this heavily (recipes, techniques, seasonality).
+  { type: 'web_search' as const },
 ] as const;
 
 export type MealStatus = 'planned' | 'cooked' | 'skipped' | 'out';
