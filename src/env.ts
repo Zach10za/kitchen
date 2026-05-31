@@ -5,7 +5,6 @@ export interface Env {
   TASKS: DurableObjectNamespace;
   WORKOUT: DurableObjectNamespace;
   AI: Ai;
-  APPROVE_WORKFLOW: Workflow;
   /** Unified chat workflow. Replaces the per-bot *_STEER_WORKFLOW bindings —
    *  one Cloudflare Workflow class (`AgentChatWorkflow`) serves every bot,
    *  parameterized by `botId` in the workflow params. */
@@ -17,8 +16,10 @@ export interface Env {
   OPENAI_MODEL_FAST: string;
   /** Cheap, fast model for pure structured extraction (pantry parse, recipe materialize). */
   OPENAI_MODEL_EXTRACT: string;
-  DRAFT_DAY: string;
-  DRAFT_HOUR_LOCAL: string;
+  /** Local hour (0-23) the daily dinner-suggestion ping fires. Defaults to 12 (noon). */
+  SUGGEST_HOUR_LOCAL: string;
+  /** Local dinner hour (0-23) defrost reminders are anchored to. Defaults to 18. */
+  DINNER_HOUR_LOCAL: string;
   TIMEZONE: string;
   GITHUB_REPO: string;
   /** Per-channel relay rate limit: max forwarded messages per hour (defaults to 30 if unset). */

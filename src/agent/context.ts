@@ -1,51 +1,59 @@
 /**
- * Shared context loaders. Both the in-process agent (`runAgent` in loop.ts)
- * and the durable AgentChatWorkflow build their system prompt from the same
- * snapshot of the household state — keeping the queries here means the two
- * paths can't drift.
+ * Shared context loaders. Both the daily-suggestion alarm and the unified
+ * AgentChatWorkflow build their system prompt from the same snapshot of the
+ * household state — keeping the queries here means the two paths can't drift.
  */
 
-import type { WeekRow } from '../kitchen-do';
-import type { MealSlot, PantryItem, PreferenceRow, WeekState } from './tools';
+import type { Meal, MealRow, PantryItem, PreferenceRow } from './tools';
 import { buildSystemPrompt } from './prompts';
+import { todayISO } from '../util/datetime';
 
 export interface RecentMeal {
-  weekOf: string;
-  day: string;
+  date: string;
   name: string;
   cuisine: string;
 }
 
 export interface AgentContext {
-  plan: WeekState | null;
+  today: Meal[];
   preferences: PreferenceRow[];
   pantry: PantryItem[];
   recentMeals: RecentMeal[];
   profile: string | null;
 }
 
-/** Most-recent draft within the last `withinDays` days, or null. */
-export function findActiveWeek(sql: SqlStorage, withinDays = 14): WeekRow | null {
-  const cutoff = Date.now() - withinDays * 86_400_000;
-  return sql
-    .exec<WeekRow>(
-      'SELECT * FROM weeks WHERE drafted_at >= ? ORDER BY drafted_at DESC LIMIT 1',
-      cutoff
-    )
-    .toArray()[0] ?? null;
+/** Parse a raw `meals` row into its decoded JSON columns. */
+export function parseMeal(row: MealRow): Meal {
+  const safeArray = <T>(json: string | null): T[] => {
+    if (!json) return [];
+    try {
+      const v = JSON.parse(json);
+      return Array.isArray(v) ? (v as T[]) : [];
+    } catch {
+      return [];
+    }
+  };
+  return {
+    id: row.id,
+    date: row.date,
+    name: row.name,
+    cuisine: row.cuisine,
+    description: row.description,
+    ingredients: safeArray(row.ingredients_json),
+    steps: safeArray(row.steps_json),
+    requires_defrost: safeArray(row.requires_defrost_json),
+    status: row.status,
+    created_at: row.created_at,
+  };
 }
 
-export function loadWeek(sql: SqlStorage, weekOf: string): WeekState | null {
-  const row = sql.exec<WeekRow>('SELECT * FROM weeks WHERE week_of = ?', weekOf).toArray()[0];
-  if (!row) return null;
-  return {
-    week_of: row.week_of,
-    status: row.status,
-    drafted_at: row.drafted_at,
-    approved_at: row.approved_at,
-    meals: JSON.parse(row.meals_json) as MealSlot[],
-    constraints: JSON.parse(row.constraints_json) as string[],
-  };
+/** All decisions recorded for a given date (usually 0 or 1). A non-empty
+ *  result is what suppresses the daily noon suggestion ping. */
+export function loadDayDecision(sql: SqlStorage, dateISO: string): Meal[] {
+  return sql
+    .exec<MealRow>('SELECT * FROM meals WHERE date = ? ORDER BY id DESC', dateISO)
+    .toArray()
+    .map(parseMeal);
 }
 
 export function loadPreferences(sql: SqlStorage): PreferenceRow[] {
@@ -68,38 +76,25 @@ export function loadProfile(sql: SqlStorage): string | null {
 }
 
 /**
- * Recent meals from prior approved weeks, used to discourage repetition.
- * Drafts are intentionally excluded — they may not actually get cooked.
+ * Recently cooked or planned dishes, used to discourage repetition. No-cook
+ * ('out') and skipped rows are excluded — they aren't dishes.
  */
-export function loadRecentMeals(
-  sql: SqlStorage,
-  excludeWeekOf: string,
-  daysBack: number
-): RecentMeal[] {
-  const cutoff = Date.now() - daysBack * 86_400_000;
-  const rows = sql
-    .exec<WeekRow>(
-      "SELECT * FROM weeks WHERE week_of != ? AND drafted_at >= ? AND status IN ('approved', 'in_progress') ORDER BY week_of DESC LIMIT 4",
-      excludeWeekOf,
-      cutoff
+export function loadRecentMeals(sql: SqlStorage, limit = 12): RecentMeal[] {
+  return sql
+    .exec<MealRow>(
+      "SELECT * FROM meals WHERE status IN ('cooked', 'planned') AND name IS NOT NULL ORDER BY date DESC, id DESC LIMIT ?",
+      limit
     )
-    .toArray();
-  const out: RecentMeal[] = [];
-  for (const row of rows) {
-    const meals = JSON.parse(row.meals_json) as MealSlot[];
-    for (const m of meals) {
-      out.push({ weekOf: row.week_of, day: m.day, name: m.name, cuisine: m.cuisine });
-    }
-  }
-  return out;
+    .toArray()
+    .map((r) => ({ date: r.date, name: r.name ?? '', cuisine: r.cuisine ?? '' }));
 }
 
-export function loadContext(sql: SqlStorage, weekOf: string): AgentContext {
+export function loadContext(sql: SqlStorage, timezone: string): AgentContext {
   return {
-    plan: loadWeek(sql, weekOf),
+    today: loadDayDecision(sql, todayISO(timezone)),
     preferences: loadPreferences(sql),
     pantry: loadPantry(sql),
-    recentMeals: loadRecentMeals(sql, weekOf, 14),
+    recentMeals: loadRecentMeals(sql),
     profile: loadProfile(sql),
   };
 }
@@ -122,8 +117,6 @@ function currentNowFor(timezone: string): { iso: string; localFormatted: string;
     hour12: true,
     timeZoneName: 'short',
   });
-  // Discord plans use a 3-letter lowercase day key (mon/tue/...). Derive it
-  // from the same timezone so day boundaries match local midnight, not UTC.
   const weekdayShort = date.toLocaleString('en-US', {
     timeZone: timezone,
     weekday: 'short',
@@ -132,9 +125,9 @@ function currentNowFor(timezone: string): { iso: string; localFormatted: string;
   return { iso: date.toISOString(), localFormatted, dayKey };
 }
 
-export function buildSystemPromptFor(sql: SqlStorage, weekOf: string, timezone: string): string {
+export function buildSystemPromptFor(sql: SqlStorage, timezone: string): string {
   return buildSystemPrompt({
-    ...loadContext(sql, weekOf),
+    ...loadContext(sql, timezone),
     now: currentNowFor(timezone),
   });
 }

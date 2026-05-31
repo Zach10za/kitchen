@@ -68,18 +68,13 @@
   // requires a new workflow binding here.
   "workflows": [
     {
-      "name": "approve-plan",
-      "binding": "APPROVE_WORKFLOW",
-      "class_name": "ApproveWorkflow",
-    },
-    {
       "name": "agent-chat",
       "binding": "AGENT_CHAT_WORKFLOW",
       "class_name": "AgentChatWorkflow",
     },
   ],
 
-  // Hourly cron keeps KitchenDO alarms armed and dispatches due reminders.
+  // Hourly cron keeps KitchenDO's daily alarm armed and dispatches due reminders.
   "triggers": {
     "crons": ["0 * * * *"],
   },
@@ -117,8 +112,10 @@
     "OPENAI_MODEL_EXTRACT": "gpt-5.4-nano",
     // Cheap, fast model for one-shot title generation in error triage.
     "OPENAI_MODEL_FAST": "gpt-5.4-nano",
-    "DRAFT_DAY": "fri",
-    "DRAFT_HOUR_LOCAL": "18",
+    // Local hour the daily dinner-suggestion ping fires (24h). Noon by default.
+    "SUGGEST_HOUR_LOCAL": "12",
+    // Local dinner hour defrost reminders are anchored to.
+    "DINNER_HOUR_LOCAL": "18",
     "TIMEZONE": "America/Los_Angeles",
     "GITHUB_REPO": "Zach10za/kitchen",
     // Per-channel /relay/message rate limit, in messages per rolling hour.
@@ -139,7 +136,7 @@
   //   DISCORD_BOT_TOKEN          — for posting messages via REST
   //   DISCORD_APP_ID             — for slash command registration
   //   DISCORD_GUILD_ID           — your server ID (scopes commands to your server)
-  //   DISCORD_CHANNEL_ID         — channel the kitchen bot posts proactive drafts to
+  //   DISCORD_CHANNEL_ID         — channel the kitchen bot posts daily dinner suggestions to
   //   DISCORD_FINANCE_CHANNEL_ID — channel the finance bot posts to
   //   DISCORD_TASKS_CHANNEL_ID   — channel the tasks bot posts to
   //   DISCORD_WORKOUT_CHANNEL_ID — channel the workout bot posts to

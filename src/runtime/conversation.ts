@@ -23,17 +23,6 @@ const PRUNE_BY_THREAD_SQL = `
   )
 `;
 
-const PRUNE_BY_WEEK_SQL = `
-  DELETE FROM conversation
-  WHERE id NOT IN (
-    SELECT id FROM (
-      SELECT id, ROW_NUMBER() OVER (PARTITION BY week_of ORDER BY id DESC) AS rn
-      FROM conversation
-    )
-    WHERE rn <= ?
-  )
-`;
-
 /**
  * Per-thread prune: keeps the most-recent `keepPerThread` rows for each
  * thread_id. Rate-limited so the hourly heartbeat doesn't burn every tick
@@ -50,20 +39,5 @@ export function maybePruneConversationByThread(
   const now = Date.now();
   if (now - lastPrunedAt < CONVERSATION_PRUNE_INTERVAL_MS) return lastPrunedAt;
   run(PRUNE_BY_THREAD_SQL, keepPerThread);
-  return now;
-}
-
-/**
- * Per-week prune for KitchenDO (which partitions conversation by week_of,
- * not thread_id). Same shape, different partition key.
- */
-export function maybePruneConversationByWeek(
-  run: SqlRunner,
-  lastPrunedAt: number,
-  keepPerWeek: number,
-): number {
-  const now = Date.now();
-  if (now - lastPrunedAt < CONVERSATION_PRUNE_INTERVAL_MS) return lastPrunedAt;
-  run(PRUNE_BY_WEEK_SQL, keepPerWeek);
   return now;
 }
