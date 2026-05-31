@@ -169,9 +169,10 @@ export const TOOLS = [
       parameters: { type: 'object', properties: {} },
     },
   },
-  // No web_search: meal suggestions come from the model's own culinary
-  // knowledge. Live search added latency and citation/link noise (Discord
-  // unfurls cited URLs into preview images) for no real benefit here.
+  // OpenAI server-side built-in. Used SILENTLY to ground recipes in real,
+  // well-regarded versions — the prompt forbids ever surfacing sources, names,
+  // or links to the user (and SUPPRESS_EMBEDS stops any stray link unfurling).
+  { type: 'web_search' as const },
 ] as const;
 
 export type MealStatus = 'planned' | 'cooked' | 'skipped' | 'out';
