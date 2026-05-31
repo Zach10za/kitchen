@@ -146,6 +146,8 @@
   //   ADMIN_TOKEN                — bearer token for /admin/* endpoints
   //   GITHUB_TOKEN               — fine-grained PAT with Issues:write on this repo
   //                                (used by error-triage to file auto-fix issues)
+  //   TAVILY_API_KEY             — Tavily search key (tvly-…) powering the shared
+  //                                web_search tool across all bots. Optional; free tier ~1k/mo.
   //   SIMPLEFIN_ACCESS_URL       — long-lived SimpleFin Bridge access URL with embedded
   //                                Basic-auth creds. Run `bun run scripts/simplefin-claim.ts`
   //                                once with a setup token to mint this.

@@ -4,6 +4,8 @@
  * /workflow/tasks/exec-tool endpoint.
  */
 
+import { WEB_SEARCH_TOOL } from '../runtime/tavily';
+
 export const TASKS_TOOLS = [
   {
     type: 'function' as const,
@@ -157,11 +159,9 @@ export const TASKS_TOOLS = [
       },
     },
   },
-  // ── OpenAI server-side built-ins ──────────────────────────────────────
-  // Executes on OpenAI's side; output appears in the response alongside our
-  // function calls and we echo it forward — no executor on our side. Available
+  // Shared Tavily-backed search (executed centrally in AgentDOBase). Available
   // when a specific task needs a fact looked up; not central to task management.
-  { type: 'web_search' as const },
+  WEB_SEARCH_TOOL,
 ] as const;
 
 // ─── TypeScript Row Types ─────────────────────────────────────────────

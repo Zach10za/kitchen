@@ -9,6 +9,8 @@
  *
  * Schema is OpenAI tool-calling format (functions with JSON Schema params).
  */
+import { WEB_SEARCH_TOOL } from '../runtime/tavily';
+
 export const TOOLS = [
   {
     type: 'function' as const,
@@ -169,10 +171,7 @@ export const TOOLS = [
       parameters: { type: 'object', properties: {} },
     },
   },
-  // OpenAI server-side built-in. Used SILENTLY to ground recipes in real,
-  // well-regarded versions — the prompt forbids ever surfacing sources, names,
-  // or links to the user (and SUPPRESS_EMBEDS stops any stray link unfurling).
-  { type: 'web_search' as const },
+  WEB_SEARCH_TOOL,
 ] as const;
 
 export type MealStatus = 'planned' | 'cooked' | 'skipped' | 'out';

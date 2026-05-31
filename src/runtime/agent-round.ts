@@ -26,10 +26,10 @@ export interface FunctionToolDef {
 /** OpenAI server-side built-in tools — executed by OpenAI, not by us.
  *  Their output items appear in `response.output` alongside function calls
  *  and we echo them forward like everything else. We never call
- *  `executeTool` for them; the model gets results inline. */
+ *  `executeTool` for them; the model gets results inline. (web_search is now
+ *  a Tavily-backed function tool — see runtime/tavily.ts — so only
+ *  code_interpreter remains hosted, used by the finance bot.) */
 export type BuiltinToolDef =
-  | { type: 'web_search' }
-  | { type: 'web_search_preview' }
   | { type: 'code_interpreter'; container: { type: 'auto' } | { type: 'static'; file_ids?: string[] } };
 
 export type ToolDef = FunctionToolDef | BuiltinToolDef;

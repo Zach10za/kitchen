@@ -46,6 +46,7 @@ import {
   type RecordUsageBody,
 } from './usage';
 import { makeOpenAIClient } from './openai';
+import { tavilySearch } from './tavily';
 import type { RoundUsage } from './agent-round';
 import type { BotSpec, ConversationScope, ToolExecCtx } from './bot-spec';
 import { dispatchChat } from './bot-registry';
@@ -269,11 +270,13 @@ export abstract class AgentDOBase<E extends Env> extends DurableObject<E> {
       // can either retry or apologize.
       let payload: { output: string; usage: RoundUsage | null };
       try {
-        const result = await this.spec.executeTool(
-          toolName,
-          (body.args ?? {}) as Record<string, unknown>,
-          toolCtx,
-        );
+        const args = (body.args ?? {}) as Record<string, unknown>;
+        // web_search is a shared tool every bot exposes — execute it here so
+        // each spec doesn't need its own case. Tavily replaces OpenAI's hosted
+        // web_search built-in; results are source-stripped, untrusted reference.
+        const result = toolName === 'web_search'
+          ? await tavilySearch(this.env, String(args.query ?? ''))
+          : await this.spec.executeTool(toolName, args, toolCtx);
         payload = typeof result === 'string'
           ? { output: result, usage: null }
           : { output: result.output, usage: result.usage ?? null };

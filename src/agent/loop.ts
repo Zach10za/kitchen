@@ -21,8 +21,8 @@ const INSERT_MEAL_SQL =
 
 /**
  * Tool dispatch for the kitchen bot. Invoked by the unified AgentChatWorkflow
- * via `KITCHEN_SPEC.executeTool`. All tools are pure SQL (no internal LLM
- * calls) so they return plain strings.
+ * via `KITCHEN_SPEC.executeTool`. All tools here are pure SQL (the shared
+ * `web_search` tool is executed centrally in AgentDOBase, not here).
  */
 export function executeTool(name: string, args: any, ctx: ToolCtx): ToolResult {
   try {
