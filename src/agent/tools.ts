@@ -169,10 +169,9 @@ export const TOOLS = [
       parameters: { type: 'object', properties: {} },
     },
   },
-  // ── OpenAI server-side built-ins ──────────────────────────────────────
-  // Executes on OpenAI's side; output appears in the response alongside our
-  // function calls and we echo it forward — no executor on our side. Cooking
-  // suggestions should lean on this heavily (recipes, techniques, seasonality).
+  // OpenAI server-side built-in. Used SILENTLY to ground recipes in real,
+  // well-regarded versions — the prompt forbids ever surfacing sources, names,
+  // or links to the user (and SUPPRESS_EMBEDS stops any stray link unfurling).
   { type: 'web_search' as const },
 ] as const;
 

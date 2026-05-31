@@ -22,9 +22,22 @@ const MESSAGE_CHAR_LIMIT = 1990;
 
 type Sendable = string | MessagePayload;
 
+// Discord message flag: SUPPRESS_EMBEDS (1 << 2). Set on plain-text sends so a
+// link in the text never auto-unfurls into preview cards/images. Embed-bearing
+// payloads (reminders, fast-reads) must NOT set it or their own embeds vanish.
+const SUPPRESS_EMBEDS = 1 << 2;
+
 function normalize(input: Sendable): MessagePayload {
   if (typeof input === 'string') return { content: input };
   return input;
+}
+
+/** Build the JSON body for a send: mute pings always, and suppress link
+ *  auto-embeds when the message carries no embeds of its own. */
+function sendBody(body: MessagePayload): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...body, allowed_mentions: { parse: [] } };
+  if (!body.embeds || body.embeds.length === 0) out.flags = SUPPRESS_EMBEDS;
+  return out;
 }
 
 export class DiscordAPI {
@@ -39,7 +52,7 @@ export class DiscordAPI {
       const res = await fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
         method: 'POST',
         headers: this.headers(),
-        body: JSON.stringify({ ...body, allowed_mentions: { parse: [] } }),
+        body: JSON.stringify(sendBody(body)),
       });
       if (!res.ok) throw new Error(`Discord postMessage failed: ${res.status} ${await res.text()}`);
       const json = (await res.json()) as { id: string };
@@ -57,7 +70,7 @@ export class DiscordAPI {
         {
           method: 'POST',
           headers: this.headers(),
-          body: JSON.stringify({ ...body, allowed_mentions: { parse: [] } }),
+          body: JSON.stringify(sendBody(body)),
         }
       );
       if (!res.ok) throw new Error(`Discord followUp failed: ${res.status} ${await res.text()}`);
@@ -94,7 +107,7 @@ export class DiscordAPI {
       {
         method: 'PATCH',
         headers: this.headers(),
-        body: JSON.stringify({ ...first, allowed_mentions: { parse: [] } }),
+        body: JSON.stringify(sendBody(first)),
       }
     );
     if (!res.ok) throw new Error(`Discord editOriginal failed: ${res.status} ${await res.text()}`);
