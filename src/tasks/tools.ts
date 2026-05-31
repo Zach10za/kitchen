@@ -157,6 +157,11 @@ export const TASKS_TOOLS = [
       },
     },
   },
+  // ── OpenAI server-side built-ins ──────────────────────────────────────
+  // Executes on OpenAI's side; output appears in the response alongside our
+  // function calls and we echo it forward — no executor on our side. Available
+  // when a specific task needs a fact looked up; not central to task management.
+  { type: 'web_search' as const },
 ] as const;
 
 // ─── TypeScript Row Types ─────────────────────────────────────────────

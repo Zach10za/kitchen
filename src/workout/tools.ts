@@ -389,6 +389,11 @@ export const WORKOUT_TOOLS = [
       },
     },
   },
+  // ── OpenAI server-side built-ins ──────────────────────────────────────
+  // Executes on OpenAI's side; output appears in the response alongside our
+  // function calls and we echo it forward — no executor on our side. Training
+  // advice must be grounded in thefitness.wiki and cited (see prompt).
+  { type: 'web_search' as const },
 ] as const;
 
 // ─── TypeScript Row Types ─────────────────────────────────────────────
