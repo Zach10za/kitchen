@@ -6,6 +6,8 @@
  * Convention: every weight is pounds (lbs). Bodyweight exercises omit weight.
  */
 
+import { WEB_SEARCH_TOOL } from '../runtime/tavily';
+
 export const WORKOUT_TOOLS = [
   {
     type: 'function' as const,
@@ -389,11 +391,9 @@ export const WORKOUT_TOOLS = [
       },
     },
   },
-  // ── OpenAI server-side built-ins ──────────────────────────────────────
-  // Executes on OpenAI's side; output appears in the response alongside our
-  // function calls and we echo it forward — no executor on our side. Training
-  // advice must be grounded in thefitness.wiki and cited (see prompt).
-  { type: 'web_search' as const },
+  // Shared Tavily-backed search (executed centrally in AgentDOBase). Use it to
+  // ground training advice in reputable sources (returns facts only, no links).
+  WEB_SEARCH_TOOL,
 ] as const;
 
 // ─── TypeScript Row Types ─────────────────────────────────────────────

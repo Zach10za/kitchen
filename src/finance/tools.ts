@@ -4,6 +4,8 @@
  * proactive tool later (e.g. notify_unusual) will fit the same shape.
  */
 
+import { WEB_SEARCH_TOOL } from '../runtime/tavily';
+
 export const FINANCE_TOOLS = [
   {
     type: 'function' as const,
@@ -123,11 +125,10 @@ export const FINANCE_TOOLS = [
       },
     },
   },
-  // ── OpenAI server-side built-ins ──────────────────────────────────
-  // These execute on OpenAI's side; their output appears in the response
-  // alongside function calls and we just echo it forward. The agent uses
-  // them by emitting tool calls of these types — no executor on our side.
-  { type: 'web_search' as const },
+  // Shared Tavily-backed search (executed centrally in AgentDOBase).
+  WEB_SEARCH_TOOL,
+  // OpenAI server-side built-in: executes on OpenAI's side, output echoed
+  // forward, no executor here. (web_search is now Tavily; code_interpreter stays.)
   { type: 'code_interpreter' as const, container: { type: 'auto' as const } },
 ] as const;
 

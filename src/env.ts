@@ -49,9 +49,9 @@ export interface Env {
   RELAY_SECRET: string;
   ADMIN_TOKEN: string;
   GITHUB_TOKEN: string;
-  /** Tavily search API key (tvly-…). Powers the kitchen bot's `web_search`
-   *  function tool. If unset, search degrades gracefully and the model falls
-   *  back to its own knowledge. Free tier (~1k searches/mo) covers single-user use. */
+  /** Tavily search API key (tvly-…). Powers the shared `web_search` function
+   *  tool across all bots. If unset, search degrades gracefully and the model
+   *  falls back to its own knowledge. Free tier (~1k searches/mo). */
   TAVILY_API_KEY?: string;
   /** SimpleFin Bridge access URL (https://USER:PASS@.../simplefin). Obtained
    *  by running `bun run scripts/simplefin-claim.ts` once with a setup token. */

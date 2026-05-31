@@ -91,7 +91,7 @@ bunx wrangler secret put AI_GATEWAY_URL
 bunx wrangler secret put RELAY_SECRET     # any long random string; share with Fly.io relay
 bunx wrangler secret put ADMIN_TOKEN      # bearer for /admin/* endpoints
 bunx wrangler secret put GITHUB_TOKEN     # fine-grained PAT, Issues:write on the repo (optional; enables auto error triage)
-bunx wrangler secret put TAVILY_API_KEY   # Tavily search key (optional; grounds kitchen suggestions — free tier ~1k/mo)
+bunx wrangler secret put TAVILY_API_KEY   # Tavily search key (optional; powers web_search across all bots — free tier ~1k/mo)
 ```
 
 Public vars (model IDs, `SUGGEST_HOUR_LOCAL`, `DINNER_HOUR_LOCAL`, timezone, repo, rate limit) live in `wrangler.jsonc` under `vars` and can be edited directly.
@@ -263,7 +263,7 @@ src/
     bot-registry.ts        Channel-to-bot routing (kitchen / finance / tasks / workout)
     migrations.ts          SQLite schema migration runner
     openai.ts              OpenAI client factory
-    tavily.ts              Tavily search client (kitchen's web_search function tool; source-stripped)
+    tavily.ts              Tavily search client + shared web_search tool (all bots; source-stripped)
     pricing.ts             Token cost calculator
     relay-rate-limit.ts    Per-channel rolling-window rate limit
     usage.ts               Per-bot cost tracking

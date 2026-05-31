@@ -13,7 +13,6 @@ import type { DiscordAPI } from '../discord/api';
 import { makeOpenAIClient } from '../runtime/openai';
 import { extractUsageFromResponse, recordUsage, costFooter } from '../runtime/usage';
 import { todayISO, localDateAtHour } from '../util/datetime';
-import { tavilySearch } from '../runtime/tavily';
 
 export interface ToolCtx { env: Env; sql: SqlStorage; client: OpenAI }
 
@@ -22,13 +21,12 @@ const INSERT_MEAL_SQL =
 
 /**
  * Tool dispatch for the kitchen bot. Invoked by the unified AgentChatWorkflow
- * via `KITCHEN_SPEC.executeTool`. Most tools are pure SQL; `web_search` calls
- * Tavily (async). All return plain strings.
+ * via `KITCHEN_SPEC.executeTool`. All tools here are pure SQL (the shared
+ * `web_search` tool is executed centrally in AgentDOBase, not here).
  */
-export async function executeTool(name: string, args: any, ctx: ToolCtx): Promise<ToolResult> {
+export function executeTool(name: string, args: any, ctx: ToolCtx): ToolResult {
   try {
     switch (name) {
-      case 'web_search':        return await toolWebSearch(args, ctx);
       case 'log_meal':          return toolLogMeal(args, ctx);
       case 'set_no_cook':       return toolSetNoCook(args, ctx);
       case 'mark_meal_cooked':  return toolMarkMealCooked(args, ctx);
@@ -43,11 +41,6 @@ export async function executeTool(name: string, args: any, ctx: ToolCtx): Promis
   } catch (err) {
     return `Tool ${name} failed: ${(err as Error).message}`;
   }
-}
-
-/** Ground a suggestion via Tavily. Returns source-stripped facts (see tavily.ts). */
-async function toolWebSearch(args: { query?: string }, ctx: ToolCtx): Promise<string> {
-  return tavilySearch(ctx.env, String(args?.query ?? ''));
 }
 
 // ─── meal decisions ───────────────────────────────────────────────────────
