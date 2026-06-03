@@ -119,6 +119,9 @@ export interface AccountMetaRow {
   type: string;
   bot_type: string;
   locked_type: number;
+  nickname: string;
+  bot_nickname: string;
+  locked_nickname: number;
   synced_at: number;
   [key: string]: SqlStorageValue;
 }
@@ -163,6 +166,23 @@ export function setAccountType(sql: SqlStorage, accountId: string, type: Account
      ON CONFLICT(account_id) DO UPDATE SET type=excluded.type, locked_type=1, synced_at=excluded.synced_at`,
     accountId, type, type, Date.now(),
   );
+}
+
+/** Persist a user-set nickname (from the sheet's Nickname cell). Locked so the
+ *  bot treats it as the display-name override. `bot_nickname` (merge base) is
+ *  left for the reconcile to advance once it writes the value back. */
+export function setNickname(sql: SqlStorage, accountId: string, nickname: string): void {
+  sql.exec(
+    `INSERT INTO account_meta (account_id, nickname, locked_nickname, synced_at)
+     VALUES (?, ?, 1, ?)
+     ON CONFLICT(account_id) DO UPDATE SET nickname=excluded.nickname, locked_nickname=1, synced_at=excluded.synced_at`,
+    accountId, nickname, Date.now(),
+  );
+}
+
+/** Record the nickname the bot last wrote to the sheet (the merge base). */
+export function setBotNickname(sql: SqlStorage, accountId: string, nickname: string): void {
+  sql.exec('UPDATE account_meta SET bot_nickname = ?, synced_at = ? WHERE account_id = ?', nickname, Date.now(), accountId);
 }
 
 /** Local YYYY-MM-DD for the given timezone (en-CA renders ISO date order). */
@@ -228,7 +248,10 @@ export function netWorthSeries(sql: SqlStorage, days: number): NetWorthPoint[] {
 
 export interface AccountBalance {
   account_id: string;
+  /** The SimpleFin account name (bot-owned, read-only on the sheet). */
   name: string;
+  /** User-set nickname, or '' if none. */
+  nickname: string;
   org: string | null;
   type: string;
   currency: string;
@@ -236,20 +259,26 @@ export interface AccountBalance {
   last_synced_at: number;
 }
 
-/** Current balance + classification for every account (joins the live accounts
- *  table to account_meta, defaulting unclassified accounts to 'other'). */
+/** Current balance + classification + nickname for every account (joins the live
+ *  accounts table to account_meta, defaulting unclassified accounts to 'other'). */
 export function currentBalances(sql: SqlStorage): AccountBalance[] {
   return sql
     .exec<AccountBalance & { [key: string]: SqlStorageValue }>(
       `SELECT a.id AS account_id, a.name, a.org_name AS org, a.currency,
               CAST(a.balance AS REAL) AS balance,
               a.last_synced_at,
-              COALESCE(m.type, 'other') AS type
+              COALESCE(m.type, 'other') AS type,
+              COALESCE(m.nickname, '') AS nickname
          FROM accounts a
          LEFT JOIN account_meta m ON m.account_id = a.id
         ORDER BY a.name`,
     )
     .toArray();
+}
+
+/** Display name = nickname if the user set one, else the SimpleFin name. */
+export function displayName(b: { name: string; nickname: string }): string {
+  return b.nickname.trim() || b.name;
 }
 
 export interface NetWorthSummary {

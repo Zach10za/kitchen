@@ -191,6 +191,22 @@ export const FINANCE_SPEC: BotSpec = {
         `);
       },
     },
+    {
+      // User-editable account nicknames (the sheet's Accounts "Nickname" column).
+      // nickname = effective display name override; bot_nickname = merge base
+      // (last value the bot wrote to the Nickname cell); locked_nickname = 1 once
+      // the user has set one. Display name elsewhere = nickname || SimpleFin name.
+      version: 7,
+      up: (sql) => {
+        for (const ddl of [
+          "ALTER TABLE account_meta ADD COLUMN nickname TEXT NOT NULL DEFAULT ''",
+          "ALTER TABLE account_meta ADD COLUMN bot_nickname TEXT NOT NULL DEFAULT ''",
+          'ALTER TABLE account_meta ADD COLUMN locked_nickname INTEGER NOT NULL DEFAULT 0',
+        ]) {
+          sql.exec(ddl);
+        }
+      },
+    },
   ],
 };
 

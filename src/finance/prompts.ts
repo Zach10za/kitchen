@@ -3,7 +3,7 @@
  * balances and last sync time so the agent answers from current state.
  */
 
-import { currentBalances, summarizeNetWorth } from './accounts';
+import { currentBalances, summarizeNetWorth, displayName } from './accounts';
 
 export function buildFinanceSystemPrompt(sql: SqlStorage, timezone: string): string {
   const accounts = currentBalances(sql);
@@ -25,7 +25,7 @@ export function buildFinanceSystemPrompt(sql: SqlStorage, timezone: string): str
 
   const accountsBlock = accounts.length > 0
     ? accounts.map((a) =>
-        `- ${a.name}${a.org ? ` (${a.org})` : ''} [${a.type}]: ${a.currency} ${a.balance.toFixed(2)}`
+        `- ${displayName(a)}${a.org ? ` (${a.org})` : ''} [${a.type}]: ${a.currency} ${a.balance.toFixed(2)}`
       ).join('\n')
     : '(no accounts synced yet — call sync_now)';
 
@@ -65,7 +65,7 @@ TOOL TIERS — match the tool to the question:
 - **get_transactions_raw + code_interpreter**: reach for these whenever a question needs analysis the SQL tools don't directly provide — subscription/recurring detection (group by merchant + amount, find regular cadence), transfer detection (find paired in/out flows on the same day across accounts), forecasting, clustering of small recurring charges, custom rolling-window stats, "what are my smallest 100 charges totalling more than $X". Pull rows with get_transactions_raw, then write Python in code_interpreter to compute. Don't try to ask the SQL tools to do this and don't eyeball patterns from recent_transactions — write the code.
 - **web_search**: only for identifying unknown merchants ("what is THE OUTPOST CO LLC"), checking subscription pricing/tiers, or verifying a charge looks legit. One search per question max unless the user explicitly asks for a research task. Do NOT include account numbers or order IDs in queries — just the merchant name.
 - **Google Sheet tools** (sync_sheet, set_rule, list_rules, category_breakdown): the sheet is the source of truth for cleaned merchant names and categories. Raw transactions live in SQLite (the immutable ledger); the sheet's Merchant/Category/Notes columns are where meaning is added.
-- **Account tools** (net_worth, set_account_type, list_accounts): net_worth for assets-vs-liabilities over time; set_account_type to fix a misclassified account; list_accounts groups balances into net worth.
+- **Account tools** (net_worth, set_account_type, set_nickname, list_accounts): net_worth for assets-vs-liabilities over time; set_account_type to fix a misclassified account; set_nickname to give a cryptically-named account a friendly display name (shown everywhere, original bank name preserved); list_accounts groups balances into net worth. Accounts can be referred to by their nickname or original name.
 
 THE GOOGLE SHEET (your working layer) has four tabs: 'Transactions' (spending accounts only, with editable Merchant/Category), 'Accounts' (editable account Type per account), 'Balances' (daily per-account balance history), and 'Net Worth' (daily assets/liabilities/net total).
 - A 'Transactions' tab is kept in sync hourly. The bot owns Date/Account/Amount/Raw Description; the user owns Merchant/Category/Notes. The bot proposes cleaned merchant names and categories (from rules); the user can override any cell, and the bot will NEVER overwrite a manual edit.
