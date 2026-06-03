@@ -66,21 +66,41 @@ export function isLiabilityType(type: string): boolean {
   return LIABILITY_TYPES.has(type as AccountType);
 }
 
+/** Common natural phrasings → canonical type. Lets a manually-typed "credit
+ *  card" (the value the strict dropdown's canonical option is just "credit")
+ *  map correctly instead of falling through to 'other'. */
+const TYPE_SYNONYMS: Record<string, AccountType> = {
+  'credit card': 'credit', creditcard: 'credit', card: 'credit', cc: 'credit',
+  'checking account': 'checking', chequing: 'checking', debit: 'checking',
+  'savings account': 'savings', hysa: 'savings', 'money market': 'savings',
+  '401k': 'retirement', '401(k)': 'retirement', '403b': 'retirement', ira: 'retirement',
+  roth: 'retirement', 'roth ira': 'retirement', pension: 'retirement', 'retirement account': 'retirement',
+  'brokerage account': 'brokerage', investment: 'brokerage', investments: 'brokerage', invest: 'brokerage',
+  'home loan': 'mortgage', heloc: 'mortgage',
+  'auto loan': 'loan', 'car loan': 'loan', 'student loan': 'loan', 'personal loan': 'loan',
+  'cash account': 'cash', wallet: 'cash',
+};
+
 export function coerceType(value: string): AccountType {
   const v = value.trim().toLowerCase();
-  return (ACCOUNT_TYPES as string[]).includes(v) ? (v as AccountType) : 'other';
+  if ((ACCOUNT_TYPES as string[]).includes(v)) return v as AccountType;
+  return TYPE_SYNONYMS[v] ?? 'other';
 }
 
 /**
- * Keyword guess from the account + institution name. Order matters: check the
- * most specific liability/investment markers before the generic deposit ones
- * (a "Fidelity 401k" is retirement, not brokerage; a "Chase Sapphire" card is
- * credit, not checking). Unknown accounts default to `checking` — the loudest
- * failure mode (a real spending account miscategorized away from spend) is one
- * the user notices immediately and fixes in the Accounts tab, whereas the guess
- * is reliable for the investment/loan names that actually need excluding.
+ * Keyword guess from the account + institution name, with the balance sign as a
+ * tiebreaker. Order matters: check the most specific liability/investment
+ * markers before the generic deposit ones (a "Fidelity 401k" is retirement, not
+ * brokerage; a "Chase Sapphire" card is credit, not checking).
+ *
+ * Many credit cards are named by product ("Sapphire", "Freedom") with no
+ * "credit"/"card" keyword, so a name-only guess misfiled them as checking. When
+ * no keyword matches, a negative balance is a strong signal of a liability
+ * (you owe) — most often a credit card — so we lean credit there rather than
+ * defaulting to checking. Either way the user can correct it in the Accounts tab
+ * (which now sticks), and unlocked accounts are re-guessed on every sync.
  */
-export function guessAccountType(name: string, org?: string | null): AccountType {
+export function guessAccountType(name: string, org?: string | null, balance?: number): AccountType {
   const s = `${name} ${org ?? ''}`.toLowerCase();
   if (/\bmortgage\b|home\s*loan|heloc/.test(s)) return 'mortgage';
   if (/\bloan\b|auto\s*loan|student\s*loan|line\s*of\s*credit/.test(s)) return 'loan';
@@ -90,6 +110,7 @@ export function guessAccountType(name: string, org?: string | null): AccountType
   if (/saving|\bhysa\b|money\s*market/.test(s)) return 'savings';
   if (/\bcash\b|wallet/.test(s)) return 'cash';
   if (/check|chequing|debit/.test(s)) return 'checking';
+  if (balance != null && Number.isFinite(balance) && balance < 0) return 'credit';
   return 'checking';
 }
 
@@ -110,14 +131,25 @@ export function loadAccountMeta(sql: SqlStorage): Map<string, AccountMetaRow> {
   return map;
 }
 
-/** Seed a guessed type the first time we see an account. Never overwrites an
- *  existing row — once classified, the type only changes via sheet edits or the
- *  set_account_type tool. */
-export function seedAccountMeta(sql: SqlStorage, accountId: string, guess: AccountType): void {
+/**
+ * Apply the keyword/balance guess on every sync. For a new account it seeds the
+ * guess; for an existing UNLOCKED account it refreshes the effective `type` to
+ * the latest guess (so an improved guesser auto-corrects past misclassifications
+ * — e.g. credit cards previously filed as checking).
+ *
+ * Crucially it updates `type` but NOT `bot_type`: `bot_type` is the merge base
+ * (the value the bot last wrote to the Accounts sheet). Leaving it untouched
+ * means the reconcile sees the sheet cell == base (bot-owned) and writes the new
+ * type to the sheet, rather than mistaking the old value for a human edit.
+ * Locked accounts (user-set) are never touched.
+ */
+export function reguessAccountMeta(sql: SqlStorage, accountId: string, guess: AccountType): void {
   sql.exec(
     `INSERT INTO account_meta (account_id, type, bot_type, locked_type, synced_at)
      VALUES (?, ?, ?, 0, ?)
-     ON CONFLICT(account_id) DO NOTHING`,
+     ON CONFLICT(account_id) DO UPDATE SET
+       type = CASE WHEN account_meta.locked_type = 1 THEN account_meta.type ELSE excluded.type END,
+       synced_at = excluded.synced_at`,
     accountId, guess, guess, Date.now(),
   );
 }

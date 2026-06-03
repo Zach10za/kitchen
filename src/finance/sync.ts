@@ -10,7 +10,7 @@
 import type { Env } from '../env';
 import { SimplefinClient, type SimplefinAccount, type SimplefinTransaction } from './simplefin';
 import { normalizeMerchant } from './normalize';
-import { guessAccountType, seedAccountMeta, captureBalance, localDate } from './accounts';
+import { guessAccountType, reguessAccountMeta, captureBalance, localDate } from './accounts';
 
 /** How far back to look on the very first sync (no prior data). */
 const FIRST_SYNC_LOOKBACK_DAYS = 90;
@@ -68,11 +68,13 @@ export async function runSync(env: Env, sql: SqlStorage): Promise<SyncResult> {
       result.errors.push(`${account.name ?? account.id}: ${accountError}`);
     }
     upsertAccount(sql, account, now);
-    // Classify on first sight (keyword guess) and snapshot today's balance so
-    // net worth can be tracked over time across every account type — including
-    // the investment/loan accounts whose transactions we don't track row-level.
-    seedAccountMeta(sql, account.id, guessAccountType(account.name, account.org?.name));
-    captureBalance(sql, account.id, parseFloat(account.balance), today);
+    // Classify on every sync (keyword + balance-sign guess; auto-corrects
+    // unlocked accounts) and snapshot today's balance so net worth can be
+    // tracked over time across every account type — including the investment/
+    // loan accounts whose transactions we don't track row-level.
+    const bal = parseFloat(account.balance);
+    reguessAccountMeta(sql, account.id, guessAccountType(account.name, account.org?.name, bal));
+    captureBalance(sql, account.id, bal, today);
     result.accountsUpdated++;
     for (const tx of account.transactions ?? []) {
       const action = upsertTransaction(sql, account.id, tx, now);

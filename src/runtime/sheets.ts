@@ -183,12 +183,19 @@ export class SheetsClient {
     return data.values ?? [];
   }
 
-  /** Overwrite multiple ranges in one request (RAW input). */
-  async batchUpdateValues(spreadsheetId: string, data: ValueRange[]): Promise<void> {
+  /** Overwrite multiple ranges in one request. Defaults to RAW (values stored
+   *  verbatim — safe for arbitrary text). Use USER_ENTERED to write formulas or
+   *  have dates/numbers parsed natively; only pass it for cells you control,
+   *  since USER_ENTERED interprets a leading "=", "+", etc. as a formula. */
+  async batchUpdateValues(
+    spreadsheetId: string,
+    data: ValueRange[],
+    valueInputOption: 'RAW' | 'USER_ENTERED' = 'RAW',
+  ): Promise<void> {
     if (data.length === 0) return;
     await this.api(`${spreadsheetId}/values:batchUpdate`, {
       method: 'POST',
-      body: JSON.stringify({ valueInputOption: 'RAW', data }),
+      body: JSON.stringify({ valueInputOption, data }),
     });
   }
 
@@ -201,10 +208,11 @@ export class SheetsClient {
     spreadsheetId: string,
     range: string,
     rows: (string | number | null)[][],
+    valueInputOption: 'RAW' | 'USER_ENTERED' = 'RAW',
   ): Promise<{ firstRow: number | null }> {
     if (rows.length === 0) return { firstRow: null };
     const data = await this.api<{ updates?: { updatedRange?: string } }>(
-      `${spreadsheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`,
+      `${spreadsheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=${valueInputOption}&insertDataOption=INSERT_ROWS`,
       { method: 'POST', body: JSON.stringify({ values: rows }) },
     );
     return { firstRow: parseFirstRow(data.updates?.updatedRange) };
