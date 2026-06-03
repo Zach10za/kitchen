@@ -280,6 +280,11 @@ export class SheetsClient {
     ]);
   }
 
+  /** Delete a whole tab by its sheetId. */
+  async deleteTab(spreadsheetId: string, sheetId: number): Promise<void> {
+    await this.batchUpdate(spreadsheetId, [{ deleteSheet: { sheetId } }]);
+  }
+
   /** Count charts on a tab (used to add a chart only once). */
   async countCharts(spreadsheetId: string, sheetId: number): Promise<number> {
     const data = await this.api<{

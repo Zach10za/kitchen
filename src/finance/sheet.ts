@@ -226,7 +226,34 @@ async function runReconcile(env: Env, sql: SqlStorage): Promise<ReconcileResult>
       result.errors.push(`${section.name}: ${(err as Error).message}`);
     }
   }
+  // Clean up leftover empty tabs (e.g. Google's default "Sheet1") once ours exist.
+  await pruneEmptyTabs(client, sheetId, result);
   return result;
+}
+
+/** The tabs the bot owns. Everything else is the user's. */
+const MANAGED_TABS = new Set<string>([TX_TAB, ACCT_TAB, BAL_TAB, NW_TAB]);
+
+/**
+ * Delete non-managed tabs that contain no data — primarily the default "Sheet1"
+ * Google leaves in the first slot when the spreadsheet is created. Only ever
+ * removes EMPTY tabs (nothing to lose) and never the last remaining sheet, so a
+ * tab the user fills with content is always preserved. Best-effort: a failure
+ * is recorded, never thrown.
+ */
+async function pruneEmptyTabs(client: SheetsClient, sheetId: string, result: ReconcileResult): Promise<void> {
+  try {
+    const tabs = await client.listTabs(sheetId);
+    const candidates = tabs.filter((t) => !MANAGED_TABS.has(t.title));
+    if (candidates.length === 0 || tabs.length - candidates.length < 1) return; // keep ≥1 sheet
+    for (const t of candidates) {
+      const values = await client.getValues(sheetId, a1(t.title, 'A1:Z1000'));
+      const isEmpty = values.every((row) => row.every((cell) => (cell ?? '') === ''));
+      if (isEmpty) await client.deleteTab(sheetId, t.sheetId);
+    }
+  } catch (err) {
+    result.errors.push(`prune-tabs: ${(err as Error).message}`);
+  }
 }
 
 // ─── Transactions tab ──────────────────────────────────────────────────────
