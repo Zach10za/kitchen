@@ -17,9 +17,12 @@ import {
   summarizeNetWorth,
   netWorthSeries,
   setAccountType,
+  setNickname,
   coerceType,
   isLiabilityType,
+  displayName,
   ACCOUNT_TYPES,
+  type AccountBalance,
 } from './accounts';
 
 export interface FinanceToolCtx {
@@ -46,6 +49,7 @@ export async function executeFinanceTool(name: string, args: any, ctx: FinanceTo
       case 'category_breakdown':    return toolCategoryBreakdown(args, ctx);
       case 'net_worth':             return toolNetWorth(args, ctx);
       case 'set_account_type':      return await toolSetAccountType(args, ctx);
+      case 'set_nickname':          return await toolSetNickname(args, ctx);
       default:                      return `Unknown finance tool: ${name}`;
     }
   } catch (err) {
@@ -69,10 +73,10 @@ function toolListAccounts(ctx: FinanceToolCtx): string {
 
   const assetLines = balances
     .filter((b) => !isLiabilityType(b.type))
-    .map((b) => `  - ${b.name}${b.org ? ` (${b.org})` : ''} [${b.type}]: ${formatMoney(b.balance)}`);
+    .map((b) => `  - ${displayName(b)}${b.org ? ` (${b.org})` : ''} [${b.type}]: ${formatMoney(b.balance)}`);
   const liabLines = balances
     .filter((b) => isLiabilityType(b.type))
-    .map((b) => `  - ${b.name}${b.org ? ` (${b.org})` : ''} [${b.type}]: ${formatMoney(-Math.abs(b.balance))}`);
+    .map((b) => `  - ${displayName(b)}${b.org ? ` (${b.org})` : ''} [${b.type}]: ${formatMoney(-Math.abs(b.balance))}`);
 
   return [
     `${balances.length} account${balances.length === 1 ? '' : 's'} — net worth ${formatMoney(net)}:`,
@@ -107,38 +111,66 @@ function toolNetWorth(args: { days?: number }, ctx: FinanceToolCtx): string {
   return lines.join('\n');
 }
 
+/** Resolve a user-supplied account reference (name, nickname, or institution,
+ *  full or partial) to a single account, or return a message describing the
+ *  ambiguity/miss. */
+function resolveAccount(
+  ctx: FinanceToolCtx,
+  query: string,
+): { account: AccountBalance } | { error: string } {
+  const q = query.trim().toLowerCase();
+  if (!q) return { error: 'Provide an account name or nickname.' };
+  const matches = currentBalances(ctx.sql).filter(
+    (b) =>
+      b.name.toLowerCase().includes(q) ||
+      b.nickname.toLowerCase().includes(q) ||
+      (b.org ?? '').toLowerCase().includes(q),
+  );
+  if (matches.length === 0) return { error: `No account matches "${query}". Call list_accounts to see names.` };
+  if (matches.length > 1) {
+    return { error: `"${query}" matches ${matches.length} accounts: ${matches.map(displayName).join(', ')}. Be more specific.` };
+  }
+  return { account: matches[0]! };
+}
+
 async function toolSetAccountType(
   args: { account?: string; type?: string },
   ctx: FinanceToolCtx,
 ): Promise<string> {
-  const query = (args.account ?? '').trim().toLowerCase();
   const rawType = (args.type ?? '').trim().toLowerCase();
   const type = coerceType(rawType);
-  if (!query) return 'set_account_type needs an account name (or part of one).';
   // coerceType maps anything unrecognized to 'other'; reject that unless the
   // user literally asked for 'other', so a typo'd type isn't applied silently.
   if (type === 'other' && rawType !== 'other') {
     return `Unknown type "${args.type}". Use one of: ${ACCOUNT_TYPES.join(', ')}.`;
   }
+  const resolved = resolveAccount(ctx, args.account ?? '');
+  if ('error' in resolved) return resolved.error;
+  const acct = resolved.account;
 
-  const matches = currentBalances(ctx.sql).filter(
-    (b) => b.name.toLowerCase().includes(query) || (b.org ?? '').toLowerCase().includes(query),
-  );
-  if (matches.length === 0) return `No account matches "${args.account}". Call list_accounts to see names.`;
-  if (matches.length > 1) {
-    return `"${args.account}" matches ${matches.length} accounts: ${matches.map((m) => m.name).join(', ')}. Be more specific.`;
-  }
-
-  const acct = matches[0]!;
   setAccountType(ctx.sql, acct.account_id, type);
   const r = await reconcileSheet(ctx.env, ctx.sql);
-  const note = r.configured
-    ? r.deleted > 0
-      ? ` Removed ${r.deleted} now-non-spending row${r.deleted === 1 ? '' : 's'} from the Transactions tab.`
-      : ''
+  const note = r.configured && r.deleted > 0
+    ? ` Removed ${r.deleted} now-non-spending row${r.deleted === 1 ? '' : 's'} from the Transactions tab.`
     : '';
   const errNote = r.errors.length > 0 ? ` Note: the sheet sync hit errors: ${r.errors.join('; ')}.` : '';
-  return `Set ${acct.name} to "${type}".${note}${errNote}`;
+  return `Set ${displayName(acct)} to "${type}".${note}${errNote}`;
+}
+
+async function toolSetNickname(
+  args: { account?: string; nickname?: string },
+  ctx: FinanceToolCtx,
+): Promise<string> {
+  const nickname = (args.nickname ?? '').trim();
+  if (!nickname) return 'set_nickname needs a nickname.';
+  const resolved = resolveAccount(ctx, args.account ?? '');
+  if ('error' in resolved) return resolved.error;
+  const acct = resolved.account;
+
+  setNickname(ctx.sql, acct.account_id, nickname);
+  const r = await reconcileSheet(ctx.env, ctx.sql);
+  const errNote = r.errors.length > 0 ? ` Note: the sheet sync hit errors: ${r.errors.join('; ')}.` : '';
+  return `Nicknamed "${acct.name}" → "${nickname}". It'll show as the account name across the sheet.${errNote}`;
 }
 
 function toolRecentTransactions(

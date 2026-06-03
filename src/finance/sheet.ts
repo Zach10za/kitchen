@@ -38,6 +38,8 @@ import { loadRules, applyRules, upsertRule, type Enrichment } from './rules';
 import {
   loadAccountMeta,
   setAccountType,
+  setNickname,
+  setBotNickname,
   currentBalances,
   summarizeNetWorth,
   coerceType,
@@ -45,6 +47,7 @@ import {
   spendingFilter,
   ACCOUNT_TYPES,
   type AccountMetaRow,
+  type AccountBalance,
 } from './accounts';
 
 const TX_TAB = 'Transactions';
@@ -57,20 +60,6 @@ const NW_TAB = 'Net Worth';
  *  range. Quoting an already-safe title is harmless, so we quote everywhere. */
 function a1(tab: string, range: string): string {
   return `'${tab.replace(/'/g, "''")}'!${range}`;
-}
-
-/** Force a text value to stay text under USER_ENTERED input — a leading "=",
- *  "+", "-", or "@" would otherwise be parsed as a formula. The apostrophe is a
- *  Sheets text marker (not displayed, not part of the read-back value). */
-function safeText(s: string): string {
-  return /^[=+\-@]/.test(s) ? `'${s}` : s;
-}
-
-/** Live reference for a Balances-row Type cell: looks up the account (by the
- *  name in column B of the same row) in the Accounts tab and returns its current
- *  Type — so editing a type in Accounts updates the Balances history too. */
-function balanceTypeFormula(row: number): string {
-  return `=IFERROR(XLOOKUP($B${row},${ACCT_TAB}!$A:$A,${ACCT_TAB}!$C:$C),"")`;
 }
 
 /** Run a non-essential formatting call, recording (not throwing) any failure so
@@ -87,16 +76,34 @@ async function applyFormatting(
   }
 }
 
-const TX_RANGE = a1(TX_TAB, 'A2:H');
-const TX_HEADER = ['Date', 'Account', 'Amount', 'Raw Description', 'Merchant', 'Category', 'Notes', 'tx_id'];
-const TX_COL = { date: 0, account: 1, amount: 2, desc: 3, merchant: 4, category: 5, notes: 6, txId: 7 } as const;
+const TX_RANGE = a1(TX_TAB, 'A2:I');
+const TX_HEADER = ['Date', 'Account', 'Amount', 'Raw Description', 'Merchant', 'Category', 'Notes', 'tx_id', 'account_id'];
+const TX_COL = { date: 0, account: 1, amount: 2, desc: 3, merchant: 4, category: 5, notes: 6, txId: 7, acctId: 8 } as const;
 
-const ACCT_RANGE = a1(ACCT_TAB, 'A2:G');
-const ACCT_HEADER = ['Account', 'Institution', 'Type', 'Balance', 'Currency', 'Last Synced', 'account_id'];
-const ACCT_COL = { name: 0, org: 1, type: 2, balance: 3, currency: 4, synced: 5, id: 6 } as const;
+const ACCT_RANGE = a1(ACCT_TAB, 'A2:H');
+const ACCT_HEADER = ['Account', 'Institution', 'Type', 'Balance', 'Currency', 'Last Synced', 'account_id', 'Nickname'];
+const ACCT_COL = { name: 0, org: 1, type: 2, balance: 3, currency: 4, synced: 5, id: 6, nickname: 7 } as const;
 
-const BAL_HEADER = ['Date', 'Account', 'Type', 'Balance'];
+const BAL_RANGE = a1(BAL_TAB, 'A2:E');
+const BAL_HEADER = ['Date', 'Account', 'Type', 'Balance', 'account_id'];
+const BAL_COL = { date: 0, account: 1, type: 2, balance: 3, id: 4 } as const;
 const NW_HEADER = ['Date', 'Assets', 'Liabilities', 'Net Worth'];
+
+/** Column letters (1-based A=1) for building A1 cell refs inside formulas. */
+const COL_LETTER = (idx0: number) => String.fromCharCode(65 + idx0);
+
+/** Display-name reference: nickname (Accounts col H) if set, else the SimpleFin
+ *  name (col A), looked up by account_id (col G). Keyed on id so it survives
+ *  renames. `idCell` is an A1 ref like `$I5` (the row's hidden account_id cell). */
+function accountNameRef(idCell: string): string {
+  const G = `${ACCT_TAB}!$G:$G`;
+  return `=IFERROR(LET(n,XLOOKUP(${idCell},${G},${ACCT_TAB}!$H:$H),IF(n="",XLOOKUP(${idCell},${G},${ACCT_TAB}!$A:$A),n)),"")`;
+}
+
+/** Type reference, looked up by account_id (Accounts col G → col C). */
+function accountTypeRef(idCell: string): string {
+  return `=IFERROR(XLOOKUP(${idCell},${ACCT_TAB}!$G:$G,${ACCT_TAB}!$C:$C),"")`;
+}
 
 export interface ReconcileResult {
   configured: boolean;
@@ -114,7 +121,7 @@ interface TxForSheet {
   amount: number;
   description: string;
   normalized_payee: string;
-  account_name: string;
+  account_id: string;
   [key: string]: SqlStorageValue;
 }
 
@@ -231,7 +238,7 @@ async function reconcileTransactions(
   sql: SqlStorage,
   result: ReconcileResult,
 ): Promise<void> {
-  const { tabId, created } = await ensureTab(client, sheetId, TX_TAB, TX_HEADER, TX_COL.txId);
+  const { tabId, created } = await ensureTab(client, sheetId, TX_TAB, TX_HEADER, [TX_COL.txId, TX_COL.acctId]);
   if (created) {
     // A basic filter gives instant per-column sort/filter UI — the main lever
     // for diagnosing spend (filter to a category, sort by amount).
@@ -239,9 +246,11 @@ async function reconcileTransactions(
       { setBasicFilter: { filter: { range: { sheetId: tabId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: TX_HEADER.length } } } },
     ]);
   }
+  // Repair the header/hidden columns on tabs created before account_id existed.
+  await ensureLayout(client, sheetId, tabId, TX_TAB, TX_HEADER, [TX_COL.txId, TX_COL.acctId], result);
 
   const sheetRows = await client.getValues(sheetId, TX_RANGE);
-  const sheetByTx = new Map<string, { rowIndex: number; merchant: string; category: string; notes: string }>();
+  const sheetByTx = new Map<string, { rowIndex: number; merchant: string; category: string; notes: string; acctId: string }>();
   sheetRows.forEach((r, i) => {
     const txId = r[TX_COL.txId];
     if (txId) {
@@ -250,6 +259,7 @@ async function reconcileTransactions(
         merchant: r[TX_COL.merchant] ?? '',
         category: r[TX_COL.category] ?? '',
         notes: r[TX_COL.notes] ?? '',
+        acctId: r[TX_COL.acctId] ?? '',
       });
     }
   });
@@ -257,10 +267,8 @@ async function reconcileTransactions(
   // Spending accounts only. Investment/loan transactions never enter the sheet.
   const txs = sql
     .exec<TxForSheet>(
-      `SELECT t.id, t.posted, t.amount, t.description, t.normalized_payee,
-              COALESCE(a.name, t.account_id) AS account_name
+      `SELECT t.id, t.posted, t.amount, t.description, t.normalized_payee, t.account_id
          FROM transactions t
-         LEFT JOIN accounts a ON a.id = t.account_id
         WHERE ${spendingFilter('t')}
         ORDER BY t.posted ASC`,
     )
@@ -271,11 +279,14 @@ async function reconcileTransactions(
   for (const m of sql.exec<MirrorRow>('SELECT * FROM sheet_rows').toArray()) mirror.set(m.tx_id, m);
   const rules = loadRules(sql);
 
-  const cellUpdates: ValueRange[] = [];
-  const updateMirror: MirrorWrite[] = []; // applied only if the cell-update write lands
+  const cellUpdates: ValueRange[] = [];      // RAW: E:F merges (gates the mirror advance)
+  const formulaWrites: ValueRange[] = [];    // USER_ENTERED: Account formula (col B)
+  const idWrites: ValueRange[] = [];         // RAW: account_id (col I) — written LAST (commit marker)
+  const updateMirror: MirrorWrite[] = [];    // applied only if the cell-update write lands
   const appendValues: (string | number | null)[][] = [];
   const appendTxIds: string[] = [];
-  const appendMirror: MirrorWrite[] = []; // applied only if the append lands
+  const appendTxAccountIds: string[] = [];
+  const appendMirror: MirrorWrite[] = [];    // applied only if the append lands
   const harvestMerchant = new Map<string, string>();
   const harvestCategory = new Map<string, string>();
 
@@ -284,11 +295,16 @@ async function reconcileTransactions(
     const existing = sheetByTx.get(tx.id);
 
     if (!existing) {
+      // Account (col B) and account_id (col I) are filled after append (need the
+      // row #). account_id is written LAST as a commit marker, so a failed
+      // formula write leaves account_id blank and the next reconcile retries —
+      // rather than stranding a row with an id but no name formula.
       appendValues.push([
-        isoDate(tx.posted), tx.account_name, tx.amount, tx.description,
-        proposed.merchant, proposed.category, '', tx.id,
+        isoDate(tx.posted), '', tx.amount, tx.description,
+        proposed.merchant, proposed.category, '', tx.id, '',
       ]);
       appendTxIds.push(tx.id);
+      appendTxAccountIds.push(tx.account_id);
       appendMirror.push({
         tx_id: tx.id, merchant: proposed.merchant, category: proposed.category,
         bot_merchant: proposed.merchant, bot_category: proposed.category,
@@ -311,6 +327,14 @@ async function reconcileTransactions(
         range: a1(TX_TAB, `E${existing.rowIndex}:F${existing.rowIndex}`),
         values: [[mMerge.value, cMerge.value]],
       });
+    }
+
+    // Backfill the Account formula + account_id key on rows that predate the
+    // id-reference layout (empty/mismatched account_id). Formula first, id last
+    // (commit marker) so a partial failure self-heals next run.
+    if (existing.acctId !== tx.account_id) {
+      formulaWrites.push({ range: a1(TX_TAB, `B${existing.rowIndex}:B${existing.rowIndex}`), values: [[accountNameRef(`$I${existing.rowIndex}`)]] });
+      idWrites.push({ range: a1(TX_TAB, `I${existing.rowIndex}:I${existing.rowIndex}`), values: [[tx.account_id]] });
     }
 
     updateMirror.push({
@@ -369,9 +393,29 @@ async function reconcileTransactions(
       const { firstRow } = await client.appendRows(sheetId, TX_RANGE, appendValues);
       result.appended += appendValues.length;
       for (const m of appendMirror) upsertMirror(sql, m);
-      if (firstRow != null) appendTxIds.forEach((txId, i) => recordRowIndex(sql, txId, firstRow + i));
+      if (firstRow != null) {
+        appendTxIds.forEach((txId, i) => {
+          const row = firstRow + i;
+          recordRowIndex(sql, txId, row);
+          // Account (col B) formula references the row's hidden account_id (col I).
+          formulaWrites.push({ range: a1(TX_TAB, `B${row}:B${row}`), values: [[accountNameRef(`$I${row}`)]] });
+          idWrites.push({ range: a1(TX_TAB, `I${row}:I${row}`), values: [[appendTxAccountIds[i]!]] });
+        });
+      }
     } catch (err) {
       result.errors.push(`tx-appends: ${(err as Error).message}`);
+    }
+  }
+
+  // Account-name formulas (col B) first, THEN account_id (col I) as the commit
+  // marker — both USER_ENTERED/RAW respectively. Live links to the Accounts tab,
+  // so a nickname/rename shows here automatically.
+  if (formulaWrites.length > 0) {
+    try {
+      await client.batchUpdateValues(sheetId, formulaWrites, 'USER_ENTERED');
+      if (idWrites.length > 0) await client.batchUpdateValues(sheetId, idWrites); // RAW, after formulas
+    } catch (err) {
+      result.errors.push(`tx-account-formulas: ${(err as Error).message}`);
     }
   }
 
@@ -407,60 +451,70 @@ async function reconcileAccountsTab(
   sql: SqlStorage,
   result: ReconcileResult,
 ): Promise<void> {
-  const { tabId } = await ensureTab(client, sheetId, ACCT_TAB, ACCT_HEADER, ACCT_COL.id);
+  const { tabId } = await ensureTab(client, sheetId, ACCT_TAB, ACCT_HEADER, [ACCT_COL.id]);
+  // Repair the header on tabs created before the Nickname column existed.
+  await ensureLayout(client, sheetId, tabId, ACCT_TAB, ACCT_HEADER, [ACCT_COL.id], result);
 
   const sheetRows = await client.getValues(sheetId, ACCT_RANGE);
-  const sheetByAcct = new Map<string, { rowIndex: number; type: string }>();
+  const sheetByAcct = new Map<string, { rowIndex: number; type: string; nickname: string }>();
   sheetRows.forEach((r, i) => {
     const id = r[ACCT_COL.id];
-    if (id) sheetByAcct.set(id, { rowIndex: i + 2, type: r[ACCT_COL.type] ?? '' });
+    if (id) sheetByAcct.set(id, { rowIndex: i + 2, type: r[ACCT_COL.type] ?? '', nickname: r[ACCT_COL.nickname] ?? '' });
   });
 
   const balances = currentBalances(sql);
   const meta = loadAccountMeta(sql);
 
   const rowUpdates: ValueRange[] = [];
-  const botTypeUpdates: { id: string; type: string }[] = []; // applied iff updates land
+  const botTypeUpdates: { id: string; type: string }[] = [];      // applied iff updates land
+  const botNickUpdates: { id: string; nickname: string }[] = [];  // applied iff updates land
   const appendValues: (string | number | null)[][] = [];
-  const appendBotTypes: { id: string; type: string }[] = []; // applied iff append lands
+  const appendBots: { id: string; type: string; nickname: string }[] = []; // applied iff append lands
 
   for (const acct of balances) {
     const m: AccountMetaRow | undefined = meta.get(acct.account_id);
     const effectiveType = m?.type ?? acct.type;
     const baseType = m?.bot_type ?? '';
+    const effectiveNick = m?.nickname ?? acct.nickname;
+    const baseNick = m?.bot_nickname ?? '';
     const existing = sheetByAcct.get(acct.account_id);
-    const liveCells = [acct.name, acct.org ?? '', '', acct.balance, acct.currency, isoDate(Math.floor(acct.last_synced_at / 1000))];
+    // Row layout A:H = name | org | type | balance | currency | synced | id | nickname.
+    const rowFor = (type: string, nick: string) => [
+      acct.name, acct.org ?? '', type, acct.balance, acct.currency,
+      isoDate(Math.floor(acct.last_synced_at / 1000)), acct.account_id, nick,
+    ];
 
     if (!existing) {
-      liveCells[ACCT_COL.type] = effectiveType;
-      appendValues.push([...liveCells, acct.account_id]);
-      appendBotTypes.push({ id: acct.account_id, type: effectiveType });
+      appendValues.push(rowFor(effectiveType, effectiveNick));
+      appendBots.push({ id: acct.account_id, type: effectiveType, nickname: effectiveNick });
       continue;
     }
 
-    // An unrecognized free-typed value (e.g. "credit card", which isn't the
-    // canonical "credit") coerces to 'other'. Do NOT treat that as an
-    // intentional 'other' — overwriting the cell with 'other' is exactly how a
-    // typed "credit card" got destroyed. Treat it as blank so the bot rewrites
-    // the current effective type instead of clobbering the user's intent.
+    // Type: an unrecognized free-typed value (e.g. "credit card") coerces to
+    // 'other'. Treat that (and an empty cell) as blank → hand back to the bot
+    // rather than overwriting with 'other' (which once destroyed a typed value).
     const typed = (existing.type ?? '').trim();
     const coerced = coerceType(typed);
-    // Treat an empty cell, or an unrecognized free-typed value (which coerces to
-    // 'other' without the user literally choosing "other"), as blank → hand the
-    // cell back to the bot rather than overwriting it with 'other'.
-    const theirs = typed === '' || (coerced === 'other' && typed.toLowerCase() !== 'other') ? '' : coerced;
-
-    const merge = mergeField(theirs, baseType, effectiveType);
-    if (merge.harvest != null) {
-      // Fresh human edit of the Type cell → persist as the locked classification
-      // (reflects a read, so safe to apply immediately).
-      setAccountType(sql, acct.account_id, coerceType(merge.value));
+    const theirsType = typed === '' || (coerced === 'other' && typed.toLowerCase() !== 'other') ? '' : coerced;
+    const typeMerge = mergeField(theirsType, baseType, effectiveType);
+    if (typeMerge.harvest != null) {
+      setAccountType(sql, acct.account_id, coerceType(typeMerge.value));
       result.humanEdits++;
-    } else if (merge.botWrote) {
-      botTypeUpdates.push({ id: acct.account_id, type: merge.value });
+    } else if (typeMerge.botWrote) {
+      botTypeUpdates.push({ id: acct.account_id, type: typeMerge.value });
     }
-    liveCells[ACCT_COL.type] = merge.value;
-    rowUpdates.push({ range: a1(ACCT_TAB, `A${existing.rowIndex}:F${existing.rowIndex}`), values: [liveCells] });
+
+    // Nickname: free text, three-way merged like Type. The bot never proposes a
+    // nickname, so `effectiveNick` is whatever the user set (or '').
+    const nickMerge = mergeField((existing.nickname ?? '').trim(), baseNick, effectiveNick);
+    if (nickMerge.harvest != null) {
+      setNickname(sql, acct.account_id, nickMerge.value);
+      result.humanEdits++;
+    } else if (nickMerge.botWrote) {
+      botNickUpdates.push({ id: acct.account_id, nickname: nickMerge.value });
+    }
+
+    rowUpdates.push({ range: a1(ACCT_TAB, `A${existing.rowIndex}:H${existing.rowIndex}`), values: [rowFor(typeMerge.value, nickMerge.value)] });
   }
 
   if (rowUpdates.length > 0) {
@@ -468,6 +522,7 @@ async function reconcileAccountsTab(
       await client.batchUpdateValues(sheetId, rowUpdates);
       result.updated += rowUpdates.length;
       for (const b of botTypeUpdates) setBotType(sql, b.id, b.type);
+      for (const b of botNickUpdates) setBotNickname(sql, b.id, b.nickname);
     } catch (err) {
       result.errors.push(`acct-updates: ${(err as Error).message}`);
     }
@@ -476,7 +531,7 @@ async function reconcileAccountsTab(
     try {
       await client.appendRows(sheetId, ACCT_RANGE, appendValues);
       result.appended += appendValues.length;
-      for (const b of appendBotTypes) setBotType(sql, b.id, b.type);
+      for (const b of appendBots) { setBotType(sql, b.id, b.type); setBotNickname(sql, b.id, b.nickname); }
     } catch (err) {
       result.errors.push(`acct-appends: ${(err as Error).message}`);
     }
@@ -509,8 +564,10 @@ async function reconcileHistory(
 ): Promise<void> {
   const today = localDate(env.TIMEZONE);
 
-  const bal = await ensureTab(client, sheetId, BAL_TAB, BAL_HEADER, null);
-  const nwTab = await ensureTab(client, sheetId, NW_TAB, NW_HEADER, null);
+  const bal = await ensureTab(client, sheetId, BAL_TAB, BAL_HEADER, [BAL_COL.id]);
+  // Repair the header/hidden account_id on Balances tabs that predate it.
+  await ensureLayout(client, sheetId, bal.tabId, BAL_TAB, BAL_HEADER, [BAL_COL.id], result);
+  const nwTab = await ensureTab(client, sheetId, NW_TAB, NW_HEADER, []);
   if (await client.countCharts(sheetId, nwTab.tabId) === 0) {
     await client.batchUpdate(sheetId, [netWorthChartRequest(nwTab.tabId)]);
   }
@@ -550,37 +607,68 @@ async function captureBalancesRows(
   client: SheetsClient,
   sheetId: string,
   today: string,
-  balances: readonly { name: string; balance: number }[],
+  balances: readonly AccountBalance[],
   result: ReconcileResult,
 ): Promise<void> {
-  const rows = await client.getValues(sheetId, a1(BAL_TAB, 'A2:D'));
-  const todayRowByName = new Map<string, number>();
+  const rows = await client.getValues(sheetId, BAL_RANGE);
+  // Map every known account_id and SimpleFin name to the account, so we can
+  // resolve a row's account_id from a legacy row that only has a name.
+  const byId = new Map(balances.map((b) => [b.account_id, b]));
+  const nameToId = new Map(balances.map((b) => [b.name.trim(), b.account_id]));
+
+  const idBackfill: ValueRange[] = [];     // RAW: account_id (col E) — kept text for exact XLOOKUP
+  const balanceUpdates: ValueRange[] = []; // USER_ENTERED: today's balance (col D)
+  const formulaWrites: ValueRange[] = [];  // USER_ENTERED: Account (B) + Type (C) id-keyed formulas
+  const seenTodayIds = new Set<string>();
+
   rows.forEach((r, i) => {
-    if (r[0] === today) todayRowByName.set((r[1] ?? '').trim(), i + 2);
+    const rowNum = i + 2;
+    const cellId = (r[BAL_COL.id] ?? '').trim();
+    const id = cellId || nameToId.get((r[BAL_COL.account] ?? '').trim()) || '';
+    // Migrate legacy rows (any day) that lack the account_id key: backfill the id
+    // and switch Account/Type to live id-keyed references. This is what fixes the
+    // stale "Type" cell and makes renames propagate to history.
+    if (!cellId && id) {
+      idBackfill.push({ range: a1(BAL_TAB, `E${rowNum}:E${rowNum}`), values: [[id]] });
+      formulaWrites.push({
+        range: a1(BAL_TAB, `B${rowNum}:C${rowNum}`),
+        values: [[accountNameRef(`$E${rowNum}`), accountTypeRef(`$E${rowNum}`)]],
+      });
+    }
+    if (r[BAL_COL.date] === today && id) {
+      seenTodayIds.add(id);
+      const b = byId.get(id);
+      if (b) balanceUpdates.push({ range: a1(BAL_TAB, `D${rowNum}:D${rowNum}`), values: [[b.balance]] });
+    }
   });
 
-  const updates: ValueRange[] = [];
-  const appendRows: (string | number | null)[][] = [];
-  for (const b of balances) {
-    const row = todayRowByName.get(b.name.trim());
-    if (row != null) {
-      updates.push({ range: a1(BAL_TAB, `D${row}:D${row}`), values: [[b.balance]] });
-    } else {
-      appendRows.push([today, safeText(b.name), '', b.balance]);
-    }
-  }
+  // Append a row for any account missing one today (incl. late-synced accounts).
+  const appendAccounts = balances.filter((b) => !seenTodayIds.has(b.account_id));
 
-  if (updates.length > 0) await client.batchUpdateValues(sheetId, updates, 'USER_ENTERED');
-  if (appendRows.length > 0) {
-    const { firstRow } = await client.appendRows(sheetId, a1(BAL_TAB, 'A2:D'), appendRows, 'USER_ENTERED');
-    result.appended += appendRows.length;
+  if (balanceUpdates.length > 0) await client.batchUpdateValues(sheetId, balanceUpdates, 'USER_ENTERED');
+  // Formulas first, account_id (commit marker) last: a partial failure leaves
+  // the id blank so the next reconcile re-migrates rather than stranding a row.
+  if (formulaWrites.length > 0) await client.batchUpdateValues(sheetId, formulaWrites, 'USER_ENTERED');
+  if (idBackfill.length > 0) await client.batchUpdateValues(sheetId, idBackfill); // RAW (text id)
+
+  if (appendAccounts.length > 0) {
+    // account_id is in the appended row itself (forced text via a leading ') so
+    // the row is always matchable by id next run — otherwise a failed formula
+    // write would make the row unmatchable and we'd append a duplicate. Date +
+    // Balance are USER_ENTERED → native date/number; Account/Type formulas next.
+    const { firstRow } = await client.appendRows(
+      sheetId,
+      BAL_RANGE,
+      appendAccounts.map((b) => [today, '', '', b.balance, `'${b.account_id}`]),
+      'USER_ENTERED',
+    );
+    result.appended += appendAccounts.length;
     if (firstRow != null) {
-      const typeFormulas = appendRows.map((_, i) => [balanceTypeFormula(firstRow + i)]);
-      await client.batchUpdateValues(
-        sheetId,
-        [{ range: a1(BAL_TAB, `C${firstRow}:C${firstRow + appendRows.length - 1}`), values: typeFormulas }],
-        'USER_ENTERED',
-      );
+      const formulas: ValueRange[] = appendAccounts.map((_, i) => {
+        const row = firstRow + i;
+        return { range: a1(BAL_TAB, `B${row}:C${row}`), values: [[accountNameRef(`$E${row}`), accountTypeRef(`$E${row}`)]] };
+      });
+      await client.batchUpdateValues(sheetId, formulas, 'USER_ENTERED');
     }
   }
 }
@@ -624,7 +712,7 @@ async function ensureTab(
   sheetId: string,
   title: string,
   header: string[],
-  hideColIndex: number | null,
+  hideCols: number[],
 ): Promise<{ tabId: number; created: boolean }> {
   const existing = (await client.listTabs(sheetId)).find((t) => t.title === title);
   if (existing) return { tabId: existing.sheetId, created: false };
@@ -633,10 +721,9 @@ async function ensureTab(
   const made = (await client.listTabs(sheetId)).find((t) => t.title === title);
   if (!made) throw new Error(`Failed to create tab "${title}" (addSheet returned no matching sheet).`);
 
-  const colLetter = String.fromCharCode(65 + header.length - 1);
-  await client.batchUpdateValues(sheetId, [{ range: a1(title, `A1:${colLetter}1`), values: [header] }]);
+  await client.batchUpdateValues(sheetId, [{ range: a1(title, `A1:${COL_LETTER(header.length - 1)}1`), values: [header] }]);
 
-  const requests: unknown[] = [
+  await client.batchUpdate(sheetId, [
     {
       updateSheetProperties: {
         properties: { sheetId: made.sheetId, gridProperties: { frozenRowCount: 1 } },
@@ -650,18 +737,50 @@ async function ensureTab(
         fields: 'userEnteredFormat.textFormat.bold',
       },
     },
-  ];
-  if (hideColIndex != null) {
-    requests.push({
+    ...hideCols.map((c) => ({
       updateDimensionProperties: {
-        range: { sheetId: made.sheetId, dimension: 'COLUMNS', startIndex: hideColIndex, endIndex: hideColIndex + 1 },
+        range: { sheetId: made.sheetId, dimension: 'COLUMNS', startIndex: c, endIndex: c + 1 },
         properties: { hiddenByUser: true },
         fields: 'hiddenByUser',
       },
-    });
-  }
-  await client.batchUpdate(sheetId, requests);
+    })),
+  ]);
   return { tabId: made.sheetId, created: true };
+}
+
+/** Repair an existing tab whose header predates a column addition (e.g. the new
+ *  Nickname / account_id columns). When the header row doesn't match, rewrite it
+ *  and (re)hide the key columns. No-op once the header matches, so it costs one
+ *  read per reconcile and only writes during the one-time migration. */
+async function ensureLayout(
+  client: SheetsClient,
+  sheetId: string,
+  tabId: number,
+  title: string,
+  header: string[],
+  hideCols: number[],
+  result: ReconcileResult,
+): Promise<void> {
+  try {
+    const lastCol = COL_LETTER(header.length - 1);
+    const row1 = (await client.getValues(sheetId, a1(title, `A1:${lastCol}1`)))[0] ?? [];
+    if (header.every((h, i) => (row1[i] ?? '') === h)) return;
+    await client.batchUpdateValues(sheetId, [{ range: a1(title, `A1:${lastCol}1`), values: [header] }]);
+    if (hideCols.length > 0) {
+      await client.batchUpdate(
+        sheetId,
+        hideCols.map((c) => ({
+          updateDimensionProperties: {
+            range: { sheetId: tabId, dimension: 'COLUMNS', startIndex: c, endIndex: c + 1 },
+            properties: { hiddenByUser: true },
+            fields: 'hiddenByUser',
+          },
+        })),
+      );
+    }
+  } catch (err) {
+    result.errors.push(`${title}-layout: ${(err as Error).message}`);
+  }
 }
 
 function upsertMirror(sql: SqlStorage, row: MirrorWrite): void {

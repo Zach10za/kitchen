@@ -179,10 +179,25 @@ export const FINANCE_TOOLS = [
       parameters: {
         type: 'object',
         properties: {
-          account: { type: 'string', description: 'Account name or a distinctive part of it (matched against the synced account names).' },
+          account: { type: 'string', description: 'Account name, nickname, or a distinctive part of it.' },
           type: { type: 'string', enum: ['checking', 'savings', 'credit', 'cash', 'brokerage', 'retirement', 'mortgage', 'loan', 'other'], description: 'The account type to set.' },
         },
         required: ['account', 'type'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'set_nickname',
+      description: "Give an account a nickname (display name) used across the sheet — handy when the bank's name is cryptic. Use when the user says \"rename\", \"nickname\", or \"call my X account Y\". The original bank name is preserved; the nickname is shown everywhere (Accounts, Balances, Transactions) and updates live via references.",
+      parameters: {
+        type: 'object',
+        properties: {
+          account: { type: 'string', description: 'Account name, current nickname, or a distinctive part of it.' },
+          nickname: { type: 'string', description: 'The display name to use for this account.' },
+        },
+        required: ['account', 'nickname'],
       },
     },
   },
