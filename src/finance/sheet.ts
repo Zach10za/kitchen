@@ -498,7 +498,7 @@ async function reconcileAccountsTab(
   }
 }
 
-// ─── History tabs (Balances + Net Worth), once per local day ─────────────────
+// ─── History tabs (Balances + Net Worth), one row per account per day ────────
 
 async function reconcileHistory(
   client: SheetsClient,
@@ -508,7 +508,6 @@ async function reconcileHistory(
   result: ReconcileResult,
 ): Promise<void> {
   const today = localDate(env.TIMEZONE);
-  if (getSetting(sql, 'sheet_history_date') === today) return; // already captured today
 
   const bal = await ensureTab(client, sheetId, BAL_TAB, BAL_HEADER, null);
   const nwTab = await ensureTab(client, sheetId, NW_TAB, NW_HEADER, null);
@@ -517,36 +516,19 @@ async function reconcileHistory(
   }
 
   const balances = currentBalances(sql);
-  if (balances.length === 0) return; // nothing to snapshot yet — don't claim the day
+  if (balances.length === 0) return; // nothing to snapshot yet
 
-  // Claim the day BEFORE appending. The two appends aren't atomic, so if we
-  // claimed after and the second failed, the retry would duplicate the first
-  // tab's rows. Claiming first means a failure skips today's sheet snapshot
-  // (the data still lives in balance_history) rather than duplicating it.
-  setSetting(sql, 'sheet_history_date', today);
-
-  const nw = summarizeNetWorth(balances);
+  // Idempotent per (account, day): we never trust a once-a-day "claim". Instead
+  // we read today's rows and UPDATE them (latest balance) or APPEND any account
+  // missing — so an account connected later in the day (a brokerage/401k that
+  // synced after the morning's first run) still gets captured today, and today's
+  // net worth reflects every account. The reconcile mutex prevents concurrent
+  // double-appends; matching by (date, name) prevents duplicates across runs.
   try {
-    // USER_ENTERED so the Date parses to a real date and amounts to numbers.
-    // Account name is the only free text — sanitized against formula injection.
-    // Type (col C) is left blank here and filled with a live reference formula
-    // below, so changing an account's type in the Accounts tab updates the
-    // historical Balances rows too (no stale duplicated type).
-    const balRows = balances.map((b) => [today, safeText(b.name), '', b.balance]);
-    const { firstRow } = await client.appendRows(sheetId, a1(BAL_TAB, 'A2:D'), balRows, 'USER_ENTERED');
-    result.appended += balances.length;
-    if (firstRow != null) {
-      const typeFormulas = balances.map((_, i) => [balanceTypeFormula(firstRow + i)]);
-      await client.batchUpdateValues(
-        sheetId,
-        [{ range: a1(BAL_TAB, `C${firstRow}:C${firstRow + balances.length - 1}`), values: typeFormulas }],
-        'USER_ENTERED',
-      );
-    }
-    await client.appendRows(sheetId, a1(NW_TAB, 'A2:D'), [[today, nw.assets, nw.liabilities, nw.net]], 'USER_ENTERED');
-    result.appended += 1;
+    await captureBalancesRows(client, sheetId, today, balances, result);
+    await captureNetWorthRow(client, sheetId, today, summarizeNetWorth(balances), result);
   } catch (err) {
-    result.errors.push(`history-append: ${(err as Error).message}`);
+    result.errors.push(`history: ${(err as Error).message}`);
   }
 
   // Formats applied after the rows exist (appended rows don't inherit
@@ -559,6 +541,75 @@ async function reconcileHistory(
       { col: 0, kind: 'date' }, { col: 1, kind: 'currency' }, { col: 2, kind: 'currency' }, { col: 3, kind: 'currency' },
     ]),
   );
+}
+
+/** Upsert today's per-account balance rows: update the Balance cell of an
+ *  existing (today, account) row, or append a new row (with a live Type
+ *  formula) for any account missing one. */
+async function captureBalancesRows(
+  client: SheetsClient,
+  sheetId: string,
+  today: string,
+  balances: readonly { name: string; balance: number }[],
+  result: ReconcileResult,
+): Promise<void> {
+  const rows = await client.getValues(sheetId, a1(BAL_TAB, 'A2:D'));
+  const todayRowByName = new Map<string, number>();
+  rows.forEach((r, i) => {
+    if (r[0] === today) todayRowByName.set((r[1] ?? '').trim(), i + 2);
+  });
+
+  const updates: ValueRange[] = [];
+  const appendRows: (string | number | null)[][] = [];
+  for (const b of balances) {
+    const row = todayRowByName.get(b.name.trim());
+    if (row != null) {
+      updates.push({ range: a1(BAL_TAB, `D${row}:D${row}`), values: [[b.balance]] });
+    } else {
+      appendRows.push([today, safeText(b.name), '', b.balance]);
+    }
+  }
+
+  if (updates.length > 0) await client.batchUpdateValues(sheetId, updates, 'USER_ENTERED');
+  if (appendRows.length > 0) {
+    const { firstRow } = await client.appendRows(sheetId, a1(BAL_TAB, 'A2:D'), appendRows, 'USER_ENTERED');
+    result.appended += appendRows.length;
+    if (firstRow != null) {
+      const typeFormulas = appendRows.map((_, i) => [balanceTypeFormula(firstRow + i)]);
+      await client.batchUpdateValues(
+        sheetId,
+        [{ range: a1(BAL_TAB, `C${firstRow}:C${firstRow + appendRows.length - 1}`), values: typeFormulas }],
+        'USER_ENTERED',
+      );
+    }
+  }
+}
+
+/** Upsert today's single Net Worth total row (update if present, else append),
+ *  so the total reflects every account even as accounts are added through the day. */
+async function captureNetWorthRow(
+  client: SheetsClient,
+  sheetId: string,
+  today: string,
+  nw: { assets: number; liabilities: number; net: number },
+  result: ReconcileResult,
+): Promise<void> {
+  const dates = await client.getValues(sheetId, a1(NW_TAB, 'A2:A'));
+  let rowIndex: number | null = null;
+  dates.forEach((r, i) => {
+    if (r[0] === today) rowIndex = i + 2;
+  });
+
+  if (rowIndex != null) {
+    await client.batchUpdateValues(
+      sheetId,
+      [{ range: a1(NW_TAB, `B${rowIndex}:D${rowIndex}`), values: [[nw.assets, nw.liabilities, nw.net]] }],
+      'USER_ENTERED',
+    );
+  } else {
+    await client.appendRows(sheetId, a1(NW_TAB, 'A2:D'), [[today, nw.assets, nw.liabilities, nw.net]], 'USER_ENTERED');
+    result.appended += 1;
+  }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -638,17 +689,6 @@ function recordRowIndex(sql: SqlStorage, txId: string, rowIndex: number): void {
   sql.exec('UPDATE sheet_rows SET row_index = ? WHERE tx_id = ?', rowIndex, txId);
 }
 
-function getSetting(sql: SqlStorage, key: string): string | null {
-  return sql.exec<{ value: string }>('SELECT value FROM settings WHERE key = ?', key).toArray()[0]?.value ?? null;
-}
-
-function setSetting(sql: SqlStorage, key: string, value: string): void {
-  sql.exec(
-    `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
-     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
-    key, value, Date.now(),
-  );
-}
 
 function isoDate(postedSec: number): string {
   return new Date(postedSec * 1000).toISOString().slice(0, 10);
