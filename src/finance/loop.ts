@@ -8,6 +8,8 @@ import type OpenAI from 'openai';
 import type { Env } from '../env';
 import { type AccountRow, type TransactionRow } from './tools';
 import { runSync } from './sync';
+import { reconcileSheet } from './sheet';
+import { loadRules, upsertRule, type RuleMatchType, type RuleRow } from './rules';
 
 export interface FinanceToolCtx {
   env: Env;
@@ -27,6 +29,10 @@ export async function executeFinanceTool(name: string, args: any, ctx: FinanceTo
       case 'unusual_transactions':  return toolUnusualTransactions(args, ctx);
       case 'sync_now':              return await toolSyncNow(ctx);
       case 'get_transactions_raw':  return toolGetTransactionsRaw(args, ctx);
+      case 'sync_sheet':            return await toolSyncSheet(ctx);
+      case 'set_rule':              return await toolSetRule(args, ctx);
+      case 'list_rules':            return toolListRules(ctx);
+      case 'category_breakdown':    return toolCategoryBreakdown(args, ctx);
       default:                      return `Unknown finance tool: ${name}`;
     }
   } catch (err) {
@@ -379,6 +385,98 @@ async function toolSyncNow(ctx: FinanceToolCtx): Promise<string> {
     `New transactions: ${result.transactionsInserted}. Updated: ${result.transactionsUpdated}.`,
     result.errors.length > 0 ? `Errors: ${result.errors.join('; ')}` : null,
   ].filter(Boolean).join(' ');
+}
+
+async function toolSyncSheet(ctx: FinanceToolCtx): Promise<string> {
+  const r = await reconcileSheet(ctx.env, ctx.sql);
+  if (!r.configured) {
+    return 'The Google Sheet is not configured (missing GOOGLE_SERVICE_ACCOUNT_JSON or FINANCE_SHEET_ID). Sheet sync is unavailable.';
+  }
+  const parts = [
+    `Sheet reconciled. ${r.appended} new row${r.appended === 1 ? '' : 's'} added, ${r.updated} updated.`,
+    r.humanEdits > 0 ? `Picked up ${r.humanEdits} of your edit${r.humanEdits === 1 ? '' : 's'} (${r.rulesHarvested} rule${r.rulesHarvested === 1 ? '' : 's'} learned).` : null,
+    r.errors.length > 0 ? `Errors: ${r.errors.join('; ')}` : null,
+  ];
+  return parts.filter(Boolean).join(' ');
+}
+
+async function toolSetRule(
+  args: { match_type?: string; pattern?: string; merchant?: string; category?: string },
+  ctx: FinanceToolCtx,
+): Promise<string> {
+  const matchType = args.match_type === 'contains' ? 'contains' : 'merchant';
+  const pattern = (args.pattern ?? '').trim();
+  const merchant = args.merchant?.trim() || null;
+  const category = args.category?.trim() || null;
+  if (!pattern) return 'set_rule needs a non-empty pattern.';
+  if (!merchant && !category) return 'set_rule needs at least one of merchant or category to set.';
+
+  // Match on the normalized (lowercase) merchant name to line up with how the
+  // sync stores normalized_payee and how applyRules compares it.
+  const normalizedPattern = matchType === 'merchant' ? pattern.toLowerCase() : pattern;
+  upsertRule(ctx.sql, {
+    match_type: matchType as RuleMatchType,
+    pattern: normalizedPattern,
+    merchant,
+    category,
+    source: 'chat',
+  });
+
+  // Apply immediately so the user sees it reflected in the sheet right away.
+  const r = await reconcileSheet(ctx.env, ctx.sql);
+  const set = [merchant ? `merchant → "${merchant}"` : null, category ? `category → "${category}"` : null]
+    .filter(Boolean)
+    .join(', ');
+  const applied = r.configured
+    ? ` Applied to the sheet (${r.updated} row${r.updated === 1 ? '' : 's'} updated).`
+    : ' (Sheet not configured, so the rule is stored but not yet reflected anywhere.)';
+  return `Rule saved: ${matchType} "${normalizedPattern}" sets ${set}.${applied}`;
+}
+
+function toolListRules(ctx: FinanceToolCtx): string {
+  const rules = loadRules(ctx.sql);
+  if (rules.length === 0) return 'No rules yet. Edit the sheet or use set_rule to create some.';
+  const lines = rules.map((r: RuleRow) => {
+    const sets = [r.merchant ? `merchant="${r.merchant}"` : null, r.category ? `category="${r.category}"` : null]
+      .filter(Boolean)
+      .join(', ');
+    const origin = r.source === 'manual' ? 'learned from sheet edit' : 'set via chat';
+    return `- ${r.match_type} "${r.pattern}" → ${sets} (${origin})`;
+  });
+  return `${rules.length} rule${rules.length === 1 ? '' : 's'}:\n${lines.join('\n')}`;
+}
+
+function toolCategoryBreakdown(args: { days?: number }, ctx: FinanceToolCtx): string {
+  const days = args.days ?? 30;
+  const since = nowSec() - days * 86_400;
+
+  // Join the raw ledger to the sheet mirror so categories reflect what's in the
+  // Google Sheet (including the user's manual edits). Outflow only.
+  const rows = ctx.sql
+    .exec<{ category: string; total: number; count: number }>(
+      `SELECT COALESCE(NULLIF(TRIM(s.category), ''), '(uncategorized)') AS category,
+              SUM(t.amount) AS total,
+              COUNT(*) AS count
+         FROM transactions t
+         LEFT JOIN sheet_rows s ON s.tx_id = t.id
+        WHERE t.posted >= ? AND t.amount < 0
+        GROUP BY category
+        ORDER BY total ASC`,
+      since,
+    )
+    .toArray();
+
+  if (rows.length === 0) return `No outflow in the last ${days} days.`;
+  const total = rows.reduce((sum, r) => sum + r.total, 0);
+  const lines = rows.map((r) => {
+    const pct = total !== 0 ? ((r.total / total) * 100).toFixed(0) : '0';
+    return `- ${r.category}: ${formatMoney(-r.total)} (${pct}%, ${r.count} tx)`;
+  });
+  return [
+    `Spend by category (last ${days}d), total ${formatMoney(-total)}:`,
+    ...lines,
+    'Note: categories come from the Google Sheet. "(uncategorized)" rows still need labeling there or via set_rule.',
+  ].join('\n');
 }
 
 function formatMoney(n: number): string {

@@ -1,6 +1,7 @@
 import type { Env } from './env';
 import type { Interaction } from './discord/types';
 import { runSync } from './finance/sync';
+import { reconcileSheet } from './finance/sheet';
 import { syncResultEmbed } from './finance/render';
 import type { AccountRow, TransactionRow } from './finance/tools';
 import { AgentDOBase } from './runtime/agent-do-base';
@@ -26,6 +27,10 @@ export class FinanceDO extends AgentDOBase<Env> {
   protected async handleCustomRoute(request: Request, url: URL): Promise<Response | null> {
     if (url.pathname === '/sync' && request.method === 'POST') {
       const result = await runSync(this.env, this.sql);
+      return Response.json(result);
+    }
+    if (url.pathname === '/sheet-sync' && request.method === 'POST') {
+      const result = await reconcileSheet(this.env, this.sql);
       return Response.json(result);
     }
     return null;
@@ -77,28 +82,48 @@ export class FinanceDO extends AgentDOBase<Env> {
     const settings = this.sql.exec(
       'SELECT key, length(value) AS len, substr(value, 1, 200) AS preview, updated_at FROM settings',
     ).toArray();
+    const sheetStats = this.sql.exec<{ rows: number; locked: number; categorized: number }>(
+      `SELECT COUNT(*) AS rows,
+              SUM(CASE WHEN locked_merchant = 1 OR locked_category = 1 THEN 1 ELSE 0 END) AS locked,
+              SUM(CASE WHEN TRIM(category) <> '' THEN 1 ELSE 0 END) AS categorized
+         FROM sheet_rows`,
+    ).toArray()[0] ?? { rows: 0, locked: 0, categorized: 0 };
+    const rules = this.sql.exec(
+      'SELECT match_type, pattern, merchant, category, source FROM rules ORDER BY id DESC LIMIT 50',
+    ).toArray();
     return {
       accounts,
       transaction_count: txCount,
       recent_transactions: recentTx,
       recent_conversation: recentConv,
       settings,
+      sheet: {
+        configured: Boolean(this.env.GOOGLE_SERVICE_ACCOUNT_JSON && this.env.FINANCE_SHEET_ID),
+        ...sheetStats,
+      },
+      rules,
     };
   }
 
-  /** Pull latest from SimpleFin. Called from /heartbeat (hourly cron) and the
-   *  /sync admin endpoint. Errors are captured so a single bad sync doesn't
-   *  kill the heartbeat (which also drives the conversation prune). */
+  /** Pull latest from SimpleFin, then reconcile the Google Sheet. Called from
+   *  /heartbeat (hourly cron) and the /sync admin endpoint. Errors are captured
+   *  so a single bad sync doesn't kill the heartbeat (which also drives the
+   *  conversation prune). The sheet reconcile is wrapped separately so a Sheets
+   *  outage never blocks the raw SimpleFin pull, and vice versa. */
   private async runScheduledSync(): Promise<void> {
-    if (!this.env.SIMPLEFIN_ACCESS_URL) {
-      // Don't error on every heartbeat in environments without the secret.
-      return;
+    if (this.env.SIMPLEFIN_ACCESS_URL) {
+      try {
+        await runSync(this.env, this.sql);
+      } catch (err) {
+        console.error('finance scheduled sync failed', err);
+        await captureError(this.env, err, { source: 'finance:scheduled-sync' });
+      }
     }
     try {
-      await runSync(this.env, this.sql);
+      await reconcileSheet(this.env, this.sql);
     } catch (err) {
-      console.error('finance scheduled sync failed', err);
-      await captureError(this.env, err, { source: 'finance:scheduled-sync' });
+      console.error('finance sheet reconcile failed', err);
+      await captureError(this.env, err, { source: 'finance:sheet-reconcile' });
     }
   }
 }

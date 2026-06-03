@@ -125,6 +125,52 @@ export const FINANCE_TOOLS = [
       },
     },
   },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'sync_sheet',
+      description: 'Reconcile the Google Sheet now: push any new transactions into it, pull back merchant/category edits the user made in the sheet, and harvest those edits into reusable rules. Normally runs hourly via cron — call this when the user asks to refresh the sheet, says they just edited it, or after you create a rule and want it applied immediately.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'set_rule',
+      description: 'Create or update a categorization rule, then apply it to the sheet. Use for bulk commands like "categorize all amazon as Shopping" or "rename TST* PHILZ to Philz Coffee". A rule can set a cleaned merchant name, a category, or both. Rules apply to all matching transactions except rows the user has manually overridden in the sheet.',
+      parameters: {
+        type: 'object',
+        properties: {
+          match_type: { type: 'string', enum: ['merchant', 'contains'], description: '"merchant" matches the exact normalized merchant name (lowercase, as shown by top_merchants). "contains" matches a case-insensitive substring of the raw bank description — use it when the merchant name is messy or varies.' },
+          pattern: { type: 'string', description: 'For match_type "merchant": the normalized merchant name (lowercase). For "contains": the substring to look for in the raw description.' },
+          merchant: { type: 'string', description: 'Optional. Cleaned merchant name to set on matching rows.' },
+          category: { type: 'string', description: 'Optional. Category to set on matching rows (e.g. "Dining", "Groceries", "Subscriptions").' },
+        },
+        required: ['match_type', 'pattern'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'list_rules',
+      description: 'List the active categorization/merchant rules, including which were learned from the user\'s manual sheet edits vs. set explicitly. Use when the user asks "what rules do I have", "why is X categorized as Y", or before editing rules.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'category_breakdown',
+      description: 'Spending grouped by category over a window, using the categories maintained in the Google Sheet. Use for "where does my money go by category", "how much on Dining this month", or any category-level analysis. Uncategorized spend is reported separately so the user knows how much is still unlabeled.',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: { type: 'integer', minimum: 1, maximum: 365, description: 'Lookback window. Default 30.' },
+        },
+      },
+    },
+  },
   // Shared Tavily-backed search (executed centrally in AgentDOBase).
   WEB_SEARCH_TOOL,
   // OpenAI server-side built-in: executes on OpenAI's side, output echoed

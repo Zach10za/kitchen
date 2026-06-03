@@ -23,7 +23,7 @@ export const FINANCE_SPEC: BotSpec = {
     'accounts',
   ]),
   tools: FINANCE_TOOLS,
-  resetTables: ['transactions', 'accounts', 'conversation'],
+  resetTables: ['sheet_rows', 'rules', 'transactions', 'accounts', 'conversation'],
   scopeColumn: 'thread_id',
 
   buildSystemPrompt: (sql, env) => buildFinanceSystemPrompt(sql, env.TIMEZONE),
@@ -127,6 +127,41 @@ export const FINANCE_SPEC: BotSpec = {
       },
     },
     { version: 4, up: (sql) => ensureUsageSchema(sql) },
+    {
+      // Google Sheets working layer. `sheet_rows` mirrors the sheet's
+      // enrichment columns: it holds the effective merchant/category (for
+      // offline analysis) plus the "base" the bot last wrote and per-field
+      // lock flags, which together drive the three-way merge in sheet.ts.
+      // `rules` is the learning loop's memory (see rules.ts).
+      version: 5,
+      up: (sql) => {
+        sql.exec(`
+          CREATE TABLE IF NOT EXISTS sheet_rows (
+            tx_id TEXT PRIMARY KEY,
+            merchant TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '',
+            bot_merchant TEXT NOT NULL DEFAULT '',
+            bot_category TEXT NOT NULL DEFAULT '',
+            locked_merchant INTEGER NOT NULL DEFAULT 0,
+            locked_category INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            row_index INTEGER,
+            synced_at INTEGER NOT NULL DEFAULT 0
+          );
+          CREATE INDEX IF NOT EXISTS idx_sheet_category ON sheet_rows(category);
+          CREATE TABLE IF NOT EXISTS rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_type TEXT NOT NULL,
+            pattern TEXT NOT NULL,
+            merchant TEXT,
+            category TEXT,
+            source TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            UNIQUE(match_type, pattern)
+          );
+        `);
+      },
+    },
   ],
 };
 

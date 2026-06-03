@@ -13,6 +13,13 @@ AI_GATEWAY_URL=
 # TAVILY_API_KEY=
 # Optional: set to enable the finance bot in a separate channel
 # DISCORD_FINANCE_CHANNEL_ID=
+# Optional: finance Google Sheets working layer. GOOGLE_SERVICE_ACCOUNT_JSON is
+# the entire service-account key file as one line (escape newlines in the PEM as
+# \n, or paste the raw JSON); share the spreadsheet with the account's email.
+# FINANCE_SHEET_ID is the long id from the sheet's URL. If unset, sheet sync
+# no-ops and the finance bot stays chat-only.
+# GOOGLE_SERVICE_ACCOUNT_JSON=
+# FINANCE_SHEET_ID=
 # Optional: set to enable the tasks bot in a separate channel
 # DISCORD_TASKS_CHANNEL_ID=
 # Optional: set to enable the workout bot in a separate channel
