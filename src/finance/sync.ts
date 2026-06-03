@@ -10,6 +10,7 @@
 import type { Env } from '../env';
 import { SimplefinClient, type SimplefinAccount, type SimplefinTransaction } from './simplefin';
 import { normalizeMerchant } from './normalize';
+import { guessAccountType, seedAccountMeta, captureBalance, localDate } from './accounts';
 
 /** How far back to look on the very first sync (no prior data). */
 const FIRST_SYNC_LOOKBACK_DAYS = 90;
@@ -57,6 +58,7 @@ export async function runSync(env: Env, sql: SqlStorage): Promise<SyncResult> {
   };
 
   const now = Date.now();
+  const today = localDate(env.TIMEZONE);
   for (const account of response.accounts) {
     // SimpleFin sometimes returns a per-account `error` field instead of (or
     // alongside) transactions when a particular institution's connection has
@@ -66,6 +68,11 @@ export async function runSync(env: Env, sql: SqlStorage): Promise<SyncResult> {
       result.errors.push(`${account.name ?? account.id}: ${accountError}`);
     }
     upsertAccount(sql, account, now);
+    // Classify on first sight (keyword guess) and snapshot today's balance so
+    // net worth can be tracked over time across every account type — including
+    // the investment/loan accounts whose transactions we don't track row-level.
+    seedAccountMeta(sql, account.id, guessAccountType(account.name, account.org?.name));
+    captureBalance(sql, account.id, parseFloat(account.balance), today);
     result.accountsUpdated++;
     for (const tx of account.transactions ?? []) {
       const action = upsertTransaction(sql, account.id, tx, now);

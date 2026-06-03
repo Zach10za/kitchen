@@ -210,6 +210,20 @@ export class SheetsClient {
     return { firstRow: parseFirstRow(data.updates?.updatedRange) };
   }
 
+  /** Delete the given 1-based row numbers from a tab. Processed top-down by the
+   *  API, so we sort descending and emit one deleteDimension per row — that way
+   *  each deletion can't invalidate the indices of rows we haven't deleted yet. */
+  async deleteRows(spreadsheetId: string, sheetId: number, rows1Based: number[]): Promise<void> {
+    const sorted = [...new Set(rows1Based)].sort((a, b) => b - a);
+    if (sorted.length === 0) return;
+    await this.batchUpdate(
+      spreadsheetId,
+      sorted.map((r) => ({
+        deleteDimension: { range: { sheetId, dimension: 'ROWS', startIndex: r - 1, endIndex: r } },
+      })),
+    );
+  }
+
   /** Low-level spreadsheets.batchUpdate (add tab, format header, hide column). */
   async batchUpdate(spreadsheetId: string, requests: unknown[]): Promise<void> {
     if (requests.length === 0) return;

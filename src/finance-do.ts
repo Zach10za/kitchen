@@ -91,6 +91,13 @@ export class FinanceDO extends AgentDOBase<Env> {
     const rules = this.sql.exec(
       'SELECT match_type, pattern, merchant, category, source FROM rules ORDER BY id DESC LIMIT 50',
     ).toArray();
+    const accountTypes = this.sql.exec(
+      `SELECT a.name, m.type, m.locked_type, CAST(a.balance AS REAL) AS balance
+         FROM accounts a LEFT JOIN account_meta m ON m.account_id = a.id ORDER BY a.name`,
+    ).toArray();
+    const balanceSnapshots = this.sql.exec<{ days: number; last: string | null }>(
+      'SELECT COUNT(DISTINCT as_of_date) AS days, MAX(as_of_date) AS last FROM balance_history',
+    ).toArray()[0] ?? { days: 0, last: null };
     return {
       accounts,
       transaction_count: txCount,
@@ -102,6 +109,8 @@ export class FinanceDO extends AgentDOBase<Env> {
         ...sheetStats,
       },
       rules,
+      account_types: accountTypes,
+      balance_snapshots: balanceSnapshots,
     };
   }
 

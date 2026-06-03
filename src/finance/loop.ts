@@ -6,10 +6,19 @@
 
 import type OpenAI from 'openai';
 import type { Env } from '../env';
-import { type AccountRow, type TransactionRow } from './tools';
+import { type TransactionRow } from './tools';
 import { runSync } from './sync';
 import { reconcileSheet } from './sheet';
 import { loadRules, upsertRule, type RuleMatchType, type RuleRow } from './rules';
+import {
+  spendingFilter,
+  currentBalances,
+  summarizeNetWorth,
+  netWorthSeries,
+  setAccountType,
+  coerceType,
+  ACCOUNT_TYPES,
+} from './accounts';
 
 export interface FinanceToolCtx {
   env: Env;
@@ -33,6 +42,8 @@ export async function executeFinanceTool(name: string, args: any, ctx: FinanceTo
       case 'set_rule':              return await toolSetRule(args, ctx);
       case 'list_rules':            return toolListRules(ctx);
       case 'category_breakdown':    return toolCategoryBreakdown(args, ctx);
+      case 'net_worth':             return toolNetWorth(args, ctx);
+      case 'set_account_type':      return await toolSetAccountType(args, ctx);
       default:                      return `Unknown finance tool: ${name}`;
     }
   } catch (err) {
@@ -45,12 +56,82 @@ function nowSec(): number {
 }
 
 function toolListAccounts(ctx: FinanceToolCtx): string {
-  const rows = ctx.sql.exec<AccountRow>('SELECT * FROM accounts ORDER BY name').toArray();
-  if (rows.length === 0) return 'No accounts synced yet. Call sync_now to pull from SimpleFin.';
-  const lines = rows.map(
-    (a) => `- ${a.name}${a.org_name ? ` (${a.org_name})` : ''}: ${a.currency} ${a.balance}${a.available_balance ? ` (avail ${a.available_balance})` : ''} — last sync ${new Date(a.last_synced_at).toISOString()}`
+  const balances = currentBalances(ctx.sql);
+  if (balances.length === 0) return 'No accounts synced yet. Call sync_now to pull from SimpleFin.';
+  const { assets, liabilities, net } = summarizeNetWorth(balances);
+  const isLiability = (type: string) => ['credit', 'mortgage', 'loan'].includes(type);
+
+  const assetLines = balances
+    .filter((b) => !isLiability(b.type))
+    .map((b) => `  - ${b.name}${b.org ? ` (${b.org})` : ''} [${b.type}]: ${formatMoney(b.balance)}`);
+  const liabLines = balances
+    .filter((b) => isLiability(b.type))
+    .map((b) => `  - ${b.name}${b.org ? ` (${b.org})` : ''} [${b.type}]: ${formatMoney(-Math.abs(b.balance))}`);
+
+  return [
+    `${balances.length} account${balances.length === 1 ? '' : 's'} — net worth ${formatMoney(net)}:`,
+    `Assets ${formatMoney(assets)}:`,
+    ...assetLines,
+    liabLines.length > 0 ? `Liabilities ${formatMoney(liabilities)}:` : null,
+    ...liabLines,
+  ].filter(Boolean).join('\n');
+}
+
+function toolNetWorth(args: { days?: number }, ctx: FinanceToolCtx): string {
+  const balances = currentBalances(ctx.sql);
+  if (balances.length === 0) return 'No accounts synced yet — net worth is unavailable until SimpleFin syncs.';
+  const { assets, liabilities, net } = summarizeNetWorth(balances);
+
+  const days = Math.max(1, Math.min(3650, args.days ?? 90));
+  const series = netWorthSeries(ctx.sql, days);
+
+  const lines = [
+    `Net worth now: ${formatMoney(net)} (assets ${formatMoney(assets)}, liabilities ${formatMoney(liabilities)}).`,
+  ];
+  if (series.length >= 2) {
+    const first = series[0]!;
+    const last = series[series.length - 1]!;
+    const delta = last.net - first.net;
+    lines.push(
+      `Trend (${first.date} → ${last.date}): ${formatMoneySigned(delta)} over ${series.length} snapshot${series.length === 1 ? '' : 's'}.`,
+    );
+  } else {
+    lines.push('Not enough history yet to show a trend — balance snapshots accrue one per day. Check back tomorrow.');
+  }
+  return lines.join('\n');
+}
+
+async function toolSetAccountType(
+  args: { account?: string; type?: string },
+  ctx: FinanceToolCtx,
+): Promise<string> {
+  const query = (args.account ?? '').trim().toLowerCase();
+  const rawType = (args.type ?? '').trim().toLowerCase();
+  const type = coerceType(rawType);
+  if (!query) return 'set_account_type needs an account name (or part of one).';
+  // coerceType maps anything unrecognized to 'other'; reject that unless the
+  // user literally asked for 'other', so a typo'd type isn't applied silently.
+  if (type === 'other' && rawType !== 'other') {
+    return `Unknown type "${args.type}". Use one of: ${ACCOUNT_TYPES.join(', ')}.`;
+  }
+
+  const matches = currentBalances(ctx.sql).filter(
+    (b) => b.name.toLowerCase().includes(query) || (b.org ?? '').toLowerCase().includes(query),
   );
-  return `${rows.length} account${rows.length === 1 ? '' : 's'}:\n${lines.join('\n')}`;
+  if (matches.length === 0) return `No account matches "${args.account}". Call list_accounts to see names.`;
+  if (matches.length > 1) {
+    return `"${args.account}" matches ${matches.length} accounts: ${matches.map((m) => m.name).join(', ')}. Be more specific.`;
+  }
+
+  const acct = matches[0]!;
+  setAccountType(ctx.sql, acct.account_id, type);
+  const r = await reconcileSheet(ctx.env, ctx.sql);
+  const note = r.configured
+    ? r.deleted > 0
+      ? ` Removed ${r.deleted} now-non-spending row${r.deleted === 1 ? '' : 's'} from the Transactions tab.`
+      : ''
+    : '';
+  return `Set ${acct.name} to "${type}".${note}`;
 }
 
 function toolRecentTransactions(
@@ -61,7 +142,7 @@ function toolRecentTransactions(
   const limit = args.limit ?? 50;
   const since = nowSec() - days * 86_400;
 
-  const filters = ['posted >= ?'];
+  const filters = ['posted >= ?', spendingFilter()];
   const params: SqlStorageValue[] = [since];
   if (args.merchant) {
     filters.push('normalized_payee = ?');
@@ -97,7 +178,7 @@ function toolTopMerchants(
     .exec<{ normalized_payee: string; total: number; count: number }>(
       `SELECT normalized_payee, SUM(amount) AS total, COUNT(*) AS count
          FROM transactions
-        WHERE posted >= ? AND amount < 0
+        WHERE posted >= ? AND amount < 0 AND ${spendingFilter()}
         GROUP BY normalized_payee
         ORDER BY total ASC
         LIMIT ?`,
@@ -122,7 +203,7 @@ function toolMerchantHistory(
 
   const rows = ctx.sql
     .exec<TransactionRow>(
-      'SELECT * FROM transactions WHERE normalized_payee = ? AND posted >= ? ORDER BY posted DESC',
+      `SELECT * FROM transactions WHERE normalized_payee = ? AND posted >= ? AND ${spendingFilter()} ORDER BY posted DESC`,
       merchant, since
     )
     .toArray();
@@ -167,7 +248,7 @@ function toolPeriodTotal(
          COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS outflow,
          COUNT(*) AS count
        FROM transactions
-       WHERE posted >= ?`,
+       WHERE posted >= ? AND ${spendingFilter()}`,
       since
     )
     .toArray()[0]!;
@@ -196,7 +277,7 @@ function toolComparePeriods(
          COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS inflow,
          COALESCE(SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END), 0) AS outflow
        FROM transactions
-       WHERE posted >= ? AND posted < ?`,
+       WHERE posted >= ? AND posted < ? AND ${spendingFilter()}`,
       start, end
     ).toArray()[0]!;
 
@@ -209,7 +290,7 @@ function toolComparePeriods(
               COALESCE(SUM(CASE WHEN posted >= ? AND amount < 0 THEN amount ELSE 0 END), 0) AS recent,
               COALESCE(SUM(CASE WHEN posted < ? AND amount < 0 THEN amount ELSE 0 END), 0) AS prior
        FROM transactions
-       WHERE posted >= ? AND amount < 0
+       WHERE posted >= ? AND amount < 0 AND ${spendingFilter()}
        GROUP BY normalized_payee
        ORDER BY ABS(
          COALESCE(SUM(CASE WHEN posted >= ? AND amount < 0 THEN amount ELSE 0 END), 0)
@@ -258,7 +339,7 @@ function toolUnusualTransactions(
 
   const recent = ctx.sql
     .exec<TransactionRow>(
-      'SELECT * FROM transactions WHERE posted >= ? AND amount < 0 ORDER BY posted DESC',
+      `SELECT * FROM transactions WHERE posted >= ? AND amount < 0 AND ${spendingFilter()} ORDER BY posted DESC`,
       recentSince
     )
     .toArray();
@@ -275,7 +356,7 @@ function toolUnusualTransactions(
               AVG(ABS(amount)) AS avg,
               SUM(ABS(amount) * ABS(amount)) AS sum_sq
          FROM transactions
-        WHERE posted < ? AND posted >= ? AND amount < 0
+        WHERE posted < ? AND posted >= ? AND amount < 0 AND ${spendingFilter()}
         GROUP BY normalized_payee`,
       recentSince, historySince,
     )
@@ -334,7 +415,7 @@ function toolGetTransactionsRaw(
   const limit = Math.max(1, Math.min(500, args.limit ?? 200));
   const since = nowSec() - days * 86_400;
 
-  const filters = ['posted >= ?'];
+  const filters = ['posted >= ?', spendingFilter()];
   const params: SqlStorageValue[] = [since];
   if (args.account_id) {
     filters.push('account_id = ?');
@@ -459,7 +540,7 @@ function toolCategoryBreakdown(args: { days?: number }, ctx: FinanceToolCtx): st
               COUNT(*) AS count
          FROM transactions t
          LEFT JOIN sheet_rows s ON s.tx_id = t.id
-        WHERE t.posted >= ? AND t.amount < 0
+        WHERE t.posted >= ? AND t.amount < 0 AND ${spendingFilter('t')}
         GROUP BY category
         ORDER BY total ASC`,
       since,
