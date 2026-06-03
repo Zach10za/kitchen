@@ -122,14 +122,26 @@ export class FinanceDO extends AgentDOBase<Env> {
   private async runScheduledSync(): Promise<void> {
     if (this.env.SIMPLEFIN_ACCESS_URL) {
       try {
-        await runSync(this.env, this.sql);
+        // runSync collects per-account failures into result.errors rather than
+        // throwing, so inspect the result — otherwise a broken bank connection
+        // vanishes silently on every hourly run.
+        const sync = await runSync(this.env, this.sql);
+        if (sync.errors.length > 0) {
+          await captureError(this.env, new Error(sync.errors.join('; ')), { source: 'finance:scheduled-sync' });
+        }
       } catch (err) {
         console.error('finance scheduled sync failed', err);
         await captureError(this.env, err, { source: 'finance:scheduled-sync' });
       }
     }
     try {
-      await reconcileSheet(this.env, this.sql);
+      // reconcileSheet is non-throwing by design (per-section/per-write errors
+      // land in result.errors); surface those so a failed Sheets write doesn't
+      // disappear without a trace.
+      const recon = await reconcileSheet(this.env, this.sql);
+      if (recon.errors.length > 0) {
+        await captureError(this.env, new Error(recon.errors.join('; ')), { source: 'finance:sheet-reconcile' });
+      }
     } catch (err) {
       console.error('finance sheet reconcile failed', err);
       await captureError(this.env, err, { source: 'finance:sheet-reconcile' });

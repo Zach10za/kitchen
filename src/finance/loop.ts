@@ -8,6 +8,7 @@ import type OpenAI from 'openai';
 import type { Env } from '../env';
 import { type TransactionRow } from './tools';
 import { runSync } from './sync';
+import { captureError } from '../error-triage';
 import { reconcileSheet } from './sheet';
 import { loadRules, upsertRule, type RuleMatchType, type RuleRow } from './rules';
 import {
@@ -17,6 +18,7 @@ import {
   netWorthSeries,
   setAccountType,
   coerceType,
+  isLiabilityType,
   ACCOUNT_TYPES,
 } from './accounts';
 
@@ -47,6 +49,11 @@ export async function executeFinanceTool(name: string, args: any, ctx: FinanceTo
       default:                      return `Unknown finance tool: ${name}`;
     }
   } catch (err) {
+    // A thrown error here is an unexpected bug (the individual handlers return
+    // strings for expected failures). Log + capture so it isn't reduced to a
+    // one-line message the agent might paper over.
+    console.error(`finance tool ${name} failed`, err);
+    await captureError(ctx.env, err, { source: `finance:tool:${name}` });
     return `Tool ${name} failed: ${(err as Error).message}`;
   }
 }
@@ -59,13 +66,12 @@ function toolListAccounts(ctx: FinanceToolCtx): string {
   const balances = currentBalances(ctx.sql);
   if (balances.length === 0) return 'No accounts synced yet. Call sync_now to pull from SimpleFin.';
   const { assets, liabilities, net } = summarizeNetWorth(balances);
-  const isLiability = (type: string) => ['credit', 'mortgage', 'loan'].includes(type);
 
   const assetLines = balances
-    .filter((b) => !isLiability(b.type))
+    .filter((b) => !isLiabilityType(b.type))
     .map((b) => `  - ${b.name}${b.org ? ` (${b.org})` : ''} [${b.type}]: ${formatMoney(b.balance)}`);
   const liabLines = balances
-    .filter((b) => isLiability(b.type))
+    .filter((b) => isLiabilityType(b.type))
     .map((b) => `  - ${b.name}${b.org ? ` (${b.org})` : ''} [${b.type}]: ${formatMoney(-Math.abs(b.balance))}`);
 
   return [
@@ -131,7 +137,8 @@ async function toolSetAccountType(
       ? ` Removed ${r.deleted} now-non-spending row${r.deleted === 1 ? '' : 's'} from the Transactions tab.`
       : ''
     : '';
-  return `Set ${acct.name} to "${type}".${note}`;
+  const errNote = r.errors.length > 0 ? ` Note: the sheet sync hit errors: ${r.errors.join('; ')}.` : '';
+  return `Set ${acct.name} to "${type}".${note}${errNote}`;
 }
 
 function toolRecentTransactions(
@@ -511,7 +518,8 @@ async function toolSetRule(
   const applied = r.configured
     ? ` Applied to the sheet (${r.updated} row${r.updated === 1 ? '' : 's'} updated).`
     : ' (Sheet not configured, so the rule is stored but not yet reflected anywhere.)';
-  return `Rule saved: ${matchType} "${normalizedPattern}" sets ${set}.${applied}`;
+  const errNote = r.errors.length > 0 ? ` Note: the sheet sync hit errors: ${r.errors.join('; ')}.` : '';
+  return `Rule saved: ${matchType} "${normalizedPattern}" sets ${set}.${applied}${errNote}`;
 }
 
 function toolListRules(ctx: FinanceToolCtx): string {

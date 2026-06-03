@@ -18,6 +18,16 @@
  * wrote, theirs = the current sheet value, ours = the value rules/classification
  * now imply): theirs !== base means a human edit, which is preserved and learned.
  *
+ * Two correctness invariants this module upholds:
+ *   1. The SQLite mirror (the merge `base`) is advanced ONLY after the sheet
+ *      write it represents succeeds. Writing the mirror first would, on a failed
+ *      write, make the next run mistake the un-written value for a human edit —
+ *      fabricating rules and locking cells. So: sheet first, mirror second.
+ *   2. Reconciles are serialized (see the module-level lock). reconcileSheet is
+ *      called from the hourly heartbeat and from chat tools; Durable Objects
+ *      interleave at await points, so without serialization two runs could
+ *      double-append rows or double-create tabs.
+ *
  * Row positions are never trusted across runs — the whole sheet is re-read each
  * time and rows located by a hidden key column, so sorting/filtering is safe.
  */
@@ -42,11 +52,18 @@ const ACCT_TAB = 'Accounts';
 const BAL_TAB = 'Balances';
 const NW_TAB = 'Net Worth';
 
-const TX_RANGE = `${TX_TAB}!A2:H`;
+/** Build a quoted A1 range. Sheet titles with spaces or punctuation (e.g.
+ *  "Net Worth") MUST be single-quoted in A1 notation or the API rejects the
+ *  range. Quoting an already-safe title is harmless, so we quote everywhere. */
+function a1(tab: string, range: string): string {
+  return `'${tab.replace(/'/g, "''")}'!${range}`;
+}
+
+const TX_RANGE = a1(TX_TAB, 'A2:H');
 const TX_HEADER = ['Date', 'Account', 'Amount', 'Raw Description', 'Merchant', 'Category', 'Notes', 'tx_id'];
 const TX_COL = { date: 0, account: 1, amount: 2, desc: 3, merchant: 4, category: 5, notes: 6, txId: 7 } as const;
 
-const ACCT_RANGE = `${ACCT_TAB}!A2:G`;
+const ACCT_RANGE = a1(ACCT_TAB, 'A2:G');
 const ACCT_HEADER = ['Account', 'Institution', 'Type', 'Balance', 'Currency', 'Last Synced', 'account_id'];
 const ACCT_COL = { name: 0, org: 1, type: 2, balance: 3, currency: 4, synced: 5, id: 6 } as const;
 
@@ -82,34 +99,76 @@ interface MirrorRow {
   [key: string]: SqlStorageValue;
 }
 
+interface MirrorWrite {
+  tx_id: string;
+  merchant: string;
+  category: string;
+  bot_merchant: string;
+  bot_category: string;
+  locked_merchant: number;
+  locked_category: number;
+  notes: string;
+}
+
 interface FieldMerge {
   value: string;
+  /** The bot should write `value` to the cell, and `value` becomes the new base. */
   botWrote: boolean;
+  /** A preserved human override (don't write, keep base where it is). */
   locked: boolean;
+  /** Non-null when a fresh human override should be harvested into a rule. */
   harvest: string | null;
 }
 
+/**
+ * Per-cell three-way merge.
+ *
+ * The non-obvious case is `proposed === theirs && theirs !== base`: the rule (or
+ * classification) now reproduces exactly what's in the cell — typically because
+ * a *previous* run harvested this very edit into a rule. We adopt it as
+ * bot-owned (botWrote, so base catches up) and DON'T harvest again. That's what
+ * makes the merge converge: a harvested edit stops being re-detected after one
+ * more run, instead of re-firing every reconcile.
+ */
 function mergeField(theirsRaw: string, base: string, proposed: string): FieldMerge {
   const theirs = theirsRaw.trim();
-  if (theirs !== base) {
-    if (theirs === '') {
-      // Human cleared an override → hand the cell back to the bot.
-      return { value: proposed, botWrote: proposed !== '', locked: false, harvest: null };
-    }
-    return { value: theirs, botWrote: false, locked: true, harvest: theirs };
+  if (theirs === base) {
+    if (proposed !== theirs) return { value: proposed, botWrote: true, locked: false, harvest: null };
+    return { value: theirs, botWrote: false, locked: false, harvest: null };
   }
-  if (proposed !== theirs) {
-    return { value: proposed, botWrote: true, locked: false, harvest: null };
+  // theirs !== base
+  if (theirs === '') {
+    // Cleared cell → hand back to the bot. NOTE: `proposed` still reflects any
+    // rule harvested from a prior edit, so a learned categorization re-appears;
+    // to truly drop it, remove the rule (list_rules), not just the cell.
+    return { value: proposed, botWrote: proposed !== '', locked: false, harvest: null };
   }
-  return { value: theirs, botWrote: false, locked: false, harvest: null };
+  if (proposed === theirs) {
+    return { value: theirs, botWrote: true, locked: false, harvest: null };
+  }
+  return { value: theirs, botWrote: false, locked: true, harvest: theirs };
+}
+
+// ─── Serialization ───────────────────────────────────────────────────────────
+
+/** Serializes reconciles within a DO isolate (one FinanceDO instance). Chained
+ *  so the heartbeat and the chat tools can't interleave their reads/writes. */
+let reconcileChain: Promise<unknown> = Promise.resolve();
+
+export function reconcileSheet(env: Env, sql: SqlStorage): Promise<ReconcileResult> {
+  const next = reconcileChain.then(() => runReconcile(env, sql));
+  // Keep the chain alive regardless of this run's outcome.
+  reconcileChain = next.catch(() => undefined);
+  return next;
 }
 
 /**
- * Reconcile every tab. Safe to call on each heartbeat. No-ops (configured:
- * false) when the Google service account or sheet id isn't configured. Each
- * section is wrapped so one failing tab can't abort the others.
+ * Reconcile every tab. No-ops (configured: false) when the Google service
+ * account or sheet id isn't configured. Each section is wrapped so one failing
+ * tab can't abort the others; individual sheet writes are wrapped so the mirror
+ * only advances for writes that actually landed.
  */
-export async function reconcileSheet(env: Env, sql: SqlStorage): Promise<ReconcileResult> {
+async function runReconcile(env: Env, sql: SqlStorage): Promise<ReconcileResult> {
   const result: ReconcileResult = {
     configured: false,
     appended: 0,
@@ -156,7 +215,7 @@ async function reconcileTransactions(
       { setBasicFilter: { filter: { range: { sheetId: tabId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: TX_HEADER.length } } } },
     ]);
   }
-  // Refresh the Category dropdown from the categories in use (non-strict, so new
+  // Refresh the Category dropdown from categories in use (non-strict, so new
   // ones can still be typed). Cheap and keeps the menu current as labels grow.
   const categories = sql
     .exec<{ category: string }>(
@@ -200,8 +259,10 @@ async function reconcileTransactions(
   const rules = loadRules(sql);
 
   const cellUpdates: ValueRange[] = [];
+  const updateMirror: MirrorWrite[] = []; // applied only if the cell-update write lands
   const appendValues: (string | number | null)[][] = [];
   const appendTxIds: string[] = [];
+  const appendMirror: MirrorWrite[] = []; // applied only if the append lands
   const harvestMerchant = new Map<string, string>();
   const harvestCategory = new Map<string, string>();
 
@@ -215,7 +276,7 @@ async function reconcileTransactions(
         proposed.merchant, proposed.category, '', tx.id,
       ]);
       appendTxIds.push(tx.id);
-      upsertMirror(sql, {
+      appendMirror.push({
         tx_id: tx.id, merchant: proposed.merchant, category: proposed.category,
         bot_merchant: proposed.merchant, bot_category: proposed.category,
         locked_merchant: 0, locked_category: 0, notes: '',
@@ -234,12 +295,12 @@ async function reconcileTransactions(
 
     if (mMerge.botWrote || cMerge.botWrote) {
       cellUpdates.push({
-        range: `${TX_TAB}!E${existing.rowIndex}:F${existing.rowIndex}`,
+        range: a1(TX_TAB, `E${existing.rowIndex}:F${existing.rowIndex}`),
         values: [[mMerge.value, cMerge.value]],
       });
     }
 
-    upsertMirror(sql, {
+    updateMirror.push({
       tx_id: tx.id, merchant: mMerge.value, category: cMerge.value,
       bot_merchant: mMerge.botWrote ? mMerge.value : baseMerchant,
       bot_category: cMerge.botWrote ? cMerge.value : baseCategory,
@@ -250,14 +311,13 @@ async function reconcileTransactions(
 
   // Rows whose account is no longer spending (reclassified) or whose tx is gone.
   const orphanRows: number[] = [];
+  const orphanTxIds: string[] = [];
   for (const [txId, row] of sheetByTx) {
-    if (!spendingIds.has(txId)) {
-      orphanRows.push(row.rowIndex);
-      sql.exec('DELETE FROM sheet_rows WHERE tx_id = ?', txId);
-    }
+    if (!spendingIds.has(txId)) { orphanRows.push(row.rowIndex); orphanTxIds.push(txId); }
   }
 
-  // Harvest edits into rules (apply to other unlocked rows next reconcile).
+  // Harvest edits into rules. Harvesting reflects what's ALREADY in the sheet
+  // (a read), so it's safe regardless of whether the writes below succeed.
   for (const [payee, merchant] of harvestMerchant) {
     upsertRule(sql, { match_type: 'merchant', pattern: payee, merchant, source: 'manual' });
     result.rulesHarvested++;
@@ -267,20 +327,39 @@ async function reconcileTransactions(
     if (!harvestMerchant.has(payee)) result.rulesHarvested++;
   }
 
-  // Apply writes: updates first (original indices valid), then deletes
-  // (descending), then appends (always go to the bottom).
+  // Writes: sheet first, mirror second. Each write is independent so one failure
+  // doesn't strand the others, and the mirror advances only for writes that land.
+  let updatesLanded = true;
   if (cellUpdates.length > 0) {
-    await client.batchUpdateValues(sheetId, cellUpdates);
-    result.updated += cellUpdates.length;
+    try {
+      await client.batchUpdateValues(sheetId, cellUpdates);
+      result.updated += cellUpdates.length;
+    } catch (err) {
+      result.errors.push(`tx-updates: ${(err as Error).message}`);
+      updatesLanded = false;
+    }
   }
+  if (updatesLanded) for (const m of updateMirror) upsertMirror(sql, m);
+
   if (orphanRows.length > 0) {
-    await client.deleteRows(sheetId, tabId, orphanRows);
-    result.deleted += orphanRows.length;
+    try {
+      await client.deleteRows(sheetId, tabId, orphanRows);
+      result.deleted += orphanRows.length;
+      for (const txId of orphanTxIds) sql.exec('DELETE FROM sheet_rows WHERE tx_id = ?', txId);
+    } catch (err) {
+      result.errors.push(`tx-deletes: ${(err as Error).message}`);
+    }
   }
+
   if (appendValues.length > 0) {
-    const { firstRow } = await client.appendRows(sheetId, TX_RANGE, appendValues);
-    result.appended += appendValues.length;
-    if (firstRow != null) appendTxIds.forEach((txId, i) => recordRowIndex(sql, txId, firstRow + i));
+    try {
+      const { firstRow } = await client.appendRows(sheetId, TX_RANGE, appendValues);
+      result.appended += appendValues.length;
+      for (const m of appendMirror) upsertMirror(sql, m);
+      if (firstRow != null) appendTxIds.forEach((txId, i) => recordRowIndex(sql, txId, firstRow + i));
+    } catch (err) {
+      result.errors.push(`tx-appends: ${(err as Error).message}`);
+    }
   }
 }
 
@@ -315,7 +394,9 @@ async function reconcileAccountsTab(
   const meta = loadAccountMeta(sql);
 
   const rowUpdates: ValueRange[] = [];
+  const botTypeUpdates: { id: string; type: string }[] = []; // applied iff updates land
   const appendValues: (string | number | null)[][] = [];
+  const appendBotTypes: { id: string; type: string }[] = []; // applied iff append lands
 
   for (const acct of balances) {
     const m: AccountMetaRow | undefined = meta.get(acct.account_id);
@@ -327,32 +408,40 @@ async function reconcileAccountsTab(
     if (!existing) {
       liveCells[ACCT_COL.type] = effectiveType;
       appendValues.push([...liveCells, acct.account_id]);
-      // Record the type we just wrote as the merge base.
-      setBotType(sql, acct.account_id, effectiveType);
+      appendBotTypes.push({ id: acct.account_id, type: effectiveType });
       continue;
     }
 
     const merge = mergeField(coerceType(existing.type), baseType, effectiveType);
     if (merge.harvest != null) {
-      // User changed the Type cell → persist as the locked classification.
+      // Fresh human edit of the Type cell → persist as the locked classification
+      // (reflects a read, so safe to apply immediately).
       setAccountType(sql, acct.account_id, coerceType(merge.value));
       result.humanEdits++;
     } else if (merge.botWrote) {
-      setBotType(sql, acct.account_id, merge.value);
+      botTypeUpdates.push({ id: acct.account_id, type: merge.value });
     }
     liveCells[ACCT_COL.type] = merge.value;
-    // Refresh the whole row (writing the Type cell with its current effective
-    // value is idempotent when it's a human-owned override).
-    rowUpdates.push({ range: `${ACCT_TAB}!A${existing.rowIndex}:F${existing.rowIndex}`, values: [liveCells] });
+    rowUpdates.push({ range: a1(ACCT_TAB, `A${existing.rowIndex}:F${existing.rowIndex}`), values: [liveCells] });
   }
 
   if (rowUpdates.length > 0) {
-    await client.batchUpdateValues(sheetId, rowUpdates);
-    result.updated += rowUpdates.length;
+    try {
+      await client.batchUpdateValues(sheetId, rowUpdates);
+      result.updated += rowUpdates.length;
+      for (const b of botTypeUpdates) setBotType(sql, b.id, b.type);
+    } catch (err) {
+      result.errors.push(`acct-updates: ${(err as Error).message}`);
+    }
   }
   if (appendValues.length > 0) {
-    await client.appendRows(sheetId, ACCT_RANGE, appendValues);
-    result.appended += appendValues.length;
+    try {
+      await client.appendRows(sheetId, ACCT_RANGE, appendValues);
+      result.appended += appendValues.length;
+      for (const b of appendBotTypes) setBotType(sql, b.id, b.type);
+    } catch (err) {
+      result.errors.push(`acct-appends: ${(err as Error).message}`);
+    }
   }
 }
 
@@ -378,31 +467,37 @@ async function reconcileHistory(
       { col: 0, kind: 'date' }, { col: 1, kind: 'currency' }, { col: 2, kind: 'currency' }, { col: 3, kind: 'currency' },
     ]);
   }
-  // Add the net-worth line chart once. Open-ended source ranges auto-extend as
-  // daily rows are appended, so the chart stays current without maintenance.
   if (await client.countCharts(sheetId, nwTab.tabId) === 0) {
     await client.batchUpdate(sheetId, [netWorthChartRequest(nwTab.tabId)]);
   }
 
   const balances = currentBalances(sql);
-  if (balances.length === 0) return;
+  if (balances.length === 0) return; // nothing to snapshot yet — don't claim the day
 
-  const balRows = balances.map((b) => [today, b.name, b.type, b.balance]);
-  await client.appendRows(sheetId, `${BAL_TAB}!A2:D`, balRows);
-  result.appended += balRows.length;
+  // Claim the day BEFORE appending. The two appends aren't atomic, so if we
+  // claimed after and the second failed, the retry would duplicate the first
+  // tab's rows. Claiming first means a failure skips today's sheet snapshot
+  // (the data still lives in balance_history) rather than duplicating it.
+  setSetting(sql, 'sheet_history_date', today);
 
   const nw = summarizeNetWorth(balances);
-  await client.appendRows(sheetId, `${NW_TAB}!A2:D`, [[today, nw.assets, nw.liabilities, nw.net]]);
-  result.appended += 1;
-
-  setSetting(sql, 'sheet_history_date', today);
+  try {
+    await client.appendRows(sheetId, a1(BAL_TAB, 'A2:D'), balances.map((b) => [today, b.name, b.type, b.balance]));
+    result.appended += balances.length;
+    await client.appendRows(sheetId, a1(NW_TAB, 'A2:D'), [[today, nw.assets, nw.liabilities, nw.net]]);
+    result.appended += 1;
+  } catch (err) {
+    result.errors.push(`history-append: ${(err as Error).message}`);
+  }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Ensure a tab exists with a header row; freeze + bold the header and
  *  optionally hide one key column. Reports whether it was just created so
- *  callers can apply one-time formatting only on first creation. */
+ *  callers can apply one-time formatting only on first creation. Throws if a
+ *  just-created tab can't be located (never returns a sentinel id — 0 is a
+ *  valid sheetId and would silently target the wrong tab). */
 async function ensureTab(
   client: SheetsClient,
   sheetId: string,
@@ -415,10 +510,10 @@ async function ensureTab(
 
   await client.batchUpdate(sheetId, [{ addSheet: { properties: { title } } }]);
   const made = (await client.listTabs(sheetId)).find((t) => t.title === title);
-  if (!made) return { tabId: 0, created: false };
+  if (!made) throw new Error(`Failed to create tab "${title}" (addSheet returned no matching sheet).`);
 
   const colLetter = String.fromCharCode(65 + header.length - 1);
-  await client.batchUpdateValues(sheetId, [{ range: `${title}!A1:${colLetter}1`, values: [header] }]);
+  await client.batchUpdateValues(sheetId, [{ range: a1(title, `A1:${colLetter}1`), values: [header] }]);
 
   const requests: unknown[] = [
     {
@@ -448,14 +543,7 @@ async function ensureTab(
   return { tabId: made.sheetId, created: true };
 }
 
-function upsertMirror(
-  sql: SqlStorage,
-  row: {
-    tx_id: string; merchant: string; category: string;
-    bot_merchant: string; bot_category: string;
-    locked_merchant: number; locked_category: number; notes: string;
-  },
-): void {
+function upsertMirror(sql: SqlStorage, row: MirrorWrite): void {
   sql.exec(
     `INSERT INTO sheet_rows
        (tx_id, merchant, category, bot_merchant, bot_category, locked_merchant, locked_category, notes, synced_at)
