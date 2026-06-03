@@ -56,4 +56,11 @@ export interface Env {
   /** SimpleFin Bridge access URL (https://USER:PASS@.../simplefin). Obtained
    *  by running `bun run scripts/simplefin-claim.ts` once with a setup token. */
   SIMPLEFIN_ACCESS_URL: string;
+  /** Google service-account key JSON (the whole file contents). The account's
+   *  email must be granted edit access to FINANCE_SHEET_ID. Powers the finance
+   *  bot's Google Sheets working layer. If unset, sheet sync no-ops. */
+  GOOGLE_SERVICE_ACCOUNT_JSON?: string;
+  /** Spreadsheet id of the finance Google Sheet (the long id in its URL). The
+   *  bot creates/maintains a `Transactions` tab in it. Required for sheet sync. */
+  FINANCE_SHEET_ID?: string;
 }

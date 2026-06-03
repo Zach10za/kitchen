@@ -151,4 +151,10 @@
   //   SIMPLEFIN_ACCESS_URL       — long-lived SimpleFin Bridge access URL with embedded
   //                                Basic-auth creds. Run `bun run scripts/simplefin-claim.ts`
   //                                once with a setup token to mint this.
+  //   GOOGLE_SERVICE_ACCOUNT_JSON — full service-account key JSON for the finance Google
+  //                                Sheets working layer. Create a service account in Google
+  //                                Cloud, enable the Sheets API, and share the spreadsheet
+  //                                with the account's email. Optional; sheet sync no-ops if unset.
+  //   FINANCE_SHEET_ID           — spreadsheet id (the long id in the sheet's URL) the finance
+  //                                bot maintains a `Transactions` tab in. Optional.
 }

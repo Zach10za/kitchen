@@ -1,6 +1,7 @@
 import type { Env } from './env';
 import type { Interaction } from './discord/types';
 import { runSync } from './finance/sync';
+import { reconcileSheet } from './finance/sheet';
 import { syncResultEmbed } from './finance/render';
 import type { AccountRow, TransactionRow } from './finance/tools';
 import { AgentDOBase } from './runtime/agent-do-base';
@@ -26,6 +27,10 @@ export class FinanceDO extends AgentDOBase<Env> {
   protected async handleCustomRoute(request: Request, url: URL): Promise<Response | null> {
     if (url.pathname === '/sync' && request.method === 'POST') {
       const result = await runSync(this.env, this.sql);
+      return Response.json(result);
+    }
+    if (url.pathname === '/sheet-sync' && request.method === 'POST') {
+      const result = await reconcileSheet(this.env, this.sql);
       return Response.json(result);
     }
     return null;
@@ -77,28 +82,69 @@ export class FinanceDO extends AgentDOBase<Env> {
     const settings = this.sql.exec(
       'SELECT key, length(value) AS len, substr(value, 1, 200) AS preview, updated_at FROM settings',
     ).toArray();
+    const sheetStats = this.sql.exec<{ rows: number; locked: number; categorized: number }>(
+      `SELECT COUNT(*) AS rows,
+              SUM(CASE WHEN locked_merchant = 1 OR locked_category = 1 THEN 1 ELSE 0 END) AS locked,
+              SUM(CASE WHEN TRIM(category) <> '' THEN 1 ELSE 0 END) AS categorized
+         FROM sheet_rows`,
+    ).toArray()[0] ?? { rows: 0, locked: 0, categorized: 0 };
+    const rules = this.sql.exec(
+      'SELECT match_type, pattern, merchant, category, source FROM rules ORDER BY id DESC LIMIT 50',
+    ).toArray();
+    const accountTypes = this.sql.exec(
+      `SELECT a.name, m.type, m.locked_type, CAST(a.balance AS REAL) AS balance
+         FROM accounts a LEFT JOIN account_meta m ON m.account_id = a.id ORDER BY a.name`,
+    ).toArray();
+    const balanceSnapshots = this.sql.exec<{ days: number; last: string | null }>(
+      'SELECT COUNT(DISTINCT as_of_date) AS days, MAX(as_of_date) AS last FROM balance_history',
+    ).toArray()[0] ?? { days: 0, last: null };
     return {
       accounts,
       transaction_count: txCount,
       recent_transactions: recentTx,
       recent_conversation: recentConv,
       settings,
+      sheet: {
+        configured: Boolean(this.env.GOOGLE_SERVICE_ACCOUNT_JSON && this.env.FINANCE_SHEET_ID),
+        ...sheetStats,
+      },
+      rules,
+      account_types: accountTypes,
+      balance_snapshots: balanceSnapshots,
     };
   }
 
-  /** Pull latest from SimpleFin. Called from /heartbeat (hourly cron) and the
-   *  /sync admin endpoint. Errors are captured so a single bad sync doesn't
-   *  kill the heartbeat (which also drives the conversation prune). */
+  /** Pull latest from SimpleFin, then reconcile the Google Sheet. Called from
+   *  /heartbeat (hourly cron) and the /sync admin endpoint. Errors are captured
+   *  so a single bad sync doesn't kill the heartbeat (which also drives the
+   *  conversation prune). The sheet reconcile is wrapped separately so a Sheets
+   *  outage never blocks the raw SimpleFin pull, and vice versa. */
   private async runScheduledSync(): Promise<void> {
-    if (!this.env.SIMPLEFIN_ACCESS_URL) {
-      // Don't error on every heartbeat in environments without the secret.
-      return;
+    if (this.env.SIMPLEFIN_ACCESS_URL) {
+      try {
+        // runSync collects per-account failures into result.errors rather than
+        // throwing, so inspect the result — otherwise a broken bank connection
+        // vanishes silently on every hourly run.
+        const sync = await runSync(this.env, this.sql);
+        if (sync.errors.length > 0) {
+          await captureError(this.env, new Error(sync.errors.join('; ')), { source: 'finance:scheduled-sync' });
+        }
+      } catch (err) {
+        console.error('finance scheduled sync failed', err);
+        await captureError(this.env, err, { source: 'finance:scheduled-sync' });
+      }
     }
     try {
-      await runSync(this.env, this.sql);
+      // reconcileSheet is non-throwing by design (per-section/per-write errors
+      // land in result.errors); surface those so a failed Sheets write doesn't
+      // disappear without a trace.
+      const recon = await reconcileSheet(this.env, this.sql);
+      if (recon.errors.length > 0) {
+        await captureError(this.env, new Error(recon.errors.join('; ')), { source: 'finance:sheet-reconcile' });
+      }
     } catch (err) {
-      console.error('finance scheduled sync failed', err);
-      await captureError(this.env, err, { source: 'finance:scheduled-sync' });
+      console.error('finance sheet reconcile failed', err);
+      await captureError(this.env, err, { source: 'finance:sheet-reconcile' });
     }
   }
 }
