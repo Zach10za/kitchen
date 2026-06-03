@@ -224,6 +224,63 @@ export class SheetsClient {
     );
   }
 
+  /** Apply a currency or date number-format to whole columns (below the header).
+   *  Currency negatives render red via the pattern's second clause. */
+  async setColumnFormats(
+    spreadsheetId: string,
+    sheetId: number,
+    specs: { col: number; kind: 'currency' | 'date' }[],
+  ): Promise<void> {
+    if (specs.length === 0) return;
+    const numberFormat = (kind: 'currency' | 'date') =>
+      kind === 'currency'
+        ? { type: 'NUMBER', pattern: '$#,##0.00;[Red]-$#,##0.00' }
+        : { type: 'DATE', pattern: 'yyyy-mm-dd' };
+    await this.batchUpdate(
+      spreadsheetId,
+      specs.map((s) => ({
+        repeatCell: {
+          range: { sheetId, startRowIndex: 1, startColumnIndex: s.col, endColumnIndex: s.col + 1 },
+          cell: { userEnteredFormat: { numberFormat: numberFormat(s.kind) } },
+          fields: 'userEnteredFormat.numberFormat',
+        },
+      })),
+    );
+  }
+
+  /** Attach a dropdown (data validation) to a whole column below the header.
+   *  `strict` rejects values outside the list; non-strict just shows the menu. */
+  async setListValidation(
+    spreadsheetId: string,
+    sheetId: number,
+    col: number,
+    values: string[],
+    strict: boolean,
+  ): Promise<void> {
+    if (values.length === 0) return;
+    await this.batchUpdate(spreadsheetId, [
+      {
+        setDataValidation: {
+          range: { sheetId, startRowIndex: 1, startColumnIndex: col, endColumnIndex: col + 1 },
+          rule: {
+            condition: { type: 'ONE_OF_LIST', values: values.map((v) => ({ userEnteredValue: v })) },
+            showCustomUi: true,
+            strict,
+          },
+        },
+      },
+    ]);
+  }
+
+  /** Count charts on a tab (used to add a chart only once). */
+  async countCharts(spreadsheetId: string, sheetId: number): Promise<number> {
+    const data = await this.api<{
+      sheets?: { properties?: { sheetId?: number }; charts?: unknown[] }[];
+    }>(`${spreadsheetId}?fields=sheets(properties.sheetId,charts.chartId)`);
+    const sheet = (data.sheets ?? []).find((s) => s.properties?.sheetId === sheetId);
+    return sheet?.charts?.length ?? 0;
+  }
+
   /** Low-level spreadsheets.batchUpdate (add tab, format header, hide column). */
   async batchUpdate(spreadsheetId: string, requests: unknown[]): Promise<void> {
     if (requests.length === 0) return;

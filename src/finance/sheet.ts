@@ -33,6 +33,7 @@ import {
   coerceType,
   localDate,
   spendingFilter,
+  ACCOUNT_TYPES,
   type AccountMetaRow,
 } from './accounts';
 
@@ -143,7 +144,29 @@ async function reconcileTransactions(
   sql: SqlStorage,
   result: ReconcileResult,
 ): Promise<void> {
-  const tabId = await ensureTab(client, sheetId, TX_TAB, TX_HEADER, TX_COL.txId);
+  const { tabId, created } = await ensureTab(client, sheetId, TX_TAB, TX_HEADER, TX_COL.txId);
+  if (created) {
+    await client.setColumnFormats(sheetId, tabId, [
+      { col: TX_COL.date, kind: 'date' },
+      { col: TX_COL.amount, kind: 'currency' },
+    ]);
+    // A basic filter gives instant per-column sort/filter UI — the main lever
+    // for diagnosing spend (filter to a category, sort by amount).
+    await client.batchUpdate(sheetId, [
+      { setBasicFilter: { filter: { range: { sheetId: tabId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: TX_HEADER.length } } } },
+    ]);
+  }
+  // Refresh the Category dropdown from the categories in use (non-strict, so new
+  // ones can still be typed). Cheap and keeps the menu current as labels grow.
+  const categories = sql
+    .exec<{ category: string }>(
+      "SELECT DISTINCT TRIM(category) AS category FROM sheet_rows WHERE TRIM(category) <> '' ORDER BY category",
+    )
+    .toArray()
+    .map((r) => r.category);
+  if (categories.length > 0) {
+    await client.setListValidation(sheetId, tabId, TX_COL.category, categories, false);
+  }
 
   const sheetRows = await client.getValues(sheetId, TX_RANGE);
   const sheetByTx = new Map<string, { rowIndex: number; merchant: string; category: string; notes: string }>();
@@ -270,7 +293,16 @@ async function reconcileAccountsTab(
   sql: SqlStorage,
   result: ReconcileResult,
 ): Promise<void> {
-  await ensureTab(client, sheetId, ACCT_TAB, ACCT_HEADER, ACCT_COL.id);
+  const { tabId, created } = await ensureTab(client, sheetId, ACCT_TAB, ACCT_HEADER, ACCT_COL.id);
+  if (created) {
+    await client.setColumnFormats(sheetId, tabId, [
+      { col: ACCT_COL.balance, kind: 'currency' },
+      { col: ACCT_COL.synced, kind: 'date' },
+    ]);
+    // Strict dropdown — keeps Type to the known vocabulary so it always maps to
+    // a real classification (no coerce-to-'other' surprises from a typo).
+    await client.setListValidation(sheetId, tabId, ACCT_COL.type, [...ACCOUNT_TYPES], true);
+  }
 
   const sheetRows = await client.getValues(sheetId, ACCT_RANGE);
   const sheetByAcct = new Map<string, { rowIndex: number; type: string }>();
@@ -336,8 +368,21 @@ async function reconcileHistory(
   const today = localDate(env.TIMEZONE);
   if (getSetting(sql, 'sheet_history_date') === today) return; // already captured today
 
-  await ensureTab(client, sheetId, BAL_TAB, BAL_HEADER, null);
-  await ensureTab(client, sheetId, NW_TAB, NW_HEADER, null);
+  const bal = await ensureTab(client, sheetId, BAL_TAB, BAL_HEADER, null);
+  if (bal.created) {
+    await client.setColumnFormats(sheetId, bal.tabId, [{ col: 0, kind: 'date' }, { col: 3, kind: 'currency' }]);
+  }
+  const nwTab = await ensureTab(client, sheetId, NW_TAB, NW_HEADER, null);
+  if (nwTab.created) {
+    await client.setColumnFormats(sheetId, nwTab.tabId, [
+      { col: 0, kind: 'date' }, { col: 1, kind: 'currency' }, { col: 2, kind: 'currency' }, { col: 3, kind: 'currency' },
+    ]);
+  }
+  // Add the net-worth line chart once. Open-ended source ranges auto-extend as
+  // daily rows are appended, so the chart stays current without maintenance.
+  if (await client.countCharts(sheetId, nwTab.tabId) === 0) {
+    await client.batchUpdate(sheetId, [netWorthChartRequest(nwTab.tabId)]);
+  }
 
   const balances = currentBalances(sql);
   if (balances.length === 0) return;
@@ -356,51 +401,51 @@ async function reconcileHistory(
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Ensure a tab exists with a header row; freeze + bold the header and
- *  optionally hide one key column. Returns the numeric sheetId. */
+ *  optionally hide one key column. Reports whether it was just created so
+ *  callers can apply one-time formatting only on first creation. */
 async function ensureTab(
   client: SheetsClient,
   sheetId: string,
   title: string,
   header: string[],
   hideColIndex: number | null,
-): Promise<number> {
+): Promise<{ tabId: number; created: boolean }> {
   const existing = (await client.listTabs(sheetId)).find((t) => t.title === title);
-  if (existing) return existing.sheetId;
+  if (existing) return { tabId: existing.sheetId, created: false };
 
   await client.batchUpdate(sheetId, [{ addSheet: { properties: { title } } }]);
-  const created = (await client.listTabs(sheetId)).find((t) => t.title === title);
+  const made = (await client.listTabs(sheetId)).find((t) => t.title === title);
+  if (!made) return { tabId: 0, created: false };
+
   const colLetter = String.fromCharCode(65 + header.length - 1);
   await client.batchUpdateValues(sheetId, [{ range: `${title}!A1:${colLetter}1`, values: [header] }]);
 
-  if (created) {
-    const requests: unknown[] = [
-      {
-        updateSheetProperties: {
-          properties: { sheetId: created.sheetId, gridProperties: { frozenRowCount: 1 } },
-          fields: 'gridProperties.frozenRowCount',
-        },
+  const requests: unknown[] = [
+    {
+      updateSheetProperties: {
+        properties: { sheetId: made.sheetId, gridProperties: { frozenRowCount: 1 } },
+        fields: 'gridProperties.frozenRowCount',
       },
-      {
-        repeatCell: {
-          range: { sheetId: created.sheetId, startRowIndex: 0, endRowIndex: 1 },
-          cell: { userEnteredFormat: { textFormat: { bold: true } } },
-          fields: 'userEnteredFormat.textFormat.bold',
-        },
+    },
+    {
+      repeatCell: {
+        range: { sheetId: made.sheetId, startRowIndex: 0, endRowIndex: 1 },
+        cell: { userEnteredFormat: { textFormat: { bold: true } } },
+        fields: 'userEnteredFormat.textFormat.bold',
       },
-    ];
-    if (hideColIndex != null) {
-      requests.push({
-        updateDimensionProperties: {
-          range: { sheetId: created.sheetId, dimension: 'COLUMNS', startIndex: hideColIndex, endIndex: hideColIndex + 1 },
-          properties: { hiddenByUser: true },
-          fields: 'hiddenByUser',
-        },
-      });
-    }
-    await client.batchUpdate(sheetId, requests);
-    return created.sheetId;
+    },
+  ];
+  if (hideColIndex != null) {
+    requests.push({
+      updateDimensionProperties: {
+        range: { sheetId: made.sheetId, dimension: 'COLUMNS', startIndex: hideColIndex, endIndex: hideColIndex + 1 },
+        properties: { hiddenByUser: true },
+        fields: 'hiddenByUser',
+      },
+    });
   }
-  return 0;
+  await client.batchUpdate(sheetId, requests);
+  return { tabId: made.sheetId, created: true };
 }
 
 function upsertMirror(
@@ -449,4 +494,37 @@ function setSetting(sql: SqlStorage, key: string, value: string): void {
 
 function isoDate(postedSec: number): string {
   return new Date(postedSec * 1000).toISOString().slice(0, 10);
+}
+
+/** A LINE chart of Assets / Liabilities / Net Worth over Date for the Net Worth
+ *  tab. Source ranges omit endRowIndex so the chart grows with the data. */
+function netWorthChartRequest(tabId: number): unknown {
+  const colRange = (col: number) => ({
+    sourceRange: { sources: [{ sheetId: tabId, startRowIndex: 0, startColumnIndex: col, endColumnIndex: col + 1 }] },
+  });
+  return {
+    addChart: {
+      chart: {
+        spec: {
+          title: 'Net Worth Over Time',
+          basicChart: {
+            chartType: 'LINE',
+            legendPosition: 'BOTTOM_LEGEND',
+            headerCount: 1,
+            axis: [
+              { position: 'BOTTOM_AXIS', title: 'Date' },
+              { position: 'LEFT_AXIS', title: 'USD' },
+            ],
+            domains: [{ domain: colRange(0) }],
+            series: [
+              { series: colRange(1), targetAxis: 'LEFT_AXIS' }, // Assets
+              { series: colRange(2), targetAxis: 'LEFT_AXIS' }, // Liabilities
+              { series: colRange(3), targetAxis: 'LEFT_AXIS' }, // Net Worth
+            ],
+          },
+        },
+        position: { overlayPosition: { anchorCell: { sheetId: tabId, rowIndex: 1, columnIndex: 5 } } },
+      },
+    },
+  };
 }
