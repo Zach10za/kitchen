@@ -170,9 +170,9 @@ export function localDate(timezone: string): string {
   return new Date().toLocaleDateString('en-CA', { timeZone: timezone });
 }
 
-/** Snapshot one account's balance for `date`. First write of the day wins, so
- *  the history is a stable daily close-ish series regardless of how many times
- *  the hourly sync runs. */
+/** Snapshot one account's balance for `date`. Latest write of the day wins, so
+ *  the daily series is a close-ish value and stays consistent with the Balances
+ *  sheet (which is also updated to the latest value through the day). */
 export function captureBalance(
   sql: SqlStorage,
   accountId: string,
@@ -183,7 +183,7 @@ export function captureBalance(
   sql.exec(
     `INSERT INTO balance_history (account_id, as_of_date, balance, captured_at)
      VALUES (?, ?, ?, ?)
-     ON CONFLICT(account_id, as_of_date) DO NOTHING`,
+     ON CONFLICT(account_id, as_of_date) DO UPDATE SET balance=excluded.balance, captured_at=excluded.captured_at`,
     accountId, date, balance, Date.now(),
   );
 }
