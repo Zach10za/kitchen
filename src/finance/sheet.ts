@@ -59,6 +59,34 @@ function a1(tab: string, range: string): string {
   return `'${tab.replace(/'/g, "''")}'!${range}`;
 }
 
+/** Force a text value to stay text under USER_ENTERED input — a leading "=",
+ *  "+", "-", or "@" would otherwise be parsed as a formula. The apostrophe is a
+ *  Sheets text marker (not displayed, not part of the read-back value). */
+function safeText(s: string): string {
+  return /^[=+\-@]/.test(s) ? `'${s}` : s;
+}
+
+/** Live reference for a Balances-row Type cell: looks up the account (by the
+ *  name in column B of the same row) in the Accounts tab and returns its current
+ *  Type — so editing a type in Accounts updates the Balances history too. */
+function balanceTypeFormula(row: number): string {
+  return `=IFERROR(XLOOKUP($B${row},${ACCT_TAB}!$A:$A,${ACCT_TAB}!$C:$C),"")`;
+}
+
+/** Run a non-essential formatting call, recording (not throwing) any failure so
+ *  a cosmetic error never aborts the data reconcile. */
+async function applyFormatting(
+  result: ReconcileResult,
+  label: string,
+  fn: () => Promise<void>,
+): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    result.errors.push(`${label}: ${(err as Error).message}`);
+  }
+}
+
 const TX_RANGE = a1(TX_TAB, 'A2:H');
 const TX_HEADER = ['Date', 'Account', 'Amount', 'Raw Description', 'Merchant', 'Category', 'Notes', 'tx_id'];
 const TX_COL = { date: 0, account: 1, amount: 2, desc: 3, merchant: 4, category: 5, notes: 6, txId: 7 } as const;
@@ -205,26 +233,11 @@ async function reconcileTransactions(
 ): Promise<void> {
   const { tabId, created } = await ensureTab(client, sheetId, TX_TAB, TX_HEADER, TX_COL.txId);
   if (created) {
-    await client.setColumnFormats(sheetId, tabId, [
-      { col: TX_COL.date, kind: 'date' },
-      { col: TX_COL.amount, kind: 'currency' },
-    ]);
     // A basic filter gives instant per-column sort/filter UI — the main lever
     // for diagnosing spend (filter to a category, sort by amount).
     await client.batchUpdate(sheetId, [
       { setBasicFilter: { filter: { range: { sheetId: tabId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: TX_HEADER.length } } } },
     ]);
-  }
-  // Refresh the Category dropdown from categories in use (non-strict, so new
-  // ones can still be typed). Cheap and keeps the menu current as labels grow.
-  const categories = sql
-    .exec<{ category: string }>(
-      "SELECT DISTINCT TRIM(category) AS category FROM sheet_rows WHERE TRIM(category) <> '' ORDER BY category",
-    )
-    .toArray()
-    .map((r) => r.category);
-  if (categories.length > 0) {
-    await client.setListValidation(sheetId, tabId, TX_COL.category, categories, false);
   }
 
   const sheetRows = await client.getValues(sheetId, TX_RANGE);
@@ -361,6 +374,28 @@ async function reconcileTransactions(
       result.errors.push(`tx-appends: ${(err as Error).message}`);
     }
   }
+
+  // Apply column formats + the Category dropdown to the data rows AFTER the
+  // writes. Appended rows inherit format/validation from the row above (the
+  // header, on a fresh tab), so applying these only on creation never reaches
+  // the data — re-applying here, once rows exist, is what makes them stick.
+  await applyFormatting(result, 'tx-format', () =>
+    client.setColumnFormats(sheetId, tabId, [
+      { col: TX_COL.date, kind: 'date' },
+      { col: TX_COL.amount, kind: 'currency' },
+    ]),
+  );
+  const categories = sql
+    .exec<{ category: string }>(
+      "SELECT DISTINCT TRIM(category) AS category FROM sheet_rows WHERE TRIM(category) <> '' ORDER BY category",
+    )
+    .toArray()
+    .map((r) => r.category);
+  if (categories.length > 0) {
+    await applyFormatting(result, 'tx-category-dropdown', () =>
+      client.setListValidation(sheetId, tabId, TX_COL.category, categories, false),
+    );
+  }
 }
 
 // ─── Accounts tab (classification surface) ───────────────────────────────────
@@ -372,16 +407,7 @@ async function reconcileAccountsTab(
   sql: SqlStorage,
   result: ReconcileResult,
 ): Promise<void> {
-  const { tabId, created } = await ensureTab(client, sheetId, ACCT_TAB, ACCT_HEADER, ACCT_COL.id);
-  if (created) {
-    await client.setColumnFormats(sheetId, tabId, [
-      { col: ACCT_COL.balance, kind: 'currency' },
-      { col: ACCT_COL.synced, kind: 'date' },
-    ]);
-    // Strict dropdown — keeps Type to the known vocabulary so it always maps to
-    // a real classification (no coerce-to-'other' surprises from a typo).
-    await client.setListValidation(sheetId, tabId, ACCT_COL.type, [...ACCOUNT_TYPES], true);
-  }
+  const { tabId } = await ensureTab(client, sheetId, ACCT_TAB, ACCT_HEADER, ACCT_COL.id);
 
   const sheetRows = await client.getValues(sheetId, ACCT_RANGE);
   const sheetByAcct = new Map<string, { rowIndex: number; type: string }>();
@@ -412,7 +438,19 @@ async function reconcileAccountsTab(
       continue;
     }
 
-    const merge = mergeField(coerceType(existing.type), baseType, effectiveType);
+    // An unrecognized free-typed value (e.g. "credit card", which isn't the
+    // canonical "credit") coerces to 'other'. Do NOT treat that as an
+    // intentional 'other' — overwriting the cell with 'other' is exactly how a
+    // typed "credit card" got destroyed. Treat it as blank so the bot rewrites
+    // the current effective type instead of clobbering the user's intent.
+    const typed = (existing.type ?? '').trim();
+    const coerced = coerceType(typed);
+    // Treat an empty cell, or an unrecognized free-typed value (which coerces to
+    // 'other' without the user literally choosing "other"), as blank → hand the
+    // cell back to the bot rather than overwriting it with 'other'.
+    const theirs = typed === '' || (coerced === 'other' && typed.toLowerCase() !== 'other') ? '' : coerced;
+
+    const merge = mergeField(theirs, baseType, effectiveType);
     if (merge.harvest != null) {
       // Fresh human edit of the Type cell → persist as the locked classification
       // (reflects a read, so safe to apply immediately).
@@ -443,6 +481,21 @@ async function reconcileAccountsTab(
       result.errors.push(`acct-appends: ${(err as Error).message}`);
     }
   }
+
+  // Formats + the strict Type dropdown, applied to the data rows AFTER writes
+  // (see the note in reconcileTransactions — appended rows don't inherit
+  // column-level formatting/validation, so it must be set once rows exist).
+  if (balances.length > 0) {
+    await applyFormatting(result, 'acct-format', () =>
+      client.setColumnFormats(sheetId, tabId, [
+        { col: ACCT_COL.balance, kind: 'currency' },
+        { col: ACCT_COL.synced, kind: 'date' },
+      ]),
+    );
+    await applyFormatting(result, 'acct-type-dropdown', () =>
+      client.setListValidation(sheetId, tabId, ACCT_COL.type, [...ACCOUNT_TYPES], true),
+    );
+  }
 }
 
 // ─── History tabs (Balances + Net Worth), once per local day ─────────────────
@@ -458,15 +511,7 @@ async function reconcileHistory(
   if (getSetting(sql, 'sheet_history_date') === today) return; // already captured today
 
   const bal = await ensureTab(client, sheetId, BAL_TAB, BAL_HEADER, null);
-  if (bal.created) {
-    await client.setColumnFormats(sheetId, bal.tabId, [{ col: 0, kind: 'date' }, { col: 3, kind: 'currency' }]);
-  }
   const nwTab = await ensureTab(client, sheetId, NW_TAB, NW_HEADER, null);
-  if (nwTab.created) {
-    await client.setColumnFormats(sheetId, nwTab.tabId, [
-      { col: 0, kind: 'date' }, { col: 1, kind: 'currency' }, { col: 2, kind: 'currency' }, { col: 3, kind: 'currency' },
-    ]);
-  }
   if (await client.countCharts(sheetId, nwTab.tabId) === 0) {
     await client.batchUpdate(sheetId, [netWorthChartRequest(nwTab.tabId)]);
   }
@@ -482,13 +527,38 @@ async function reconcileHistory(
 
   const nw = summarizeNetWorth(balances);
   try {
-    await client.appendRows(sheetId, a1(BAL_TAB, 'A2:D'), balances.map((b) => [today, b.name, b.type, b.balance]));
+    // USER_ENTERED so the Date parses to a real date and amounts to numbers.
+    // Account name is the only free text — sanitized against formula injection.
+    // Type (col C) is left blank here and filled with a live reference formula
+    // below, so changing an account's type in the Accounts tab updates the
+    // historical Balances rows too (no stale duplicated type).
+    const balRows = balances.map((b) => [today, safeText(b.name), '', b.balance]);
+    const { firstRow } = await client.appendRows(sheetId, a1(BAL_TAB, 'A2:D'), balRows, 'USER_ENTERED');
     result.appended += balances.length;
-    await client.appendRows(sheetId, a1(NW_TAB, 'A2:D'), [[today, nw.assets, nw.liabilities, nw.net]]);
+    if (firstRow != null) {
+      const typeFormulas = balances.map((_, i) => [balanceTypeFormula(firstRow + i)]);
+      await client.batchUpdateValues(
+        sheetId,
+        [{ range: a1(BAL_TAB, `C${firstRow}:C${firstRow + balances.length - 1}`), values: typeFormulas }],
+        'USER_ENTERED',
+      );
+    }
+    await client.appendRows(sheetId, a1(NW_TAB, 'A2:D'), [[today, nw.assets, nw.liabilities, nw.net]], 'USER_ENTERED');
     result.appended += 1;
   } catch (err) {
     result.errors.push(`history-append: ${(err as Error).message}`);
   }
+
+  // Formats applied after the rows exist (appended rows don't inherit
+  // column-level formats — see reconcileTransactions).
+  await applyFormatting(result, 'bal-format', () =>
+    client.setColumnFormats(sheetId, bal.tabId, [{ col: 0, kind: 'date' }, { col: 3, kind: 'currency' }]),
+  );
+  await applyFormatting(result, 'nw-format', () =>
+    client.setColumnFormats(sheetId, nwTab.tabId, [
+      { col: 0, kind: 'date' }, { col: 1, kind: 'currency' }, { col: 2, kind: 'currency' }, { col: 3, kind: 'currency' },
+    ]),
+  );
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
