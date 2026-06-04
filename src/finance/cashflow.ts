@@ -15,6 +15,12 @@
 
 /** Category value the bot writes for detected transfers and the formulas exclude. */
 export const TRANSFER_CATEGORY = 'Transfer';
+/** Manual escape hatch: categorize a one-off (e.g. a bonus) "Exclude" to drop it
+ *  from cash flow without it being a transfer. */
+export const EXCLUDE_CATEGORY = 'Exclude';
+
+/** Categories dropped from cash flow (case-insensitive), lowercased. */
+const CASHFLOW_EXCLUDED = new Set([TRANSFER_CATEGORY.toLowerCase(), EXCLUDE_CATEGORY.toLowerCase()]);
 
 /** How far apart the two legs of a transfer can post and still pair. */
 const PAIR_WINDOW_SEC = 4 * 86_400;
@@ -105,7 +111,7 @@ export function monthlyCashFlow(sql: SqlStorage, timezone: string, months: numbe
 
   const byMonth = new Map<string, { inflow: number; outflow: number }>();
   for (const tx of rows) {
-    if ((tx.category ?? '').trim().toLowerCase() === TRANSFER_CATEGORY.toLowerCase()) continue;
+    if (CASHFLOW_EXCLUDED.has((tx.category ?? '').trim().toLowerCase())) continue;
     const month = localMonthOf(tx.posted, timezone);
     const bucket = byMonth.get(month) ?? { inflow: 0, outflow: 0 };
     if (tx.amount > 0) bucket.inflow += tx.amount;

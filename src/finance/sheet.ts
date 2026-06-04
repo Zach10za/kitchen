@@ -35,7 +35,7 @@
 import type { Env } from '../env';
 import { SheetsClient, type ValueRange } from '../runtime/sheets';
 import { loadRules, applyRules, upsertRule, type Enrichment } from './rules';
-import { detectTransferIds, TRANSFER_CATEGORY } from './cashflow';
+import { detectTransferIds, TRANSFER_CATEGORY, EXCLUDE_CATEGORY } from './cashflow';
 import {
   loadAccountMeta,
   setAccountType,
@@ -91,8 +91,9 @@ const NW_HEADER = ['Date', 'Assets', 'Liabilities', 'Net Worth'];
 
 const CF_TAB = 'Cash Flow';
 const CF_HEADER = ['Month', 'Inflows', 'Outflows', 'Net'];
-/** How many recent months the Cash Flow tab + chart shows. */
-const CF_MONTHS = 24;
+/** Cap on how many recent months the Cash Flow tab shows (it starts at the
+ *  first month with data, so it won't show empty leading months). */
+const CF_MAX_MONTHS = 36;
 
 /** Column letters (1-based A=1) for building A1 cell refs inside formulas. */
 const COL_LETTER = (idx0: number) => String.fromCharCode(65 + idx0);
@@ -719,20 +720,21 @@ async function captureNetWorthRow(
 // row's own A cell (LEFT(date,7) prefix match). N() coerces the header/blank
 // text cells to 0 so the full-column refs don't #VALUE. SUMIFS date-RANGE does
 // NOT work here — it returns 0 against the text dates the bot writes (verified).
+const cfExcluded = `(Transactions!$F:$F<>"${TRANSFER_CATEGORY}")*(Transactions!$F:$F<>"${EXCLUDE_CATEGORY}")`;
 const cfInflowFormula = (row: number) =>
-  `=SUMPRODUCT((LEFT(Transactions!$A:$A,7)=$A${row})*(N(Transactions!$C:$C)>0)*(Transactions!$F:$F<>"${TRANSFER_CATEGORY}")*N(Transactions!$C:$C))`;
+  `=SUMPRODUCT((LEFT(Transactions!$A:$A,7)=$A${row})*(N(Transactions!$C:$C)>0)*${cfExcluded}*N(Transactions!$C:$C))`;
 const cfOutflowFormula = (row: number) =>
-  `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)=$A${row})*(N(Transactions!$C:$C)<0)*(Transactions!$F:$F<>"${TRANSFER_CATEGORY}")*N(Transactions!$C:$C))`;
+  `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)=$A${row})*(N(Transactions!$C:$C)<0)*${cfExcluded}*N(Transactions!$C:$C))`;
 
-/** Recent YYYY-MM labels, oldest→newest, in the given timezone. */
-function recentMonths(count: number, timezone: string): string[] {
-  const todayYm = new Date().toLocaleDateString('en-CA', { timeZone: timezone }).slice(0, 7);
-  let [y, m] = todayYm.split('-').map(Number) as [number, number];
+/** Inclusive list of YYYY-MM labels from `firstYm` to `lastYm`, oldest→newest. */
+function monthsRange(firstYm: string, lastYm: string): string[] {
+  let [y, m] = firstYm.split('-').map(Number) as [number, number];
+  const [ly, lm] = lastYm.split('-').map(Number) as [number, number];
   const months: string[] = [];
-  for (let i = 0; i < count; i++) {
-    months.unshift(`${y}-${String(m).padStart(2, '0')}`);
-    m--;
-    if (m === 0) { m = 12; y--; }
+  while ((y < ly || (y === ly && m <= lm)) && months.length < 600) {
+    months.push(`${y}-${String(m).padStart(2, '0')}`);
+    m++;
+    if (m === 13) { m = 1; y++; }
   }
   return months;
 }
@@ -750,13 +752,19 @@ async function reconcileCashFlow(
   sql: SqlStorage,
   result: ReconcileResult,
 ): Promise<void> {
-  void sql; // analysis is done by the sheet formulas, not the bot
   const { tabId } = await ensureTab(client, sheetId, CF_TAB, CF_HEADER, []);
   if ((await client.countCharts(sheetId, tabId)) === 0) {
     await client.batchUpdate(sheetId, [cashFlowChartRequest(tabId)]);
   }
 
-  const months = recentMonths(CF_MONTHS, env.TIMEZONE);
+  // Start the scaffold at the first month that has any transaction (so the chart
+  // doesn't lead with empty months), capped to the most recent CF_MAX_MONTHS.
+  const tz = env.TIMEZONE;
+  const currentYm = new Date().toLocaleDateString('en-CA', { timeZone: tz }).slice(0, 7);
+  const minPosted = sql.exec<{ min: number | null }>('SELECT MIN(posted) AS min FROM transactions').toArray()[0]?.min ?? null;
+  const firstYm = minPosted ? new Date(minPosted * 1000).toLocaleDateString('en-CA', { timeZone: tz }).slice(0, 7) : currentYm;
+  const months = monthsRange(firstYm, currentYm).slice(-CF_MAX_MONTHS);
+  if (months.length === 0) return;
   const lastRow = months.length + 1;
 
   try {

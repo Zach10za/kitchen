@@ -153,6 +153,7 @@ async function runMonthly(): Promise<void> {
     ['2026-06-03', 'Checking', 100, 'refund', 'store', ''],
     ['2026-06-05', 'Checking', -40, 'coffee', 'cafe', ''],
     ['2026-06-10', 'Checking', -1000, 'to savings', 'xfer', 'Transfer'],
+    ['2026-06-15', 'Checking', 5000, 'annual bonus', 'employer', 'Exclude'], // dropped from cash flow
   ];
   await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'A1:F1'), values: [['Date', 'Account', 'Amount', 'Desc', 'Merchant', 'Category']] }]);
   await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', `A2:A${rows.length + 1}`), values: rows.map((r) => [r[0] as string]) }]); // RAW text dates
@@ -167,9 +168,9 @@ async function runMonthly(): Promise<void> {
   // Production shape: full-column refs (no row cap) keyed on the month CELL
   // (LEFT(date,7)=$A<row>), with N() coercing the header/blank text cells to 0.
   const spIn = (cell: string) =>
-    `=SUMPRODUCT((LEFT(Transactions!$A:$A,7)=${cell})*(N(Transactions!$C:$C)>0)*(Transactions!$F:$F<>"Transfer")*N(Transactions!$C:$C))`;
+    `=SUMPRODUCT((LEFT(Transactions!$A:$A,7)=${cell})*(N(Transactions!$C:$C)>0)*(Transactions!$F:$F<>"Transfer")*(Transactions!$F:$F<>"Exclude")*N(Transactions!$C:$C))`;
   const spOut = (cell: string) =>
-    `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)=${cell})*(N(Transactions!$C:$C)<0)*(Transactions!$F:$F<>"Transfer")*N(Transactions!$C:$C))`;
+    `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)=${cell})*(N(Transactions!$C:$C)<0)*(Transactions!$F:$F<>"Transfer")*(Transactions!$F:$F<>"Exclude")*N(Transactions!$C:$C))`;
 
   // Month labels as RAW text (production shape) — USER_ENTERED would parse
   // "2026-05" into a date and break the LEFT(date,7)=$A2 match.
