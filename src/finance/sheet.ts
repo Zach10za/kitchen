@@ -43,8 +43,12 @@ import {
   setBotNickname,
   currentBalances,
   summarizeNetWorth,
+  captureBalance,
   coerceType,
   localDate,
+  isManualAccount,
+  newManualAccountId,
+  upsertManualAccount,
   ACCOUNT_TYPES,
   type AccountMetaRow,
   type AccountBalance,
@@ -476,10 +480,21 @@ function mirrorRow(txId: string, category: string, excluded: number): MirrorWrit
 
 // ─── Accounts tab (classification surface) ───────────────────────────────────
 
+/** Parse a money cell the user typed, tolerating currency/format noise:
+ *  "$25,000.00" → 25000, "(1,200)" → -1200, "-50" → -50, "" → 0. */
+function parseMoney(raw: string | undefined): number {
+  const s = (raw ?? '').trim();
+  if (!s) return 0;
+  const negative = /^\(.*\)$/.test(s) || s.replace(/[^-\d]/g, '').startsWith('-');
+  const n = parseFloat(s.replace(/[^0-9.]/g, ''));
+  if (!Number.isFinite(n)) return 0;
+  return negative ? -Math.abs(n) : n;
+}
+
 async function reconcileAccountsTab(
   client: SheetsClient,
   sheetId: string,
-  _env: Env,
+  env: Env,
   sql: SqlStorage,
   result: ReconcileResult,
 ): Promise<void> {
@@ -487,15 +502,8 @@ async function reconcileAccountsTab(
   // Repair the header on tabs created before the Nickname column existed.
   await ensureLayout(client, sheetId, tabId, ACCT_TAB, ACCT_HEADER, [ACCT_COL.id], result);
 
+  const today = localDate(env.TIMEZONE);
   const sheetRows = await client.getValues(sheetId, ACCT_RANGE);
-  const sheetByAcct = new Map<string, { rowIndex: number; type: string; nickname: string }>();
-  sheetRows.forEach((r, i) => {
-    const id = r[ACCT_COL.id];
-    if (id) sheetByAcct.set(id, { rowIndex: i + 2, type: r[ACCT_COL.type] ?? '', nickname: r[ACCT_COL.nickname] ?? '' });
-  });
-
-  const balances = currentBalances(sql);
-  const meta = loadAccountMeta(sql);
 
   const rowUpdates: ValueRange[] = [];
   const botTypeUpdates: { id: string; type: string }[] = [];      // applied iff updates land
@@ -503,7 +511,59 @@ async function reconcileAccountsTab(
   const appendValues: (string | number | null)[][] = [];
   const appendBots: { id: string; type: string; nickname: string }[] = []; // applied iff append lands
 
+  // ── Pass A: manual accounts are SHEET-owned. The user types a row (Account +
+  // Type + Balance) and updates the balance over time; we adopt it into SQLite so
+  // it flows into Balances + Net Worth like a synced account. A row with no
+  // account_id but a name is a brand-new manual account (mint an id); a row whose
+  // id starts with `manual:` is an existing one whose cells we read back. We
+  // rewrite each row normalized (numeric balance, coerced type, minted id in the
+  // hidden col G) but otherwise keep the user's values verbatim.
+  const seenManualIds = new Set<string>();
+  for (let i = 0; i < sheetRows.length; i++) {
+    const r = sheetRows[i]!;
+    const rowNum = i + 2;
+    const id = (r[ACCT_COL.id] ?? '').trim();
+    const name = (r[ACCT_COL.name] ?? '').trim();
+    if (id ? !isManualAccount(id) : name === '') continue; // synced row or blank → pass B
+    const acctId = id || newManualAccountId();
+    const displayName = name || '(manual account)';
+    const org = (r[ACCT_COL.org] ?? '').trim() || 'Manual';
+    const currency = (r[ACCT_COL.currency] ?? '').trim() || 'USD';
+    const type = coerceType((r[ACCT_COL.type] ?? '').trim());
+    const nickname = (r[ACCT_COL.nickname] ?? '').trim();
+    const balance = parseMoney(r[ACCT_COL.balance]);
+
+    upsertManualAccount(sql, { id: acctId, name: displayName, org, currency, balance, syncedAt: Date.now() });
+    setAccountType(sql, acctId, type);          // locked — the guesser never runs on manual ids anyway
+    if (nickname) setNickname(sql, acctId, nickname);
+    captureBalance(sql, acctId, balance, today); // daily snapshot → net-worth series includes it
+    seenManualIds.add(acctId);
+
+    rowUpdates.push({ range: a1(ACCT_TAB, `A${rowNum}:H${rowNum}`), values: [[displayName, org, type, balance, currency, today, acctId, nickname]] });
+  }
+
+  // ── Pass B: synced accounts (DB-owned, three-way merged), plus any manual
+  // account whose sheet row was deleted (re-append from the DB so it stays
+  // visible + counted; remove it for good via a chat request, not row-deletion).
+  const sheetByAcct = new Map<string, { rowIndex: number; type: string; nickname: string }>();
+  sheetRows.forEach((r, i) => {
+    const id = (r[ACCT_COL.id] ?? '').trim();
+    if (id && !isManualAccount(id)) sheetByAcct.set(id, { rowIndex: i + 2, type: r[ACCT_COL.type] ?? '', nickname: r[ACCT_COL.nickname] ?? '' });
+  });
+
+  const balances = currentBalances(sql);
+  const meta = loadAccountMeta(sql);
+
   for (const acct of balances) {
+    if (isManualAccount(acct.account_id)) {
+      if (!seenManualIds.has(acct.account_id)) {
+        appendValues.push([acct.name, acct.org ?? 'Manual', acct.type, acct.balance, acct.currency,
+          isoDate(Math.floor(acct.last_synced_at / 1000)), acct.account_id, acct.nickname]);
+        captureBalance(sql, acct.account_id, acct.balance, today);
+      }
+      continue; // manual rows on the sheet are fully handled in pass A
+    }
+
     const m: AccountMetaRow | undefined = meta.get(acct.account_id);
     const effectiveType = m?.type ?? acct.type;
     const baseType = m?.bot_type ?? '';
