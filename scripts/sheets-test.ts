@@ -90,4 +90,49 @@ async function run(label: string, dateInput: 'RAW' | 'USER_ENTERED'): Promise<vo
 
 await run('text-dates', 'RAW');
 await run('native-dates', 'USER_ENTERED');
-console.log('\nDone. Use whichever representation PASSED for the Cash Flow tab.');
+
+// ─── Account reference formulas (id-keyed nickname/name + type) ───────────────
+// Verbatim from src/finance/sheet.ts — keep in sync.
+const accountNameRef = (idCell: string) =>
+  `=IFERROR(LET(n,XLOOKUP(${idCell},Accounts!$G:$G,Accounts!$H:$H),IF(n="",XLOOKUP(${idCell},Accounts!$G:$G,Accounts!$A:$A),n)),"")`;
+const accountTypeRef = (idCell: string) =>
+  `=IFERROR(XLOOKUP(${idCell},Accounts!$G:$G,Accounts!$C:$C),"")`;
+
+async function runAccountRefs(): Promise<void> {
+  await ensureTab('Accounts');
+  await ensureTab('Ref');
+  await client!.clearValues(SHEET_ID, q('Accounts', 'A1:H1000'));
+  await client!.clearValues(SHEET_ID, q('Ref', 'A1:C1000'));
+
+  // A name | B inst | C type | D bal | E cur | F synced | G account_id | H nickname
+  await client!.batchUpdateValues(SHEET_ID, [
+    { range: q('Accounts', 'A1:H3'), values: [
+      ['Account', 'Institution', 'Type', 'Balance', 'Currency', 'Last Synced', 'account_id', 'Nickname'],
+      ['Chase Checking', 'Chase', 'checking', 0, 'USD', '', 'ACT-123', ''],          // no nickname → name
+      ['CRYPTIC NAME LLC', 'Amex', 'credit', 0, 'USD', '', '999888', 'My Amex'],     // numeric-looking id + nickname
+    ] },
+  ]);
+  // Ref tab: account_id cells (RAW text, as the bot writes them) + the formulas.
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Ref', 'A2:A3'), values: [['ACT-123'], ['999888']] }]);
+  await client!.batchUpdateValues(
+    SHEET_ID,
+    [{ range: q('Ref', 'B2:C3'), values: [
+      [accountNameRef('$A2'), accountTypeRef('$A2')],
+      [accountNameRef('$A3'), accountTypeRef('$A3')],
+    ] }],
+    'USER_ENTERED',
+  );
+
+  const got = await client!.getValuesRendered(SHEET_ID, q('Ref', 'B2:C3'), 'UNFORMATTED_VALUE');
+  const results = {
+    r1_name: String(got[0]?.[0] ?? ''), r1_type: String(got[0]?.[1] ?? ''),
+    r2_name: String(got[1]?.[0] ?? ''), r2_type: String(got[1]?.[1] ?? ''),
+  };
+  const ok =
+    results.r1_name === 'Chase Checking' && results.r1_type === 'checking' &&
+    results.r2_name === 'My Amex' && results.r2_type === 'credit';
+  console.log('[account-refs] →', results, ok ? '✅ PASS' : '❌ FAIL (expected name/checking, then My Amex/credit)');
+}
+
+await runAccountRefs();
+console.log('\nDone.');
