@@ -153,6 +153,14 @@ export const FINANCE_TOOLS = [
   {
     type: 'function' as const,
     function: {
+      name: 'categorize_all',
+      description: 'Auto-categorize every uncategorized merchant now (Dining, Groceries, Income, etc.) via the LLM, storing each as a rule and applying it to the sheet. Use when the user asks to "categorize everything" / "fill in categories" / notices categories are empty. Normally new merchants are auto-categorized hourly; this does the whole backlog at once. Manual categorizations are never overwritten, and transfers stay "Transfer".',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
       name: 'list_rules',
       description: 'List the active categorization/merchant rules, including which were learned from the user\'s manual sheet edits vs. set explicitly. Use when the user asks "what rules do I have", "why is X categorized as Y", or before editing rules.',
       parameters: { type: 'object', properties: {} },

@@ -17,7 +17,7 @@
  */
 
 export type RuleMatchType = 'merchant' | 'contains';
-export type RuleSource = 'manual' | 'chat';
+export type RuleSource = 'manual' | 'chat' | 'auto';
 
 export interface RuleRow {
   id: number;

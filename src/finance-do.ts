@@ -2,6 +2,7 @@ import type { Env } from './env';
 import type { Interaction } from './discord/types';
 import { runSync } from './finance/sync';
 import { reconcileSheet } from './finance/sheet';
+import { autoCategorize } from './finance/categorize';
 import { syncResultEmbed } from './finance/render';
 import type { AccountRow, TransactionRow } from './finance/tools';
 import { AgentDOBase } from './runtime/agent-do-base';
@@ -133,6 +134,14 @@ export class FinanceDO extends AgentDOBase<Env> {
         console.error('finance scheduled sync failed', err);
         await captureError(this.env, err, { source: 'finance:scheduled-sync' });
       }
+    }
+    try {
+      // Categorize any new merchants (cheap LLM call; no-op once known) before
+      // the reconcile applies the resulting rules to the sheet.
+      await autoCategorize(this.env, this.sql);
+    } catch (err) {
+      console.error('finance auto-categorize failed', err);
+      await captureError(this.env, err, { source: 'finance:auto-categorize' });
     }
     try {
       // reconcileSheet is non-throwing by design (per-section/per-write errors
