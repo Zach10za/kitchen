@@ -135,4 +135,63 @@ async function runAccountRefs(): Promise<void> {
 }
 
 await runAccountRefs();
+
+// ─── Monthly cash flow: which formula correctly buckets text dates by month? ──
+async function runMonthly(): Promise<void> {
+  await ensureTab('Transactions');
+  await ensureTab('M');
+  await client!.clearValues(SHEET_ID, q('Transactions', 'A1:F1000'));
+  await client!.clearValues(SHEET_ID, q('M', 'A1:E1000'));
+
+  // Two months; transfers excluded. Expected:
+  //   2026-05: in 2000, out 500   (the -3000 Transfer dropped)
+  //   2026-06: in 100,  out 40    (the -1000 Transfer dropped)
+  const rows: (string | number)[][] = [
+    ['2026-05-15', 'Checking', 2000, 'paycheck', 'employer', ''],
+    ['2026-05-20', 'Checking', -500, 'dinner', 'rest', 'Dining'],
+    ['2026-05-25', 'Checking', -3000, 'to savings', 'xfer', 'Transfer'],
+    ['2026-06-03', 'Checking', 100, 'refund', 'store', ''],
+    ['2026-06-05', 'Checking', -40, 'coffee', 'cafe', ''],
+    ['2026-06-10', 'Checking', -1000, 'to savings', 'xfer', 'Transfer'],
+  ];
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'A1:F1'), values: [['Date', 'Account', 'Amount', 'Desc', 'Merchant', 'Category']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', `A2:A${rows.length + 1}`), values: rows.map((r) => [r[0] as string]) }]); // RAW text dates
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', `B2:F${rows.length + 1}`), values: rows.map((r) => r.slice(1) as (string | number)[]) }]);
+
+  // Approach A — SUMIFS with text date-range (>= month start, <= month end).
+  const sumifsIn = (start: string, end: string) =>
+    `=SUMIFS(Transactions!$C:$C, Transactions!$A:$A, ">=${start}", Transactions!$A:$A, "<=${end}", Transactions!$C:$C, ">0", Transactions!$F:$F, "<>Transfer")`;
+  const sumifsOut = (start: string, end: string) =>
+    `=-SUMIFS(Transactions!$C:$C, Transactions!$A:$A, ">=${start}", Transactions!$A:$A, "<=${end}", Transactions!$C:$C, "<0", Transactions!$F:$F, "<>Transfer")`;
+  // Approach B — SUMPRODUCT with LEFT(date,7) month-prefix match.
+  // Production shape: full-column refs (no row cap) keyed on the month CELL
+  // (LEFT(date,7)=$A<row>), with N() coercing the header/blank text cells to 0.
+  const spIn = (cell: string) =>
+    `=SUMPRODUCT((LEFT(Transactions!$A:$A,7)=${cell})*(N(Transactions!$C:$C)>0)*(Transactions!$F:$F<>"Transfer")*N(Transactions!$C:$C))`;
+  const spOut = (cell: string) =>
+    `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)=${cell})*(N(Transactions!$C:$C)<0)*(Transactions!$F:$F<>"Transfer")*N(Transactions!$C:$C))`;
+
+  // Month labels as RAW text (production shape) — USER_ENTERED would parse
+  // "2026-05" into a date and break the LEFT(date,7)=$A2 match.
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('M', 'A2:A3'), values: [['2026-05'], ['2026-06']] }]);
+  await client!.batchUpdateValues(
+    SHEET_ID,
+    [{ range: q('M', 'B2:E3'), values: [
+      [sumifsIn('2026-05-01', '2026-05-31'), sumifsOut('2026-05-01', '2026-05-31'), spIn('$A2'), spOut('$A2')],
+      [sumifsIn('2026-06-01', '2026-06-30'), sumifsOut('2026-06-01', '2026-06-30'), spIn('$A3'), spOut('$A3')],
+    ] }],
+    'USER_ENTERED',
+  );
+
+  const got = await client!.getValuesRendered(SHEET_ID, q('M', 'B2:E3'), 'UNFORMATTED_VALUE');
+  const n = (v: unknown) => Number(v ?? 0);
+  const sumifs = { m5_in: n(got[0]?.[0]), m5_out: n(got[0]?.[1]), m6_in: n(got[1]?.[0]), m6_out: n(got[1]?.[1]) };
+  const sumproduct = { m5_in: n(got[0]?.[2]), m5_out: n(got[0]?.[3]), m6_in: n(got[1]?.[2]), m6_out: n(got[1]?.[3]) };
+  const expect = (o: { m5_in: number; m5_out: number; m6_in: number; m6_out: number }) =>
+    o.m5_in === 2000 && o.m5_out === 500 && o.m6_in === 100 && o.m6_out === 40;
+  console.log('[monthly SUMIFS range]', sumifs, expect(sumifs) ? '✅ PASS' : '❌ FAIL');
+  console.log('[monthly SUMPRODUCT  ]', sumproduct, expect(sumproduct) ? '✅ PASS' : '❌ FAIL');
+}
+
+await runMonthly();
 console.log('\nDone.');

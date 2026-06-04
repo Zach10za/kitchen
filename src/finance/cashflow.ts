@@ -1,15 +1,15 @@
 /**
  * Cash-flow support: detecting inter-account transfers (to auto-tag them) and a
- * daily inflow/outflow series for the chat tool.
+ * monthly inflow/outflow series for the chat tool.
  *
  * Design (decided with the operator): ALL accounts' transactions live in the
- * sheet, transfers are identified by the **Category** column, and the daily
- * cash-flow table/chart is computed by sheet **formulas** (SUMIFS excluding
- * Category = "Transfer"). The bot's only cash-flow job is to *propose* the
- * "Transfer" category on transactions it detects as paired flows — the user can
- * override any of them, and the formulas do the actual math (live, no sync).
+ * sheet, transfers are identified by the **Category** column, and the monthly
+ * cash-flow table/chart is computed by sheet **formulas** (a SUMPRODUCT that
+ * buckets by month and excludes Category = "Transfer"). The bot's only cash-flow
+ * job is to *propose* the "Transfer" category on transactions it detects as
+ * paired flows — the user can override any, and the formulas do the math (live).
  *
- * `detectTransferIds` is the auto-tagger's engine; `dailyCashFlow` mirrors the
+ * `detectTransferIds` is the auto-tagger's engine; `monthlyCashFlow` mirrors the
  * sheet formula for chat answers (all accounts, minus Category = "Transfer").
  */
 
@@ -64,8 +64,9 @@ export function detectTransferIds(rows: readonly PairTx[]): Set<string> {
   return transfers;
 }
 
-export interface DailyFlow {
-  date: string;
+export interface MonthlyFlow {
+  /** YYYY-MM. */
+  month: string;
   inflow: number;
   /** Positive magnitude of money out (not signed). */
   outflow: number;
@@ -79,18 +80,19 @@ interface FlowTx {
   [key: string]: SqlStorageValue;
 }
 
-/** Local YYYY-MM-DD for a unix-seconds timestamp in the given timezone. */
-function localDateOf(postedSec: number, timezone: string): string {
-  return new Date(postedSec * 1000).toLocaleDateString('en-CA', { timeZone: timezone });
+/** Local YYYY-MM for a unix-seconds timestamp in the given timezone. */
+function localMonthOf(postedSec: number, timezone: string): string {
+  return new Date(postedSec * 1000).toLocaleDateString('en-CA', { timeZone: timezone }).slice(0, 7);
 }
 
 /**
- * Daily inflow/outflow series for the last `days` days, mirroring the sheet's
- * Cash Flow formulas: every account, minus rows whose sheet Category is
- * "Transfer". Days with no activity are omitted.
+ * Monthly inflow/outflow series for the last `months` months, mirroring the
+ * sheet's Cash Flow formulas: every account, minus rows whose sheet Category is
+ * "Transfer". Months with no activity are omitted.
  */
-export function dailyCashFlow(sql: SqlStorage, timezone: string, days: number): DailyFlow[] {
-  const since = Math.floor(Date.now() / 1000) - days * 86_400;
+export function monthlyCashFlow(sql: SqlStorage, timezone: string, months: number): MonthlyFlow[] {
+  // Generous lower bound (≈31 days/month) so we capture the requested window.
+  const since = Math.floor(Date.now() / 1000) - months * 31 * 86_400;
   const rows = sql
     .exec<FlowTx>(
       `SELECT t.posted, t.amount, s.category AS category
@@ -101,17 +103,18 @@ export function dailyCashFlow(sql: SqlStorage, timezone: string, days: number): 
     )
     .toArray();
 
-  const byDate = new Map<string, { inflow: number; outflow: number }>();
+  const byMonth = new Map<string, { inflow: number; outflow: number }>();
   for (const tx of rows) {
     if ((tx.category ?? '').trim().toLowerCase() === TRANSFER_CATEGORY.toLowerCase()) continue;
-    const date = localDateOf(tx.posted, timezone);
-    const bucket = byDate.get(date) ?? { inflow: 0, outflow: 0 };
+    const month = localMonthOf(tx.posted, timezone);
+    const bucket = byMonth.get(month) ?? { inflow: 0, outflow: 0 };
     if (tx.amount > 0) bucket.inflow += tx.amount;
     else bucket.outflow += -tx.amount;
-    byDate.set(date, bucket);
+    byMonth.set(month, bucket);
   }
 
-  return [...byDate.entries()]
+  return [...byMonth.entries()]
     .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-    .map(([date, b]) => ({ date, inflow: b.inflow, outflow: b.outflow, net: b.inflow - b.outflow }));
+    .slice(-months)
+    .map(([month, b]) => ({ month, inflow: b.inflow, outflow: b.outflow, net: b.inflow - b.outflow }));
 }

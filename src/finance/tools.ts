@@ -175,11 +175,11 @@ export const FINANCE_TOOLS = [
     type: 'function' as const,
     function: {
       name: 'cash_flow',
-      description: 'Daily inflows vs outflows over a window, with inter-account transfers excluded (any transaction categorized "Transfer" — the bot auto-tags detected paired flows, and the user can adjust). Mirrors the live Cash Flow tab + chart in the sheet. Use for "what\'s my daily cash flow", "income vs spending by day", "am I cash-flow positive".',
+      description: 'Monthly inflows vs outflows, with inter-account transfers excluded (any transaction categorized "Transfer" — the bot auto-tags detected paired flows, and the user can adjust). Mirrors the live Cash Flow tab + chart in the sheet. Use for "what\'s my monthly cash flow", "income vs spending by month", "am I cash-flow positive".',
       parameters: {
         type: 'object',
         properties: {
-          days: { type: 'integer', minimum: 1, maximum: 365, description: 'Lookback window. Default 30.' },
+          months: { type: 'integer', minimum: 1, maximum: 60, description: 'How many recent months. Default 12.' },
         },
       },
     },

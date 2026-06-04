@@ -10,7 +10,7 @@ import { type TransactionRow } from './tools';
 import { runSync } from './sync';
 import { captureError } from '../error-triage';
 import { reconcileSheet } from './sheet';
-import { dailyCashFlow } from './cashflow';
+import { monthlyCashFlow } from './cashflow';
 import { loadRules, upsertRule, type RuleMatchType, type RuleRow } from './rules';
 import {
   spendingFilter,
@@ -113,20 +113,19 @@ function toolNetWorth(args: { days?: number }, ctx: FinanceToolCtx): string {
   return lines.join('\n');
 }
 
-function toolCashFlow(args: { days?: number }, ctx: FinanceToolCtx): string {
-  const days = Math.max(1, Math.min(365, args.days ?? 30));
-  const flow = dailyCashFlow(ctx.sql, ctx.env.TIMEZONE, days);
-  if (flow.length === 0) return `No cash flow in the last ${days} days.`;
+function toolCashFlow(args: { months?: number }, ctx: FinanceToolCtx): string {
+  const months = Math.max(1, Math.min(60, args.months ?? 12));
+  const flow = monthlyCashFlow(ctx.sql, ctx.env.TIMEZONE, months);
+  if (flow.length === 0) return `No cash flow in the last ${months} months.`;
 
   const totalIn = flow.reduce((s, f) => s + f.inflow, 0);
   const totalOut = flow.reduce((s, f) => s + f.outflow, 0);
-  const lines = flow.slice(-30).map(
-    (f) => `${f.date}: in ${formatMoney(f.inflow)}, out ${formatMoney(f.outflow)}, net ${formatMoneySigned(f.net)}`,
+  const lines = flow.map(
+    (f) => `${f.month}: in ${formatMoney(f.inflow)}, out ${formatMoney(f.outflow)}, net ${formatMoneySigned(f.net)}`,
   );
   return [
-    `Daily cash flow (last ${days}d, transfers excluded via Category):`,
+    `Monthly cash flow (last ${flow.length} month${flow.length === 1 ? '' : 's'}, transfers excluded via Category):`,
     `Totals — in ${formatMoney(totalIn)}, out ${formatMoney(totalOut)}, net ${formatMoneySigned(totalIn - totalOut)}.`,
-    ...(flow.length > 30 ? [`(showing the last 30 of ${flow.length} active days)`] : []),
     ...lines,
   ].join('\n');
 }
