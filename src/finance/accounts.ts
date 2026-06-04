@@ -114,6 +114,44 @@ export function guessAccountType(name: string, org?: string | null, balance?: nu
   return 'checking';
 }
 
+/**
+ * Manual accounts — ones the user maintains by hand on the sheet's Accounts tab
+ * (e.g. a car loan, a private mortgage, an asset SimpleFin can't reach) rather
+ * than syncing from SimpleFin. They live in the same `accounts` table so they
+ * flow into Balances + Net Worth like any other account; the only distinction is
+ * their id, which carries a `manual:` prefix. SimpleFin sync only ever touches
+ * ids it returns, so manual accounts are never overwritten or re-guessed; the
+ * Accounts-tab reconcile treats their name/balance/type as user-owned.
+ */
+const MANUAL_PREFIX = 'manual:';
+
+export function isManualAccount(id: string): boolean {
+  return id.startsWith(MANUAL_PREFIX);
+}
+
+export function newManualAccountId(): string {
+  return `${MANUAL_PREFIX}${crypto.randomUUID()}`;
+}
+
+/**
+ * Insert or update a manual account from the values the user typed on the sheet.
+ * Balance is stored as TEXT to match the SimpleFin sync convention (read back via
+ * CAST AS REAL in currentBalances). available_balance is left null.
+ */
+export function upsertManualAccount(
+  sql: SqlStorage,
+  acct: { id: string; name: string; org: string | null; currency: string; balance: number; syncedAt: number },
+): void {
+  sql.exec(
+    `INSERT INTO accounts (id, name, org_name, currency, balance, available_balance, last_synced_at)
+     VALUES (?, ?, ?, ?, ?, NULL, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       name=excluded.name, org_name=excluded.org_name, currency=excluded.currency,
+       balance=excluded.balance, last_synced_at=excluded.last_synced_at`,
+    acct.id, acct.name, acct.org, acct.currency, String(acct.balance), acct.syncedAt,
+  );
+}
+
 export interface AccountMetaRow {
   account_id: string;
   type: string;
