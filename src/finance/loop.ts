@@ -11,6 +11,7 @@ import { runSync } from './sync';
 import { captureError } from '../error-triage';
 import { reconcileSheet } from './sheet';
 import { monthlyCashFlow } from './cashflow';
+import { autoCategorize } from './categorize';
 import { loadRules, upsertRule, type RuleMatchType, type RuleRow } from './rules';
 import {
   spendingFilter,
@@ -47,6 +48,7 @@ export async function executeFinanceTool(name: string, args: any, ctx: FinanceTo
       case 'sync_sheet':            return await toolSyncSheet(ctx);
       case 'set_rule':              return await toolSetRule(args, ctx);
       case 'list_rules':            return toolListRules(ctx);
+      case 'categorize_all':        return await toolCategorizeAll(ctx);
       case 'category_breakdown':    return toolCategoryBreakdown(args, ctx);
       case 'net_worth':             return toolNetWorth(args, ctx);
       case 'cash_flow':             return toolCashFlow(args, ctx);
@@ -577,10 +579,21 @@ function toolListRules(ctx: FinanceToolCtx): string {
     const sets = [r.merchant ? `merchant="${r.merchant}"` : null, r.category ? `category="${r.category}"` : null]
       .filter(Boolean)
       .join(', ');
-    const origin = r.source === 'manual' ? 'learned from sheet edit' : 'set via chat';
+    const origin = r.source === 'manual' ? 'learned from sheet edit' : r.source === 'auto' ? 'auto-categorized' : 'set via chat';
     return `- ${r.match_type} "${r.pattern}" → ${sets} (${origin})`;
   });
   return `${rules.length} rule${rules.length === 1 ? '' : 's'}:\n${lines.join('\n')}`;
+}
+
+async function toolCategorizeAll(ctx: FinanceToolCtx): Promise<string> {
+  // Categorize every uncategorized merchant now (the hourly sync does this
+  // incrementally; this is the on-demand "do it all" path).
+  const n = await autoCategorize(ctx.env, ctx.sql, { max: 1000 });
+  if (n === 0) return 'Every merchant already has a category. Nothing to do.';
+  const r = await reconcileSheet(ctx.env, ctx.sql);
+  const applied = r.configured ? ` Applied to the sheet (${r.updated} row${r.updated === 1 ? '' : 's'} updated).` : '';
+  const errNote = r.errors.length > 0 ? ` Note: the sheet sync hit errors: ${r.errors.join('; ')}.` : '';
+  return `Categorized ${n} merchant${n === 1 ? '' : 's'}.${applied}${errNote} Transfers stay "Transfer"; you can override any category in the sheet.`;
 }
 
 function toolCategoryBreakdown(args: { days?: number }, ctx: FinanceToolCtx): string {

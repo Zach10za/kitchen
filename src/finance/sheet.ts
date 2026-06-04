@@ -36,6 +36,7 @@ import type { Env } from '../env';
 import { SheetsClient, type ValueRange } from '../runtime/sheets';
 import { loadRules, applyRules, upsertRule, type Enrichment } from './rules';
 import { detectTransferIds, TRANSFER_CATEGORY } from './cashflow';
+import { CATEGORY_TAXONOMY } from './categorize';
 import {
   loadAccountMeta,
   setAccountType,
@@ -305,10 +306,10 @@ async function reconcileTransactions(
 
   for (const tx of txs) {
     const proposed: Enrichment = applyRules(rules, tx);
-    // Auto-propose "Transfer" for detected paired flows when no rule already
-    // set a category. Flows through the normal category merge, so the user can
-    // override it in the sheet.
-    if (!proposed.category && transferIds.has(tx.id)) proposed.category = TRANSFER_CATEGORY;
+    // A detected paired flow is a transfer regardless of the merchant's
+    // auto-category, so "Transfer" overrides the rule's category. (The user's
+    // manual edit still wins — it's preserved by the merge below.)
+    if (transferIds.has(tx.id)) proposed.category = TRANSFER_CATEGORY;
     const existing = sheetByTx.get(tx.id);
 
     if (!existing) {
@@ -447,17 +448,18 @@ async function reconcileTransactions(
       { col: TX_COL.amount, kind: 'currency' },
     ]),
   );
-  const categories = sql
+  // Dropdown = the standard taxonomy + any custom categories already in use
+  // (non-strict, so the user can still type a new one).
+  const inUse = sql
     .exec<{ category: string }>(
       "SELECT DISTINCT TRIM(category) AS category FROM sheet_rows WHERE TRIM(category) <> '' ORDER BY category",
     )
     .toArray()
     .map((r) => r.category);
-  if (categories.length > 0) {
-    await applyFormatting(result, 'tx-category-dropdown', () =>
-      client.setListValidation(sheetId, tabId, TX_COL.category, categories, false),
-    );
-  }
+  const categories = [...new Set<string>([...CATEGORY_TAXONOMY, TRANSFER_CATEGORY, ...inUse])];
+  await applyFormatting(result, 'tx-category-dropdown', () =>
+    client.setListValidation(sheetId, tabId, TX_COL.category, categories, false),
+  );
   // Exclude column → checkboxes (check a row to drop it from cash flow).
   await applyFormatting(result, 'tx-exclude-checkbox', () =>
     client.setCheckbox(sheetId, tabId, TX_COL.exclude),
