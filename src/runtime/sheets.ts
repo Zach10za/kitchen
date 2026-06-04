@@ -280,6 +280,20 @@ export class SheetsClient {
     ]);
   }
 
+  /** Clear all values in an A1 range (leaves formatting/validation/charts intact). */
+  async clearValues(spreadsheetId: string, range: string): Promise<void> {
+    await this.api(`${spreadsheetId}/values/${encodeURIComponent(range)}:clear`, { method: 'POST', body: '{}' });
+  }
+
+  /** Read one A1 range with an explicit render option (e.g. UNFORMATTED_VALUE so
+   *  formula results come back as numbers, not display strings). */
+  async getValuesRendered(spreadsheetId: string, range: string, renderOption: string): Promise<unknown[][]> {
+    const data = await this.api<{ values?: unknown[][] }>(
+      `${spreadsheetId}/values/${encodeURIComponent(range)}?valueRenderOption=${renderOption}`,
+    );
+    return data.values ?? [];
+  }
+
   /** Count charts on a tab (used to add a chart only once). */
   async countCharts(spreadsheetId: string, sheetId: number): Promise<number> {
     const data = await this.api<{

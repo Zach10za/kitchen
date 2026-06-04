@@ -10,6 +10,7 @@ import { type TransactionRow } from './tools';
 import { runSync } from './sync';
 import { captureError } from '../error-triage';
 import { reconcileSheet } from './sheet';
+import { dailyCashFlow } from './cashflow';
 import { loadRules, upsertRule, type RuleMatchType, type RuleRow } from './rules';
 import {
   spendingFilter,
@@ -48,6 +49,7 @@ export async function executeFinanceTool(name: string, args: any, ctx: FinanceTo
       case 'list_rules':            return toolListRules(ctx);
       case 'category_breakdown':    return toolCategoryBreakdown(args, ctx);
       case 'net_worth':             return toolNetWorth(args, ctx);
+      case 'cash_flow':             return toolCashFlow(args, ctx);
       case 'set_account_type':      return await toolSetAccountType(args, ctx);
       case 'set_nickname':          return await toolSetNickname(args, ctx);
       default:                      return `Unknown finance tool: ${name}`;
@@ -111,6 +113,24 @@ function toolNetWorth(args: { days?: number }, ctx: FinanceToolCtx): string {
   return lines.join('\n');
 }
 
+function toolCashFlow(args: { days?: number }, ctx: FinanceToolCtx): string {
+  const days = Math.max(1, Math.min(365, args.days ?? 30));
+  const flow = dailyCashFlow(ctx.sql, ctx.env.TIMEZONE, days);
+  if (flow.length === 0) return `No cash flow in the last ${days} days.`;
+
+  const totalIn = flow.reduce((s, f) => s + f.inflow, 0);
+  const totalOut = flow.reduce((s, f) => s + f.outflow, 0);
+  const lines = flow.slice(-30).map(
+    (f) => `${f.date}: in ${formatMoney(f.inflow)}, out ${formatMoney(f.outflow)}, net ${formatMoneySigned(f.net)}`,
+  );
+  return [
+    `Daily cash flow (last ${days}d, transfers excluded via Category):`,
+    `Totals — in ${formatMoney(totalIn)}, out ${formatMoney(totalOut)}, net ${formatMoneySigned(totalIn - totalOut)}.`,
+    ...(flow.length > 30 ? [`(showing the last 30 of ${flow.length} active days)`] : []),
+    ...lines,
+  ].join('\n');
+}
+
 /** Resolve a user-supplied account reference (name, nickname, or institution,
  *  full or partial) to a single account, or return a message describing the
  *  ambiguity/miss. */
@@ -150,11 +170,8 @@ async function toolSetAccountType(
 
   setAccountType(ctx.sql, acct.account_id, type);
   const r = await reconcileSheet(ctx.env, ctx.sql);
-  const note = r.configured && r.deleted > 0
-    ? ` Removed ${r.deleted} now-non-spending row${r.deleted === 1 ? '' : 's'} from the Transactions tab.`
-    : '';
   const errNote = r.errors.length > 0 ? ` Note: the sheet sync hit errors: ${r.errors.join('; ')}.` : '';
-  return `Set ${displayName(acct)} to "${type}".${note}${errNote}`;
+  return `Set ${displayName(acct)} to "${type}". Net worth re-signs its balance accordingly.${errNote}`;
 }
 
 async function toolSetNickname(
