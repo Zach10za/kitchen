@@ -98,6 +98,12 @@ const CF_HEADER = ['Month', 'Inflows', 'Outflows', 'Net'];
  *  first month with data, so it won't show empty leading months). */
 const CF_MAX_MONTHS = 36;
 
+const SC_TAB = 'Spend by Category';
+/** Spend-analysis columns: the taxonomy minus Income (inflow, not spend). */
+const SPEND_CATEGORIES = CATEGORY_TAXONOMY.filter((c) => c !== 'Income');
+/** Months (rows) the spend-by-category matrix shows. */
+const SC_MONTHS = 12;
+
 /** Column letters (1-based A=1) for building A1 cell refs inside formulas. */
 const COL_LETTER = (idx0: number) => String.fromCharCode(65 + idx0);
 
@@ -229,7 +235,7 @@ async function runReconcile(env: Env, sql: SqlStorage): Promise<ReconcileResult>
   if (!client || !sheetId) return result;
   result.configured = true;
 
-  for (const section of [reconcileTransactions, reconcileAccountsTab, reconcileHistory, reconcileCashFlow]) {
+  for (const section of [reconcileTransactions, reconcileAccountsTab, reconcileHistory, reconcileCashFlow, reconcileSpendByCategory]) {
     try {
       await section(client, sheetId, env, sql, result);
     } catch (err) {
@@ -803,6 +809,61 @@ async function reconcileCashFlow(
   );
 }
 
+// ─── Spend by Category tab (month × category matrix via live formulas) ───────
+
+/** Spend (outflow magnitude) for one (month, category) cell, excluding the
+ *  user-checked Exclude rows. Transfers don't match a spend category, so they're
+ *  naturally absent. monthCell/catCell are A1 refs like $A2 / B$1. */
+const spendCell = (monthCell: string, catCell: string) =>
+  `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)=${monthCell})*(Transactions!$F:$F=${catCell})*(N(Transactions!$C:$C)<0)*(Transactions!$J:$J<>TRUE)*N(Transactions!$C:$C))`;
+
+/**
+ * A live month × spending-category matrix (months down, categories across) plus
+ * a per-category Total row, with a stacked-column chart (spend by category over
+ * time) and a pie chart (overall category breakdown). Formula-driven, so
+ * re-categorizing updates it instantly. Categories are the fixed taxonomy (minus
+ * Income) so the layout + charts are stable; custom categories aren't shown here.
+ */
+async function reconcileSpendByCategory(
+  client: SheetsClient,
+  sheetId: string,
+  env: Env,
+  sql: SqlStorage,
+  result: ReconcileResult,
+): Promise<void> {
+  const header = ['Month', ...SPEND_CATEGORIES];
+  const lastCol = COL_LETTER(SPEND_CATEGORIES.length); // category cols are B..lastCol
+  const { tabId } = await ensureTab(client, sheetId, SC_TAB, header, []);
+
+  const tz = env.TIMEZONE;
+  const currentYm = new Date().toLocaleDateString('en-CA', { timeZone: tz }).slice(0, 7);
+  const minPosted = sql.exec<{ min: number | null }>('SELECT MIN(posted) AS min FROM transactions').toArray()[0]?.min ?? null;
+  const firstYm = minPosted ? new Date(minPosted * 1000).toLocaleDateString('en-CA', { timeZone: tz }).slice(0, 7) : currentYm;
+  const months = monthsRange(firstYm, currentYm).slice(-SC_MONTHS);
+  if (months.length === 0) return;
+  const lastMonthRow = months.length + 1; // months occupy rows 2..lastMonthRow
+  const totalRow = lastMonthRow + 1;
+
+  try {
+    await client.batchUpdateValues(sheetId, [{ range: a1(SC_TAB, `A1:${lastCol}1`), values: [header] }]);
+    await client.clearValues(sheetId, a1(SC_TAB, `A2:${lastCol}1000`));
+    await client.batchUpdateValues(sheetId, [{ range: a1(SC_TAB, `A2:A${lastMonthRow}`), values: months.map((m) => [m]) }]); // RAW months
+    const matrix = months.map((_, ri) => SPEND_CATEGORIES.map((_, ci) => spendCell(`$A${ri + 2}`, `${COL_LETTER(ci + 1)}$1`)));
+    await client.batchUpdateValues(sheetId, [{ range: a1(SC_TAB, `B2:${lastCol}${lastMonthRow}`), values: matrix }], 'USER_ENTERED');
+    const totals = SPEND_CATEGORIES.map((_, ci) => { const L = COL_LETTER(ci + 1); return `=SUM(${L}2:${L}${lastMonthRow})`; });
+    await client.batchUpdateValues(sheetId, [{ range: a1(SC_TAB, `A${totalRow}:${lastCol}${totalRow}`), values: [['Total', ...totals]] }], 'USER_ENTERED');
+  } catch (err) {
+    result.errors.push(`spend-by-category: ${(err as Error).message}`);
+  }
+
+  if ((await client.countCharts(sheetId, tabId)) === 0) {
+    await client.batchUpdate(sheetId, spendByCategoryCharts(tabId, lastMonthRow, SPEND_CATEGORIES.length, totalRow));
+  }
+  await applyFormatting(result, 'sc-format', () =>
+    client.setColumnFormats(sheetId, tabId, SPEND_CATEGORIES.map((_, ci) => ({ col: ci + 1, kind: 'currency' as const }))),
+  );
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Ensure a tab exists with a header row; freeze + bold the header and
@@ -947,6 +1008,54 @@ function netWorthChartRequest(tabId: number): unknown {
       },
     },
   };
+}
+
+/** Two charts for the Spend by Category tab: a stacked column of spend by
+ *  category over months, and a pie of the overall category breakdown. Ranges are
+ *  fixed (the matrix is a fixed month×taxonomy grid), so the charts stay correct
+ *  as the formulas recompute each reconcile. */
+function spendByCategoryCharts(tabId: number, lastMonthRow: number, nCats: number, totalRow: number): unknown[] {
+  const anchorCol = nCats + 2; // park charts to the right of the matrix
+  const monthDomain = { sourceRange: { sources: [{ sheetId: tabId, startRowIndex: 0, endRowIndex: lastMonthRow, startColumnIndex: 0, endColumnIndex: 1 }] } };
+  const series = Array.from({ length: nCats }, (_, ci) => ({
+    series: { sourceRange: { sources: [{ sheetId: tabId, startRowIndex: 0, endRowIndex: lastMonthRow, startColumnIndex: ci + 1, endColumnIndex: ci + 2 }] } },
+    targetAxis: 'LEFT_AXIS',
+  }));
+  const stacked = {
+    addChart: {
+      chart: {
+        spec: {
+          title: 'Spend by Category over Time',
+          basicChart: {
+            chartType: 'COLUMN',
+            stackedType: 'STACKED',
+            legendPosition: 'RIGHT_LEGEND',
+            headerCount: 1,
+            axis: [{ position: 'BOTTOM_AXIS', title: 'Month' }, { position: 'LEFT_AXIS', title: 'Spend (USD)' }],
+            domains: [{ domain: monthDomain }],
+            series,
+          },
+        },
+        position: { overlayPosition: { anchorCell: { sheetId: tabId, rowIndex: 1, columnIndex: anchorCol } } },
+      },
+    },
+  };
+  const pie = {
+    addChart: {
+      chart: {
+        spec: {
+          title: 'Total Spend by Category',
+          pieChart: {
+            legendPosition: 'RIGHT_LEGEND',
+            domain: { sourceRange: { sources: [{ sheetId: tabId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 1, endColumnIndex: nCats + 1 }] } },
+            series: { sourceRange: { sources: [{ sheetId: tabId, startRowIndex: totalRow - 1, endRowIndex: totalRow, startColumnIndex: 1, endColumnIndex: nCats + 1 }] } },
+          },
+        },
+        position: { overlayPosition: { anchorCell: { sheetId: tabId, rowIndex: 20, columnIndex: anchorCol } } },
+      },
+    },
+  };
+  return [stacked, pie];
 }
 
 /** A COLUMN chart of daily Inflows vs Outflows for the Cash Flow tab. */

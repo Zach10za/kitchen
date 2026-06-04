@@ -230,4 +230,35 @@ async function runColumnExclude(): Promise<void> {
 }
 
 if (wants('column-exclude')) await runColumnExclude();
+
+// ─── Spend-by-category-by-month matrix (month rows × category cols) ───────────
+async function runSpendMatrix(): Promise<void> {
+  await ensureTab('Transactions');
+  await ensureTab('SX');
+  await client!.clearValues(SHEET_ID, q('Transactions', 'A1:J1000'));
+  await client!.clearValues(SHEET_ID, q('SX', 'A1:Z1000'));
+
+  // A date | C amount | F category | J exclude. Expected (spend = outflow magnitude):
+  //   May: Dining 100, Groceries 50 ; Jun: Dining 40 (the -200 Dining is Exclude-checked), Groceries 0
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'A1:J1'), values: [['Date', 'Account', 'Amount', 'Desc', 'Merchant', 'Category', 'Notes', 'tx_id', 'account_id', 'Exclude']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'A2:A6'), values: [['2026-05-10'], ['2026-05-12'], ['2026-06-05'], ['2026-06-06'], ['2026-06-07']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'C2:C6'), values: [[-100], [-50], [-40], [-1000], [-200]] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'F2:F6'), values: [['Dining'], ['Groceries'], ['Dining'], ['Transfer'], ['Dining']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'J2:J6'), values: [['FALSE'], ['FALSE'], ['FALSE'], ['FALSE'], ['TRUE']] }], 'USER_ENTERED');
+
+  // Matrix tab SX: A1 "Month", B1 Dining, C1 Groceries; rows = months.
+  const cell = (monthCell: string, catCell: string) =>
+    `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)=${monthCell})*(Transactions!$F:$F=${catCell})*(N(Transactions!$C:$C)<0)*(Transactions!$J:$J<>TRUE)*N(Transactions!$C:$C))`;
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('SX', 'A1:C1'), values: [['Month', 'Dining', 'Groceries']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('SX', 'A2:A3'), values: [['2026-05'], ['2026-06']] }]); // RAW text months
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('SX', 'B2:C3'), values: [[cell('$A2', 'B$1'), cell('$A2', 'C$1')], [cell('$A3', 'B$1'), cell('$A3', 'C$1')]] }], 'USER_ENTERED');
+
+  const got = await client!.getValuesRendered(SHEET_ID, q('SX', 'B2:C3'), 'UNFORMATTED_VALUE');
+  const n = (v: unknown) => Number(v ?? 0);
+  const res = { may_dining: n(got[0]?.[0]), may_groc: n(got[0]?.[1]), jun_dining: n(got[1]?.[0]), jun_groc: n(got[1]?.[1]) };
+  const ok = res.may_dining === 100 && res.may_groc === 50 && res.jun_dining === 40 && res.jun_groc === 0;
+  console.log('[spend-matrix]', res, ok ? '✅ PASS' : '❌ FAIL (expected may 100/50, jun 40/0)');
+}
+
+if (wants('spend-matrix')) await runSpendMatrix();
 console.log('\nDone.');
