@@ -3,11 +3,13 @@
  * monthly inflow/outflow series for the chat tool.
  *
  * Design (decided with the operator): ALL accounts' transactions live in the
- * sheet, transfers are identified by the **Category** column, and the monthly
- * cash-flow table/chart is computed by sheet **formulas** (a SUMPRODUCT that
- * buckets by month and excludes Category = "Transfer"). The bot's only cash-flow
- * job is to *propose* the "Transfer" category on transactions it detects as
- * paired flows — the user can override any, and the formulas do the math (live).
+ * sheet, and the monthly cash-flow table/chart is computed by sheet **formulas**
+ * (a SUMPRODUCT bucketed by month) that exclude two things: inter-account
+ * transfers (Category = "Transfer") and any row the user checked the **Exclude**
+ * box on (a separate column, so the row keeps its real category — e.g. a one-off
+ * bonus). The bot's only cash-flow job is to *propose* the "Transfer" category on
+ * detected paired flows; the user owns the Exclude box and the formulas do the
+ * math (live, no sync).
  *
  * `detectTransferIds` is the auto-tagger's engine; `monthlyCashFlow` mirrors the
  * sheet formula for chat answers (all accounts, minus Category = "Transfer").
@@ -15,12 +17,6 @@
 
 /** Category value the bot writes for detected transfers and the formulas exclude. */
 export const TRANSFER_CATEGORY = 'Transfer';
-/** Manual escape hatch: categorize a one-off (e.g. a bonus) "Exclude" to drop it
- *  from cash flow without it being a transfer. */
-export const EXCLUDE_CATEGORY = 'Exclude';
-
-/** Categories dropped from cash flow (case-insensitive), lowercased. */
-const CASHFLOW_EXCLUDED = new Set([TRANSFER_CATEGORY.toLowerCase(), EXCLUDE_CATEGORY.toLowerCase()]);
 
 /** How far apart the two legs of a transfer can post and still pair. */
 const PAIR_WINDOW_SEC = 4 * 86_400;
@@ -83,6 +79,7 @@ interface FlowTx {
   posted: number;
   amount: number;
   category: string | null;
+  excluded: number;
   [key: string]: SqlStorageValue;
 }
 
@@ -101,7 +98,7 @@ export function monthlyCashFlow(sql: SqlStorage, timezone: string, months: numbe
   const since = Math.floor(Date.now() / 1000) - months * 31 * 86_400;
   const rows = sql
     .exec<FlowTx>(
-      `SELECT t.posted, t.amount, s.category AS category
+      `SELECT t.posted, t.amount, s.category AS category, COALESCE(s.is_excluded, 0) AS excluded
          FROM transactions t
          LEFT JOIN sheet_rows s ON s.tx_id = t.id
         WHERE t.posted >= ?`,
@@ -111,7 +108,10 @@ export function monthlyCashFlow(sql: SqlStorage, timezone: string, months: numbe
 
   const byMonth = new Map<string, { inflow: number; outflow: number }>();
   for (const tx of rows) {
-    if (CASHFLOW_EXCLUDED.has((tx.category ?? '').trim().toLowerCase())) continue;
+    // Excluded from cash flow: inter-account transfers (Category) or rows the
+    // user checked "Exclude" (mirrored from the sheet's Exclude column).
+    if (tx.excluded === 1) continue;
+    if ((tx.category ?? '').trim().toLowerCase() === TRANSFER_CATEGORY.toLowerCase()) continue;
     const month = localMonthOf(tx.posted, timezone);
     const bucket = byMonth.get(month) ?? { inflow: 0, outflow: 0 };
     if (tx.amount > 0) bucket.inflow += tx.amount;

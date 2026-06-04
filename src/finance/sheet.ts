@@ -35,7 +35,7 @@
 import type { Env } from '../env';
 import { SheetsClient, type ValueRange } from '../runtime/sheets';
 import { loadRules, applyRules, upsertRule, type Enrichment } from './rules';
-import { detectTransferIds, TRANSFER_CATEGORY, EXCLUDE_CATEGORY } from './cashflow';
+import { detectTransferIds, TRANSFER_CATEGORY } from './cashflow';
 import {
   loadAccountMeta,
   setAccountType,
@@ -76,9 +76,11 @@ async function applyFormatting(
   }
 }
 
-const TX_RANGE = a1(TX_TAB, 'A2:I');
-const TX_HEADER = ['Date', 'Account', 'Amount', 'Raw Description', 'Merchant', 'Category', 'Notes', 'tx_id', 'account_id'];
-const TX_COL = { date: 0, account: 1, amount: 2, desc: 3, merchant: 4, category: 5, notes: 6, txId: 7, acctId: 8 } as const;
+const TX_RANGE = a1(TX_TAB, 'A2:J');
+const TX_HEADER = ['Date', 'Account', 'Amount', 'Raw Description', 'Merchant', 'Category', 'Notes', 'tx_id', 'account_id', 'Exclude'];
+const TX_COL = { date: 0, account: 1, amount: 2, desc: 3, merchant: 4, category: 5, notes: 6, txId: 7, acctId: 8, exclude: 9 } as const;
+/** Column letter of the user-checkable Exclude column (J), for formulas. */
+const TX_EXCLUDE_COL = 'J';
 
 const ACCT_RANGE = a1(ACCT_TAB, 'A2:H');
 const ACCT_HEADER = ['Account', 'Institution', 'Type', 'Balance', 'Currency', 'Last Synced', 'account_id', 'Nickname'];
@@ -149,6 +151,7 @@ interface MirrorWrite {
   locked_merchant: number;
   locked_category: number;
   notes: string;
+  excluded: number;
 }
 
 interface FieldMerge {
@@ -256,7 +259,7 @@ async function reconcileTransactions(
   await ensureLayout(client, sheetId, tabId, TX_TAB, TX_HEADER, [TX_COL.txId, TX_COL.acctId], result);
 
   const sheetRows = await client.getValues(sheetId, TX_RANGE);
-  const sheetByTx = new Map<string, { rowIndex: number; merchant: string; category: string; notes: string; acctId: string }>();
+  const sheetByTx = new Map<string, { rowIndex: number; merchant: string; category: string; notes: string; acctId: string; excluded: number }>();
   sheetRows.forEach((r, i) => {
     const txId = r[TX_COL.txId];
     if (txId) {
@@ -266,6 +269,7 @@ async function reconcileTransactions(
         category: r[TX_COL.category] ?? '',
         notes: r[TX_COL.notes] ?? '',
         acctId: r[TX_COL.acctId] ?? '',
+        excluded: (r[TX_COL.exclude] ?? '').toString().toUpperCase() === 'TRUE' ? 1 : 0,
       });
     }
   });
@@ -321,7 +325,7 @@ async function reconcileTransactions(
       appendMirror.push({
         tx_id: tx.id, merchant: proposed.merchant, category: proposed.category,
         bot_merchant: proposed.merchant, bot_category: proposed.category,
-        locked_merchant: 0, locked_category: 0, notes: '',
+        locked_merchant: 0, locked_category: 0, notes: '', excluded: 0,
       });
       continue;
     }
@@ -355,7 +359,7 @@ async function reconcileTransactions(
       bot_merchant: mMerge.botWrote ? mMerge.value : baseMerchant,
       bot_category: cMerge.botWrote ? cMerge.value : baseCategory,
       locked_merchant: mMerge.locked ? 1 : 0, locked_category: cMerge.locked ? 1 : 0,
-      notes: existing.notes,
+      notes: existing.notes, excluded: existing.excluded,
     });
   }
 
@@ -454,6 +458,10 @@ async function reconcileTransactions(
       client.setListValidation(sheetId, tabId, TX_COL.category, categories, false),
     );
   }
+  // Exclude column → checkboxes (check a row to drop it from cash flow).
+  await applyFormatting(result, 'tx-exclude-checkbox', () =>
+    client.setCheckbox(sheetId, tabId, TX_COL.exclude),
+  );
 }
 
 // ─── Accounts tab (classification surface) ───────────────────────────────────
@@ -720,7 +728,8 @@ async function captureNetWorthRow(
 // row's own A cell (LEFT(date,7) prefix match). N() coerces the header/blank
 // text cells to 0 so the full-column refs don't #VALUE. SUMIFS date-RANGE does
 // NOT work here — it returns 0 against the text dates the bot writes (verified).
-const cfExcluded = `(Transactions!$F:$F<>"${TRANSFER_CATEGORY}")*(Transactions!$F:$F<>"${EXCLUDE_CATEGORY}")`;
+// Exclude transfers (by Category) and rows the user checked Exclude (col J).
+const cfExcluded = `(Transactions!$F:$F<>"${TRANSFER_CATEGORY}")*(Transactions!$${TX_EXCLUDE_COL}:$${TX_EXCLUDE_COL}<>TRUE)`;
 const cfInflowFormula = (row: number) =>
   `=SUMPRODUCT((LEFT(Transactions!$A:$A,7)=$A${row})*(N(Transactions!$C:$C)>0)*${cfExcluded}*N(Transactions!$C:$C))`;
 const cfOutflowFormula = (row: number) =>
@@ -878,15 +887,15 @@ async function ensureLayout(
 function upsertMirror(sql: SqlStorage, row: MirrorWrite): void {
   sql.exec(
     `INSERT INTO sheet_rows
-       (tx_id, merchant, category, bot_merchant, bot_category, locked_merchant, locked_category, notes, synced_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (tx_id, merchant, category, bot_merchant, bot_category, locked_merchant, locked_category, notes, is_excluded, synced_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(tx_id) DO UPDATE SET
        merchant=excluded.merchant, category=excluded.category,
        bot_merchant=excluded.bot_merchant, bot_category=excluded.bot_category,
        locked_merchant=excluded.locked_merchant, locked_category=excluded.locked_category,
-       notes=excluded.notes, synced_at=excluded.synced_at`,
+       notes=excluded.notes, is_excluded=excluded.is_excluded, synced_at=excluded.synced_at`,
     row.tx_id, row.merchant, row.category, row.bot_merchant, row.bot_category,
-    row.locked_merchant, row.locked_category, row.notes, Date.now(),
+    row.locked_merchant, row.locked_category, row.notes, row.excluded, Date.now(),
   );
 }
 

@@ -25,7 +25,11 @@ function loadServiceAccountJson(): string {
 }
 
 const SHEET_ID = process.argv[2] as string;
-if (!SHEET_ID) throw new Error('Usage: bun run scripts/sheets-test.ts <spreadsheetId>');
+if (!SHEET_ID) throw new Error('Usage: bun run scripts/sheets-test.ts <spreadsheetId> [only]');
+/** Optional 2nd arg restricts which test runs (avoids the 60 writes/min quota):
+ *  dates | account-refs | monthly | column-exclude. Default: all. */
+const ONLY = process.argv[3] ?? '';
+const wants = (name: string) => !ONLY || ONLY === name;
 
 const client = SheetsClient.fromEnv(loadServiceAccountJson());
 if (!client) throw new Error('Could not build SheetsClient from .dev.vars');
@@ -88,8 +92,10 @@ async function run(label: string, dateInput: 'RAW' | 'USER_ENTERED'): Promise<vo
   console.log(`[${label}] dates=${dateInput} →`, results, ok ? '✅ PASS' : '❌ FAIL (expected d1 in100/out40, d2 in0/out25)');
 }
 
-await run('text-dates', 'RAW');
-await run('native-dates', 'USER_ENTERED');
+if (wants('dates')) {
+  await run('text-dates', 'RAW');
+  await run('native-dates', 'USER_ENTERED');
+}
 
 // ─── Account reference formulas (id-keyed nickname/name + type) ───────────────
 // Verbatim from src/finance/sheet.ts — keep in sync.
@@ -134,7 +140,7 @@ async function runAccountRefs(): Promise<void> {
   console.log('[account-refs] →', results, ok ? '✅ PASS' : '❌ FAIL (expected name/checking, then My Amex/credit)');
 }
 
-await runAccountRefs();
+if (wants('account-refs')) await runAccountRefs();
 
 // ─── Monthly cash flow: which formula correctly buckets text dates by month? ──
 async function runMonthly(): Promise<void> {
@@ -194,5 +200,34 @@ async function runMonthly(): Promise<void> {
   console.log('[monthly SUMPRODUCT  ]', sumproduct, expect(sumproduct) ? '✅ PASS' : '❌ FAIL');
 }
 
-await runMonthly();
+if (wants('monthly')) await runMonthly();
+
+// ─── Cash flow with a separate "Exclude" checkbox column (col J, boolean) ─────
+async function runColumnExclude(): Promise<void> {
+  await ensureTab('Transactions');
+  await ensureTab('MX');
+  await client!.clearValues(SHEET_ID, q('Transactions', 'A1:J1000'));
+  await client!.clearValues(SHEET_ID, q('MX', 'A1:C1000'));
+
+  // Layout: A date | C amount | F category | J exclude(boolean). Expected for
+  // 2026-06: in 100 (the +5000 bonus is checked-excluded, category kept "Income"),
+  // out 40 (the -1000 Transfer dropped by category).
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'A1:J1'), values: [['Date', 'Account', 'Amount', 'Desc', 'Merchant', 'Category', 'Notes', 'tx_id', 'account_id', 'Exclude']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'A2:A5'), values: [['2026-06-03'], ['2026-06-15'], ['2026-06-10'], ['2026-06-05']] }]); // RAW text dates
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'C2:C5'), values: [[100], [5000], [-1000], [-40]] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'F2:F5'), values: [[''], ['Income'], ['Transfer'], ['']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'J2:J5'), values: [['FALSE'], ['TRUE'], ['FALSE'], ['FALSE']] }], 'USER_ENTERED'); // → booleans
+
+  const inflow = `=SUMPRODUCT((LEFT(Transactions!$A:$A,7)=$A2)*(N(Transactions!$C:$C)>0)*(Transactions!$F:$F<>"Transfer")*(Transactions!$J:$J<>TRUE)*N(Transactions!$C:$C))`;
+  const outflow = `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)=$A2)*(N(Transactions!$C:$C)<0)*(Transactions!$F:$F<>"Transfer")*(Transactions!$J:$J<>TRUE)*N(Transactions!$C:$C))`;
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('MX', 'A2:A2'), values: [['2026-06']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('MX', 'B2:C2'), values: [[inflow, outflow]] }], 'USER_ENTERED');
+
+  const got = await client!.getValuesRendered(SHEET_ID, q('MX', 'B2:C2'), 'UNFORMATTED_VALUE');
+  const n = (v: unknown) => Number(v ?? 0);
+  const res = { in: n(got[0]?.[0]), out: n(got[0]?.[1]) };
+  console.log('[column-exclude]', res, res.in === 100 && res.out === 40 ? '✅ PASS' : '❌ FAIL (expected in100/out40)');
+}
+
+if (wants('column-exclude')) await runColumnExclude();
 console.log('\nDone.');

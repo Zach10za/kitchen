@@ -207,6 +207,17 @@ export const FINANCE_SPEC: BotSpec = {
         }
       },
     },
+    {
+      // Mirror of the Transactions "Exclude" checkbox column: 1 when the user has
+      // checked a row out of cash flow (kept separate from Category so the row
+      // keeps its real category). The bot only reads the column; never writes it.
+      version: 8,
+      up: (sql) => {
+        // Named is_excluded (not "excluded") to avoid colliding with SQLite's
+        // EXCLUDED upsert keyword.
+        sql.exec('ALTER TABLE sheet_rows ADD COLUMN is_excluded INTEGER NOT NULL DEFAULT 0');
+      },
+    },
   ],
 };
 

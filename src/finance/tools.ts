@@ -175,7 +175,7 @@ export const FINANCE_TOOLS = [
     type: 'function' as const,
     function: {
       name: 'cash_flow',
-      description: 'Monthly inflows vs outflows. Excludes transactions categorized "Transfer" (inter-account moves, auto-tagged) or "Exclude" (manual escape hatch for one-offs like a big bonus that aren\'t transfers but skew the view). Mirrors the live Cash Flow tab + chart in the sheet. Use for "what\'s my monthly cash flow", "income vs spending by month", "am I cash-flow positive". To drop a row, tell the user to categorize it "Exclude" (or set a rule).',
+      description: 'Monthly inflows vs outflows. Excludes inter-account transfers (Category "Transfer", auto-tagged) and any row the user checked the "Exclude" box on (the Transactions tab Exclude column — a manual escape hatch for one-offs like a big bonus that aren\'t transfers but skew the view; the row keeps its real category). Mirrors the live Cash Flow tab + chart. Use for "what\'s my monthly cash flow", "income vs spending by month", "am I cash-flow positive". To drop a row, tell the user to check its Exclude box.',
       parameters: {
         type: 'object',
         properties: {

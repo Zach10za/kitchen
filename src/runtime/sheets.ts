@@ -294,6 +294,18 @@ export class SheetsClient {
     return data.values ?? [];
   }
 
+  /** Render a whole column (below the header) as checkboxes (boolean validation). */
+  async setCheckbox(spreadsheetId: string, sheetId: number, col: number): Promise<void> {
+    await this.batchUpdate(spreadsheetId, [
+      {
+        setDataValidation: {
+          range: { sheetId, startRowIndex: 1, startColumnIndex: col, endColumnIndex: col + 1 },
+          rule: { condition: { type: 'BOOLEAN' }, showCustomUi: true },
+        },
+      },
+    ]);
+  }
+
   /** Count charts on a tab (used to add a chart only once). */
   async countCharts(spreadsheetId: string, sheetId: number): Promise<number> {
     const data = await this.api<{
