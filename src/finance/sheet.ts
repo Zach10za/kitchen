@@ -90,9 +90,9 @@ const BAL_COL = { date: 0, account: 1, type: 2, balance: 3, id: 4 } as const;
 const NW_HEADER = ['Date', 'Assets', 'Liabilities', 'Net Worth'];
 
 const CF_TAB = 'Cash Flow';
-const CF_HEADER = ['Date', 'Inflows', 'Outflows', 'Net'];
-/** Rolling window (days) the Cash Flow tab + chart shows. */
-const CF_WINDOW_DAYS = 90;
+const CF_HEADER = ['Month', 'Inflows', 'Outflows', 'Net'];
+/** How many recent months the Cash Flow tab + chart shows. */
+const CF_MONTHS = 24;
 
 /** Column letters (1-based A=1) for building A1 cell refs inside formulas. */
 const COL_LETTER = (idx0: number) => String.fromCharCode(65 + idx0);
@@ -715,18 +715,33 @@ async function captureNetWorthRow(
 
 // ─── Cash Flow tab (daily inflows/outflows via live formulas) ────────────────
 
+// Monthly inflow/outflow via SUMPRODUCT keyed on the YYYY-MM month label in the
+// row's own A cell (LEFT(date,7) prefix match). N() coerces the header/blank
+// text cells to 0 so the full-column refs don't #VALUE. SUMIFS date-RANGE does
+// NOT work here — it returns 0 against the text dates the bot writes (verified).
 const cfInflowFormula = (row: number) =>
-  `=SUMIFS(Transactions!$C:$C, Transactions!$A:$A, $A${row}, Transactions!$C:$C, ">0", Transactions!$F:$F, "<>${TRANSFER_CATEGORY}")`;
+  `=SUMPRODUCT((LEFT(Transactions!$A:$A,7)=$A${row})*(N(Transactions!$C:$C)>0)*(Transactions!$F:$F<>"${TRANSFER_CATEGORY}")*N(Transactions!$C:$C))`;
 const cfOutflowFormula = (row: number) =>
-  `=-SUMIFS(Transactions!$C:$C, Transactions!$A:$A, $A${row}, Transactions!$C:$C, "<0", Transactions!$F:$F, "<>${TRANSFER_CATEGORY}")`;
+  `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)=$A${row})*(N(Transactions!$C:$C)<0)*(Transactions!$F:$F<>"${TRANSFER_CATEGORY}")*N(Transactions!$C:$C))`;
+
+/** Recent YYYY-MM labels, oldest→newest, in the given timezone. */
+function recentMonths(count: number, timezone: string): string[] {
+  const todayYm = new Date().toLocaleDateString('en-CA', { timeZone: timezone }).slice(0, 7);
+  let [y, m] = todayYm.split('-').map(Number) as [number, number];
+  const months: string[] = [];
+  for (let i = 0; i < count; i++) {
+    months.unshift(`${y}-${String(m).padStart(2, '0')}`);
+    m--;
+    if (m === 0) { m = 12; y--; }
+  }
+  return months;
+}
 
 /**
- * The Cash Flow tab is **live formulas**, not bot-computed values: a rolling
- * window of dates with SUMIFS that sum the Transactions tab and exclude
- * Category = "Transfer". So categorizing a row updates the numbers instantly,
- * no sync. The bot just maintains the date scaffold (so the window rolls) and
- * the formulas. Dates are written as TEXT to match the Transactions tab's text
- * dates (SUMIFS matches them — verified against a live sheet).
+ * The Cash Flow tab is **live formulas**, not bot-computed values: a column of
+ * recent months with SUMPRODUCTs that sum the Transactions tab by month and
+ * exclude Category = "Transfer". So categorizing a row updates the numbers
+ * instantly, no sync. The bot only maintains the month scaffold + formulas.
  */
 async function reconcileCashFlow(
   client: SheetsClient,
@@ -741,19 +756,20 @@ async function reconcileCashFlow(
     await client.batchUpdate(sheetId, [cashFlowChartRequest(tabId)]);
   }
 
-  const dates: string[] = [];
-  for (let i = CF_WINDOW_DAYS - 1; i >= 0; i--) {
-    dates.push(new Date(Date.now() - i * 86_400_000).toLocaleDateString('en-CA', { timeZone: env.TIMEZONE }));
-  }
-  const lastRow = dates.length + 1;
+  const months = recentMonths(CF_MONTHS, env.TIMEZONE);
+  const lastRow = months.length + 1;
 
   try {
-    await client.batchUpdateValues(sheetId, [{ range: a1(CF_TAB, `A2:A${lastRow}`), values: dates.map((d) => [d]) }]); // RAW text
+    // Header + clear any prior data (handles the daily→monthly transition: the
+    // earlier daily version wrote a "Date" header and up to 90 day-rows).
+    await client.batchUpdateValues(sheetId, [{ range: a1(CF_TAB, 'A1:D1'), values: [CF_HEADER] }]);
+    await client.clearValues(sheetId, a1(CF_TAB, 'A2:D'));
+    await client.batchUpdateValues(sheetId, [{ range: a1(CF_TAB, `A2:A${lastRow}`), values: months.map((m) => [m]) }]); // RAW text
     await client.batchUpdateValues(
       sheetId,
       [{
         range: a1(CF_TAB, `B2:D${lastRow}`),
-        values: dates.map((_, i) => [cfInflowFormula(i + 2), cfOutflowFormula(i + 2), `=B${i + 2}-C${i + 2}`]),
+        values: months.map((_, i) => [cfInflowFormula(i + 2), cfOutflowFormula(i + 2), `=B${i + 2}-C${i + 2}`]),
       }],
       'USER_ENTERED',
     );
@@ -923,7 +939,7 @@ function cashFlowChartRequest(tabId: number): unknown {
     addChart: {
       chart: {
         spec: {
-          title: 'Daily Inflows vs Outflows',
+          title: 'Monthly Inflows vs Outflows',
           basicChart: {
             chartType: 'COLUMN',
             legendPosition: 'BOTTOM_LEGEND',
