@@ -261,4 +261,47 @@ async function runSpendMatrix(): Promise<void> {
 }
 
 if (wants('spend-matrix')) await runSpendMatrix();
+
+// ─── Mappings-tab model: Merchant/Category are XLOOKUP formulas; analysis reads
+// the formula-driven category column. Validates the whole raw→clean→category→
+// analysis chain. ───────────────────────────────────────────────────────────
+async function runMappings(): Promise<void> {
+  await ensureTab('Transactions');
+  await ensureTab('Mappings');
+  await ensureTab('MAP');
+  await client!.clearValues(SHEET_ID, q('Transactions', 'A1:J1000'));
+  await client!.clearValues(SHEET_ID, q('Mappings', 'A1:E1000'));
+  await client!.clearValues(SHEET_ID, q('MAP', 'A1:F1000'));
+
+  // Mappings: A=Raw, B=Clean (merchant map) ; D=Merchant, E=Category (cat map).
+  await client!.batchUpdateValues(SHEET_ID, [
+    { range: q('Mappings', 'A1:B4'), values: [['Raw Merchant', 'Clean Name'], ['SQ *BLUE BOTTLE', 'Blue Bottle'], ['AMZN MKTP', 'Amazon'], ['ONLINE XFER', 'Transfer Out']] },
+    { range: q('Mappings', 'D1:E4'), values: [['Merchant', 'Category'], ['Blue Bottle', 'Dining'], ['Amazon', 'Shopping'], ['Transfer Out', 'Transfer']] },
+  ]);
+
+  // Transactions: A date, C amount, D raw, E Merchant(formula), F Category(formula), J exclude.
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'A1:J1'), values: [['Date', 'Account', 'Amount', 'Raw Description', 'Merchant', 'Category', 'Notes', 'tx_id', 'account_id', 'Exclude']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'A2:A4'), values: [['2026-06-01'], ['2026-06-02'], ['2026-06-03']] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'C2:C4'), values: [[-10], [-50], [-1000]] }]);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'D2:D4'), values: [['SQ *BLUE BOTTLE'], ['AMZN MKTP'], ['ONLINE XFER']] }]);
+  const merchF = (r: number) => `=IFERROR(XLOOKUP($D${r},Mappings!$A:$A,Mappings!$B:$B),$D${r})`;
+  const catF = (r: number) => `=IFERROR(XLOOKUP($E${r},Mappings!$D:$D,Mappings!$E:$E),"")`;
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'E2:F4'), values: [[merchF(2), catF(2)], [merchF(3), catF(3)], [merchF(4), catF(4)]] }], 'USER_ENTERED');
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', 'J2:J4'), values: [['FALSE'], ['FALSE'], ['FALSE']] }], 'USER_ENTERED');
+
+  // Read back the computed Merchant/Category, then run analysis off column F.
+  const me = await client!.getValuesRendered(SHEET_ID, q('Transactions', 'E2:F4'), 'UNFORMATTED_VALUE');
+  const cfOut = `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)="2026-06")*(N(Transactions!$C:$C)<0)*(Transactions!$F:$F<>"Transfer")*(Transactions!$J:$J<>TRUE)*N(Transactions!$C:$C))`;
+  const dining = `=-SUMPRODUCT((LEFT(Transactions!$A:$A,7)="2026-06")*(Transactions!$F:$F="Dining")*(N(Transactions!$C:$C)<0)*(Transactions!$J:$J<>TRUE)*N(Transactions!$C:$C))`;
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('MAP', 'A1:B1'), values: [[cfOut, dining]] }], 'USER_ENTERED');
+  const got = await client!.getValuesRendered(SHEET_ID, q('MAP', 'A1:B1'), 'UNFORMATTED_VALUE');
+
+  const merchantsOk = me[0]?.[0] === 'Blue Bottle' && me[1]?.[0] === 'Amazon' && me[2]?.[0] === 'Transfer Out';
+  const catsOk = me[0]?.[1] === 'Dining' && me[1]?.[1] === 'Shopping' && me[2]?.[1] === 'Transfer';
+  const analysisOk = Number(got[0]?.[0] ?? 0) === 60 && Number(got[0]?.[1] ?? 0) === 10; // cash-flow out 60 (transfer excluded), Dining 10
+  console.log('[mappings] merchants', merchantsOk ? '✅' : '❌', '| categories', catsOk ? '✅' : '❌', '| analysis-off-formula-column', analysisOk ? '✅' : '❌',
+    { merchants: me, cfOut: got[0]?.[0], dining: got[0]?.[1] });
+}
+
+if (wants('mappings')) await runMappings();
 console.log('\nDone.');

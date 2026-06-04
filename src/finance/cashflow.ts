@@ -1,70 +1,19 @@
 /**
- * Cash-flow support: detecting inter-account transfers (to auto-tag them) and a
- * monthly inflow/outflow series for the chat tool.
+ * Cash-flow support: a monthly inflow/outflow series for the chat tool.
  *
  * Design (decided with the operator): ALL accounts' transactions live in the
  * sheet, and the monthly cash-flow table/chart is computed by sheet **formulas**
  * (a SUMPRODUCT bucketed by month) that exclude two things: inter-account
  * transfers (Category = "Transfer") and any row the user checked the **Exclude**
  * box on (a separate column, so the row keeps its real category — e.g. a one-off
- * bonus). The bot's only cash-flow job is to *propose* the "Transfer" category on
- * detected paired flows; the user owns the Exclude box and the formulas do the
- * math (live, no sync).
- *
- * `detectTransferIds` is the auto-tagger's engine; `monthlyCashFlow` mirrors the
- * sheet formula for chat answers (all accounts, minus Category = "Transfer").
+ * bonus). Transfers are tagged by category, not paired-flow detection: the LLM
+ * classifies each merchant in the Mappings tab (Transfer included) and the user
+ * curates it. `monthlyCashFlow` mirrors the sheet formula for chat answers (all
+ * accounts, minus Category = "Transfer" and minus Exclude-checked rows).
  */
 
-/** Category value the bot writes for detected transfers and the formulas exclude. */
+/** Category value that marks a transfer and the cash-flow formulas exclude. */
 export const TRANSFER_CATEGORY = 'Transfer';
-
-/** How far apart the two legs of a transfer can post and still pair. */
-const PAIR_WINDOW_SEC = 4 * 86_400;
-
-interface PairTx {
-  id: string;
-  account_id: string;
-  posted: number;
-  amount: number;
-}
-
-/**
- * Greedy paired-flow detection: match each debit to an unused credit of the same
- * absolute amount (to the cent) on a DIFFERENT account within the window, and
- * mark both transaction ids as transfers. Runs over every account's
- * transactions, so a checking→savings move pairs even though savings isn't a
- * spending account.
- */
-export function detectTransferIds(rows: readonly PairTx[]): Set<string> {
-  const creditsByCents = new Map<number, PairTx[]>();
-  for (const r of rows) {
-    if (r.amount > 0) {
-      const cents = Math.round(r.amount * 100);
-      const list = creditsByCents.get(cents);
-      if (list) list.push(r);
-      else creditsByCents.set(cents, [r]);
-    }
-  }
-  const used = new Set<string>();
-  const transfers = new Set<string>();
-  for (const debit of rows) {
-    if (debit.amount >= 0) continue;
-    const candidates = creditsByCents.get(Math.round(-debit.amount * 100)) ?? [];
-    let best: PairTx | null = null;
-    for (const c of candidates) {
-      if (used.has(c.id) || c.account_id === debit.account_id) continue;
-      if (Math.abs(c.posted - debit.posted) > PAIR_WINDOW_SEC) continue;
-      if (!best || Math.abs(c.posted - debit.posted) < Math.abs(best.posted - debit.posted)) best = c;
-    }
-    if (best) {
-      used.add(best.id);
-      used.add(debit.id);
-      transfers.add(best.id);
-      transfers.add(debit.id);
-    }
-  }
-  return transfers;
-}
 
 export interface MonthlyFlow {
   /** YYYY-MM. */

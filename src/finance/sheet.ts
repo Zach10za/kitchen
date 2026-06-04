@@ -34,9 +34,8 @@
 
 import type { Env } from '../env';
 import { SheetsClient, type ValueRange } from '../runtime/sheets';
-import { loadRules, applyRules, upsertRule, type Enrichment } from './rules';
-import { detectTransferIds, TRANSFER_CATEGORY } from './cashflow';
-import { CATEGORY_TAXONOMY } from './categorize';
+import { TRANSFER_CATEGORY } from './cashflow';
+import { CATEGORY_TAXONOMY, CLASSIFY_TAXONOMY, classifyMerchants } from './categorize';
 import {
   loadAccountMeta,
   setAccountType,
@@ -77,9 +76,22 @@ async function applyFormatting(
   }
 }
 
-const TX_RANGE = a1(TX_TAB, 'A2:J');
-const TX_HEADER = ['Date', 'Account', 'Amount', 'Raw Description', 'Merchant', 'Category', 'Notes', 'tx_id', 'account_id', 'Exclude'];
-const TX_COL = { date: 0, account: 1, amount: 2, desc: 3, merchant: 4, category: 5, notes: 6, txId: 7, acctId: 8, exclude: 9 } as const;
+const MAP_TAB = 'Mappings';
+// A: the bot's merchant grouping key (normalized). B: the user's clean name.
+// D: clean merchant. E: its category. C is a spacer between the two tables.
+const MAP_HEADER = ['Merchant (raw)', 'Clean Name', '', 'Merchant', 'Category'];
+const MAP_CAT_COL = 4; // column E (Category) on the Mappings tab
+/** Merchant (E) resolves the row's normalized key (col K) → Clean Name via the
+ *  merchant map; Category (F) resolves the Clean Name (col E) → category. Both
+ *  are live, so editing the Mappings tab updates every matching transaction. */
+const merchantRef = (row: number) => `=IFERROR(XLOOKUP($K${row},${MAP_TAB}!$A:$A,${MAP_TAB}!$B:$B),$K${row})`;
+const categoryRef = (row: number) => `=IFERROR(XLOOKUP($E${row},${MAP_TAB}!$D:$D,${MAP_TAB}!$E:$E),"")`;
+
+const TX_RANGE = a1(TX_TAB, 'A2:K');
+const TX_HEADER = ['Date', 'Account', 'Amount', 'Raw Description', 'Merchant', 'Category', 'Notes', 'tx_id', 'account_id', 'Exclude', 'merchant_key'];
+const TX_COL = { date: 0, account: 1, amount: 2, desc: 3, merchant: 4, category: 5, notes: 6, txId: 7, acctId: 8, exclude: 9, mkey: 10 } as const;
+/** Hidden bot-owned columns: tx_id, account_id, merchant_key. */
+const TX_HIDDEN = [TX_COL.txId, TX_COL.acctId, TX_COL.mkey];
 /** Column letter of the user-checkable Exclude column (J), for formulas. */
 const TX_EXCLUDE_COL = 'J';
 
@@ -137,15 +149,6 @@ interface TxForSheet {
   description: string;
   normalized_payee: string;
   account_id: string;
-  [key: string]: SqlStorageValue;
-}
-
-interface MirrorRow {
-  tx_id: string;
-  bot_merchant: string;
-  bot_category: string;
-  locked_merchant: number;
-  locked_category: number;
   [key: string]: SqlStorageValue;
 }
 
@@ -235,7 +238,7 @@ async function runReconcile(env: Env, sql: SqlStorage): Promise<ReconcileResult>
   if (!client || !sheetId) return result;
   result.configured = true;
 
-  for (const section of [reconcileTransactions, reconcileAccountsTab, reconcileHistory, reconcileCashFlow, reconcileSpendByCategory]) {
+  for (const section of [reconcileMappings, reconcileTransactions, reconcileAccountsTab, reconcileHistory, reconcileCashFlow, reconcileSpendByCategory]) {
     try {
       await section(client, sheetId, env, sql, result);
     } catch (err) {
@@ -243,6 +246,67 @@ async function runReconcile(env: Env, sql: SqlStorage): Promise<ReconcileResult>
     }
   }
   return result;
+}
+
+// ─── Mappings tab (merchant renames + category map; bot seeds, user curates) ──
+
+/**
+ * Maintains the Mappings tab — the single editable source of truth for cleaned
+ * merchant names and categories. Two side-by-side tables:
+ *   A: Merchant (raw)  B: Clean Name        — one row per distinct merchant key
+ *   D: Merchant        E: Category          — one row per distinct clean name
+ *
+ * The bot SEEDS rows (clean = bot's normalized name; category = LLM-classified,
+ * incl. "Transfer") and PRESERVES the user's edits — it reads the existing
+ * values first, then rewrites the full lists, so a clean name/category the user
+ * typed is kept. The Transactions tab resolves both maps with live XLOOKUP
+ * formulas, so editing one cell here updates every matching transaction.
+ */
+async function reconcileMappings(
+  client: SheetsClient,
+  sheetId: string,
+  env: Env,
+  sql: SqlStorage,
+  result: ReconcileResult,
+): Promise<void> {
+  const { tabId } = await ensureTab(client, sheetId, MAP_TAB, MAP_HEADER, []);
+
+  // Merchant map: one row per distinct merchant key (normalized_payee). Preserve
+  // existing clean names; seed new keys with the bot's normalized guess.
+  const existingClean = await readMap(client, sheetId, a1(MAP_TAB, 'A2:B'));
+  const keys = sql
+    .exec<{ k: string }>("SELECT DISTINCT normalized_payee AS k FROM transactions WHERE TRIM(normalized_payee) <> '' ORDER BY normalized_payee")
+    .toArray()
+    .map((r) => r.k);
+  const merchantRows = keys.map((k) => [k, existingClean.get(k) || k]);
+  const cleanNames = [...new Set(merchantRows.map((r) => (r[1] as string).trim()).filter(Boolean))];
+
+  // Category map: one row per distinct clean name. Preserve existing categories;
+  // classify the new ones (LLM, "Transfer" included).
+  const existingCat = await readMap(client, sheetId, a1(MAP_TAB, 'D2:E'));
+  const newCleans = cleanNames.filter((c) => !existingCat.has(c));
+  let classified = new Map<string, string>();
+  if (newCleans.length > 0) {
+    try {
+      classified = await classifyMerchants(env, newCleans);
+    } catch (err) {
+      result.errors.push(`classify: ${(err as Error).message}`);
+    }
+  }
+  const catRows = cleanNames.map((c) => [c, existingCat.get(c) || classified.get(c) || 'Other']);
+
+  try {
+    await client.batchUpdateValues(sheetId, [{ range: a1(MAP_TAB, 'A1:E1'), values: [MAP_HEADER] }]);
+    await client.clearValues(sheetId, a1(MAP_TAB, 'A2:E'));
+    if (merchantRows.length > 0) await client.batchUpdateValues(sheetId, [{ range: a1(MAP_TAB, `A2:B${merchantRows.length + 1}`), values: merchantRows }]);
+    if (catRows.length > 0) await client.batchUpdateValues(sheetId, [{ range: a1(MAP_TAB, `D2:E${catRows.length + 1}`), values: catRows }]);
+  } catch (err) {
+    result.errors.push(`mappings: ${(err as Error).message}`);
+  }
+
+  await applyFormatting(result, 'map-cat-dropdown', () =>
+    client.setListValidation(sheetId, tabId, MAP_CAT_COL, [...CLASSIFY_TAXONOMY], false),
+  );
 }
 
 // ─── Transactions tab ──────────────────────────────────────────────────────
@@ -254,35 +318,34 @@ async function reconcileTransactions(
   sql: SqlStorage,
   result: ReconcileResult,
 ): Promise<void> {
-  const { tabId, created } = await ensureTab(client, sheetId, TX_TAB, TX_HEADER, [TX_COL.txId, TX_COL.acctId]);
+  const { tabId, created } = await ensureTab(client, sheetId, TX_TAB, TX_HEADER, TX_HIDDEN);
   if (created) {
-    // A basic filter gives instant per-column sort/filter UI — the main lever
-    // for diagnosing spend (filter to a category, sort by amount).
     await client.batchUpdate(sheetId, [
       { setBasicFilter: { filter: { range: { sheetId: tabId, startRowIndex: 0, startColumnIndex: 0, endColumnIndex: TX_HEADER.length } } } },
     ]);
   }
-  // Repair the header/hidden columns on tabs created before account_id existed.
-  await ensureLayout(client, sheetId, tabId, TX_TAB, TX_HEADER, [TX_COL.txId, TX_COL.acctId], result);
+  await ensureLayout(client, sheetId, tabId, TX_TAB, TX_HEADER, TX_HIDDEN, result);
+
+  // Maps drive Merchant (merchant_key→clean) and Category (clean→category). The
+  // sheet resolves them with live XLOOKUP formulas; the bot reads them here only
+  // to compute the SQLite category mirror the chat tools use.
+  const cleanByKey = await readMap(client, sheetId, a1(MAP_TAB, 'A2:B'));
+  const categoryByClean = await readMap(client, sheetId, a1(MAP_TAB, 'D2:E'));
 
   const sheetRows = await client.getValues(sheetId, TX_RANGE);
-  const sheetByTx = new Map<string, { rowIndex: number; merchant: string; category: string; notes: string; acctId: string; excluded: number }>();
+  const sheetByTx = new Map<string, { rowIndex: number; acctId: string; excluded: number; mkey: string }>();
   sheetRows.forEach((r, i) => {
     const txId = r[TX_COL.txId];
     if (txId) {
       sheetByTx.set(txId, {
         rowIndex: i + 2,
-        merchant: r[TX_COL.merchant] ?? '',
-        category: r[TX_COL.category] ?? '',
-        notes: r[TX_COL.notes] ?? '',
         acctId: r[TX_COL.acctId] ?? '',
         excluded: (r[TX_COL.exclude] ?? '').toString().toUpperCase() === 'TRUE' ? 1 : 0,
+        mkey: r[TX_COL.mkey] ?? '',
       });
     }
   });
 
-  // ALL accounts' transactions go in the sheet now (the analysis is done by
-  // sheet formulas that exclude Category = "Transfer").
   const txs = sql
     .exec<TxForSheet>(
       `SELECT t.id, t.posted, t.amount, t.description, t.normalized_payee, t.account_id
@@ -291,117 +354,45 @@ async function reconcileTransactions(
     )
     .toArray();
   const allTxIds = new Set(txs.map((t) => t.id));
-  // Detect inter-account transfers (paired equal/opposite flows across accounts)
-  // so we can PROPOSE the "Transfer" category — the user can override any.
-  const transferIds = detectTransferIds(txs);
 
-  const mirror = new Map<string, MirrorRow>();
-  for (const m of sql.exec<MirrorRow>('SELECT * FROM sheet_rows').toArray()) mirror.set(m.tx_id, m);
-  const rules = loadRules(sql);
-
-  const cellUpdates: ValueRange[] = [];      // RAW: E:F merges (gates the mirror advance)
-  const formulaWrites: ValueRange[] = [];    // USER_ENTERED: Account formula (col B)
-  const idWrites: ValueRange[] = [];         // RAW: account_id (col I) — written LAST (commit marker)
-  const updateMirror: MirrorWrite[] = [];    // applied only if the cell-update write lands
+  const cellUpdates: ValueRange[] = [];   // RAW: account_id (I) + merchant_key (K) — written last
+  const formulaWrites: ValueRange[] = []; // USER_ENTERED: Account (B) + Merchant (E) + Category (F)
   const appendValues: (string | number | null)[][] = [];
   const appendTxIds: string[] = [];
   const appendTxAccountIds: string[] = [];
-  const appendMirror: MirrorWrite[] = [];    // applied only if the append lands
-  const harvestMerchant = new Map<string, string>();
-  const harvestCategory = new Map<string, string>();
 
   for (const tx of txs) {
-    const proposed: Enrichment = applyRules(rules, tx);
-    // A detected paired flow is a transfer regardless of the merchant's
-    // auto-category, so "Transfer" overrides the rule's category. (The user's
-    // manual edit still wins — it's preserved by the merge below.)
-    if (transferIds.has(tx.id)) proposed.category = TRANSFER_CATEGORY;
+    // Mirror the sheet's formula result into SQLite for the chat tools.
+    const clean = cleanByKey.get(tx.normalized_payee) || tx.normalized_payee;
+    const category = categoryByClean.get(clean) ?? '';
     const existing = sheetByTx.get(tx.id);
 
     if (!existing) {
-      // Account (col B) and account_id (col I) are filled after append (need the
-      // row #). account_id is written LAST as a commit marker, so a failed
-      // formula write leaves account_id blank and the next reconcile retries —
-      // rather than stranding a row with an id but no name formula.
-      appendValues.push([
-        isoDate(tx.posted), '', tx.amount, tx.description,
-        proposed.merchant, proposed.category, '', tx.id, '',
-      ]);
+      // B/E/F are formulas filled after append; account_id (I) written last as a
+      // commit marker. merchant_key (K) carries the grouping key for the Merchant formula.
+      appendValues.push([isoDate(tx.posted), '', tx.amount, tx.description, '', '', '', tx.id, '', '', tx.normalized_payee]);
       appendTxIds.push(tx.id);
       appendTxAccountIds.push(tx.account_id);
-      appendMirror.push({
-        tx_id: tx.id, merchant: proposed.merchant, category: proposed.category,
-        bot_merchant: proposed.merchant, bot_category: proposed.category,
-        locked_merchant: 0, locked_category: 0, notes: '', excluded: 0,
-      });
+      upsertMirror(sql, mirrorRow(tx.id, category, 0));
       continue;
     }
-
-    const base = mirror.get(tx.id);
-    const baseMerchant = base?.bot_merchant ?? '';
-    const baseCategory = base?.bot_category ?? '';
-    const mMerge = mergeField(existing.merchant, baseMerchant, proposed.merchant);
-    const cMerge = mergeField(existing.category, baseCategory, proposed.category);
-
-    if (mMerge.harvest != null) { harvestMerchant.set(tx.normalized_payee, mMerge.harvest); result.humanEdits++; }
-    if (cMerge.harvest != null) { harvestCategory.set(tx.normalized_payee, cMerge.harvest); result.humanEdits++; }
-
-    if (mMerge.botWrote || cMerge.botWrote) {
-      cellUpdates.push({
-        range: a1(TX_TAB, `E${existing.rowIndex}:F${existing.rowIndex}`),
-        values: [[mMerge.value, cMerge.value]],
-      });
-    }
-
-    // Backfill the Account formula + account_id key on rows that predate the
-    // id-reference layout (empty/mismatched account_id). Formula first, id last
-    // (commit marker) so a partial failure self-heals next run.
+    upsertMirror(sql, mirrorRow(tx.id, category, existing.excluded));
     if (existing.acctId !== tx.account_id) {
-      formulaWrites.push({ range: a1(TX_TAB, `B${existing.rowIndex}:B${existing.rowIndex}`), values: [[accountNameRef(`$I${existing.rowIndex}`)]] });
-      idWrites.push({ range: a1(TX_TAB, `I${existing.rowIndex}:I${existing.rowIndex}`), values: [[tx.account_id]] });
+      cellUpdates.push({ range: a1(TX_TAB, `I${existing.rowIndex}:I${existing.rowIndex}`), values: [[tx.account_id]] });
     }
-
-    updateMirror.push({
-      tx_id: tx.id, merchant: mMerge.value, category: cMerge.value,
-      bot_merchant: mMerge.botWrote ? mMerge.value : baseMerchant,
-      bot_category: cMerge.botWrote ? cMerge.value : baseCategory,
-      locked_merchant: mMerge.locked ? 1 : 0, locked_category: cMerge.locked ? 1 : 0,
-      notes: existing.notes, excluded: existing.excluded,
-    });
+    if (existing.mkey !== tx.normalized_payee) {
+      cellUpdates.push({ range: a1(TX_TAB, `K${existing.rowIndex}:K${existing.rowIndex}`), values: [[tx.normalized_payee]] });
+    }
+    // Account/Merchant/Category formulas (idempotent — written for every row).
+    formulaWrites.push({ range: a1(TX_TAB, `B${existing.rowIndex}:B${existing.rowIndex}`), values: [[accountNameRef(`$I${existing.rowIndex}`)]] });
+    formulaWrites.push({ range: a1(TX_TAB, `E${existing.rowIndex}:F${existing.rowIndex}`), values: [[merchantRef(existing.rowIndex), categoryRef(existing.rowIndex)]] });
   }
 
-  // Rows whose transaction no longer exists in the ledger (e.g. a pending tx
-  // SimpleFin dropped) — delete them from the sheet.
   const orphanRows: number[] = [];
   const orphanTxIds: string[] = [];
   for (const [txId, row] of sheetByTx) {
     if (!allTxIds.has(txId)) { orphanRows.push(row.rowIndex); orphanTxIds.push(txId); }
   }
-
-  // Harvest edits into rules. Harvesting reflects what's ALREADY in the sheet
-  // (a read), so it's safe regardless of whether the writes below succeed.
-  for (const [payee, merchant] of harvestMerchant) {
-    upsertRule(sql, { match_type: 'merchant', pattern: payee, merchant, source: 'manual' });
-    result.rulesHarvested++;
-  }
-  for (const [payee, category] of harvestCategory) {
-    upsertRule(sql, { match_type: 'merchant', pattern: payee, category, source: 'manual' });
-    if (!harvestMerchant.has(payee)) result.rulesHarvested++;
-  }
-
-  // Writes: sheet first, mirror second. Each write is independent so one failure
-  // doesn't strand the others, and the mirror advances only for writes that land.
-  let updatesLanded = true;
-  if (cellUpdates.length > 0) {
-    try {
-      await client.batchUpdateValues(sheetId, cellUpdates);
-      result.updated += cellUpdates.length;
-    } catch (err) {
-      result.errors.push(`tx-updates: ${(err as Error).message}`);
-      updatesLanded = false;
-    }
-  }
-  if (updatesLanded) for (const m of updateMirror) upsertMirror(sql, m);
 
   if (orphanRows.length > 0) {
     try {
@@ -417,14 +408,14 @@ async function reconcileTransactions(
     try {
       const { firstRow } = await client.appendRows(sheetId, TX_RANGE, appendValues);
       result.appended += appendValues.length;
-      for (const m of appendMirror) upsertMirror(sql, m);
       if (firstRow != null) {
         appendTxIds.forEach((txId, i) => {
           const row = firstRow + i;
           recordRowIndex(sql, txId, row);
-          // Account (col B) formula references the row's hidden account_id (col I).
           formulaWrites.push({ range: a1(TX_TAB, `B${row}:B${row}`), values: [[accountNameRef(`$I${row}`)]] });
-          idWrites.push({ range: a1(TX_TAB, `I${row}:I${row}`), values: [[appendTxAccountIds[i]!]] });
+          formulaWrites.push({ range: a1(TX_TAB, `E${row}:F${row}`), values: [[merchantRef(row), categoryRef(row)]] });
+          // account_id written via cellUpdates (RAW) below, after the formulas.
+          cellUpdates.push({ range: a1(TX_TAB, `I${row}:I${row}`), values: [[appendTxAccountIds[i]!]] });
         });
       }
     } catch (err) {
@@ -432,44 +423,42 @@ async function reconcileTransactions(
     }
   }
 
-  // Account-name formulas (col B) first, THEN account_id (col I) as the commit
-  // marker — both USER_ENTERED/RAW respectively. Live links to the Accounts tab,
-  // so a nickname/rename shows here automatically.
+  // Formulas first (Account/Merchant/Category live links), THEN account_id (RAW)
+  // as the commit marker so a partial failure re-runs next reconcile.
   if (formulaWrites.length > 0) {
     try {
       await client.batchUpdateValues(sheetId, formulaWrites, 'USER_ENTERED');
-      if (idWrites.length > 0) await client.batchUpdateValues(sheetId, idWrites); // RAW, after formulas
+      if (cellUpdates.length > 0) await client.batchUpdateValues(sheetId, cellUpdates); // RAW account_id
     } catch (err) {
-      result.errors.push(`tx-account-formulas: ${(err as Error).message}`);
+      result.errors.push(`tx-formulas: ${(err as Error).message}`);
     }
   }
 
-  // Apply column formats + the Category dropdown to the data rows AFTER the
-  // writes. Appended rows inherit format/validation from the row above (the
-  // header, on a fresh tab), so applying these only on creation never reaches
-  // the data — re-applying here, once rows exist, is what makes them stick.
+  // Formats + checkbox on the data rows. Merchant/Category are formulas now
+  // (edited via the Mappings tab), so no Category dropdown on this tab.
   await applyFormatting(result, 'tx-format', () =>
-    client.setColumnFormats(sheetId, tabId, [
-      { col: TX_COL.date, kind: 'date' },
-      { col: TX_COL.amount, kind: 'currency' },
-    ]),
+    client.setColumnFormats(sheetId, tabId, [{ col: TX_COL.date, kind: 'date' }, { col: TX_COL.amount, kind: 'currency' }]),
   );
-  // Dropdown = the standard taxonomy + any custom categories already in use
-  // (non-strict, so the user can still type a new one).
-  const inUse = sql
-    .exec<{ category: string }>(
-      "SELECT DISTINCT TRIM(category) AS category FROM sheet_rows WHERE TRIM(category) <> '' ORDER BY category",
-    )
-    .toArray()
-    .map((r) => r.category);
-  const categories = [...new Set<string>([...CATEGORY_TAXONOMY, TRANSFER_CATEGORY, ...inUse])];
-  await applyFormatting(result, 'tx-category-dropdown', () =>
-    client.setListValidation(sheetId, tabId, TX_COL.category, categories, false),
-  );
-  // Exclude column → checkboxes (check a row to drop it from cash flow).
   await applyFormatting(result, 'tx-exclude-checkbox', () =>
     client.setCheckbox(sheetId, tabId, TX_COL.exclude),
   );
+}
+
+/** Read a 2-column key→value range into a Map (trimmed keys; first wins). */
+async function readMap(client: SheetsClient, sheetId: string, range: string): Promise<Map<string, string>> {
+  const rows = await client.getValues(sheetId, range);
+  const map = new Map<string, string>();
+  for (const r of rows) {
+    const key = (r[0] ?? '').trim();
+    if (key && !map.has(key)) map.set(key, (r[1] ?? '').trim());
+  }
+  return map;
+}
+
+/** Mirror row for SQLite (only category + excluded matter now; merge columns
+ *  are vestigial but kept non-null for the schema). */
+function mirrorRow(txId: string, category: string, excluded: number): MirrorWrite {
+  return { tx_id: txId, merchant: '', category, bot_merchant: '', bot_category: '', locked_merchant: 0, locked_category: 0, notes: '', excluded };
 }
 
 // ─── Accounts tab (classification surface) ───────────────────────────────────

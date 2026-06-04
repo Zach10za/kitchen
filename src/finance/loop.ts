@@ -11,8 +11,6 @@ import { runSync } from './sync';
 import { captureError } from '../error-triage';
 import { reconcileSheet } from './sheet';
 import { monthlyCashFlow } from './cashflow';
-import { autoCategorize } from './categorize';
-import { loadRules, upsertRule, type RuleMatchType, type RuleRow } from './rules';
 import {
   spendingFilter,
   currentBalances,
@@ -46,8 +44,6 @@ export async function executeFinanceTool(name: string, args: any, ctx: FinanceTo
       case 'sync_now':              return await toolSyncNow(ctx);
       case 'get_transactions_raw':  return toolGetTransactionsRaw(args, ctx);
       case 'sync_sheet':            return await toolSyncSheet(ctx);
-      case 'set_rule':              return await toolSetRule(args, ctx);
-      case 'list_rules':            return toolListRules(ctx);
       case 'categorize_all':        return await toolCategorizeAll(ctx);
       case 'category_breakdown':    return toolCategoryBreakdown(args, ctx);
       case 'net_worth':             return toolNetWorth(args, ctx);
@@ -538,62 +534,15 @@ async function toolSyncSheet(ctx: FinanceToolCtx): Promise<string> {
   return parts.filter(Boolean).join(' ');
 }
 
-async function toolSetRule(
-  args: { match_type?: string; pattern?: string; merchant?: string; category?: string },
-  ctx: FinanceToolCtx,
-): Promise<string> {
-  const matchType = args.match_type === 'contains' ? 'contains' : 'merchant';
-  const pattern = (args.pattern ?? '').trim();
-  const merchant = args.merchant?.trim() || null;
-  const category = args.category?.trim() || null;
-  if (!pattern) return 'set_rule needs a non-empty pattern.';
-  if (!merchant && !category) return 'set_rule needs at least one of merchant or category to set.';
-
-  // Match on the normalized (lowercase) merchant name to line up with how the
-  // sync stores normalized_payee and how applyRules compares it.
-  const normalizedPattern = matchType === 'merchant' ? pattern.toLowerCase() : pattern;
-  upsertRule(ctx.sql, {
-    match_type: matchType as RuleMatchType,
-    pattern: normalizedPattern,
-    merchant,
-    category,
-    source: 'chat',
-  });
-
-  // Apply immediately so the user sees it reflected in the sheet right away.
-  const r = await reconcileSheet(ctx.env, ctx.sql);
-  const set = [merchant ? `merchant → "${merchant}"` : null, category ? `category → "${category}"` : null]
-    .filter(Boolean)
-    .join(', ');
-  const applied = r.configured
-    ? ` Applied to the sheet (${r.updated} row${r.updated === 1 ? '' : 's'} updated).`
-    : ' (Sheet not configured, so the rule is stored but not yet reflected anywhere.)';
-  const errNote = r.errors.length > 0 ? ` Note: the sheet sync hit errors: ${r.errors.join('; ')}.` : '';
-  return `Rule saved: ${matchType} "${normalizedPattern}" sets ${set}.${applied}${errNote}`;
-}
-
-function toolListRules(ctx: FinanceToolCtx): string {
-  const rules = loadRules(ctx.sql);
-  if (rules.length === 0) return 'No rules yet. Edit the sheet or use set_rule to create some.';
-  const lines = rules.map((r: RuleRow) => {
-    const sets = [r.merchant ? `merchant="${r.merchant}"` : null, r.category ? `category="${r.category}"` : null]
-      .filter(Boolean)
-      .join(', ');
-    const origin = r.source === 'manual' ? 'learned from sheet edit' : r.source === 'auto' ? 'auto-categorized' : 'set via chat';
-    return `- ${r.match_type} "${r.pattern}" → ${sets} (${origin})`;
-  });
-  return `${rules.length} rule${rules.length === 1 ? '' : 's'}:\n${lines.join('\n')}`;
-}
-
 async function toolCategorizeAll(ctx: FinanceToolCtx): Promise<string> {
-  // Categorize every uncategorized merchant now (the hourly sync does this
-  // incrementally; this is the on-demand "do it all" path).
-  const n = await autoCategorize(ctx.env, ctx.sql, { max: 1000 });
-  if (n === 0) return 'Every merchant already has a category. Nothing to do.';
+  // Categorization now lives in the Mappings tab: reconcileSheet seeds a clean
+  // name + category for every distinct merchant (LLM-classified, "Transfer"
+  // included) and the Transactions tab resolves both with live formulas. This
+  // tool just forces a reconcile so any newly-synced merchants get seeded.
   const r = await reconcileSheet(ctx.env, ctx.sql);
-  const applied = r.configured ? ` Applied to the sheet (${r.updated} row${r.updated === 1 ? '' : 's'} updated).` : '';
+  if (!r.configured) return 'The Google Sheet isn\'t configured, so there\'s nowhere to categorize. Set FINANCE_SHEET_ID and the service account first.';
   const errNote = r.errors.length > 0 ? ` Note: the sheet sync hit errors: ${r.errors.join('; ')}.` : '';
-  return `Categorized ${n} merchant${n === 1 ? '' : 's'}.${applied}${errNote} Transfers stay "Transfer"; you can override any category in the sheet.`;
+  return `Re-seeded the Mappings tab — every merchant now has a clean name and category, applied live across the Transactions tab.${errNote} To change one, edit its row in the Mappings tab (rename the merchant or pick a different category) and it propagates to every matching transaction instantly.`;
 }
 
 function toolCategoryBreakdown(args: { days?: number }, ctx: FinanceToolCtx): string {
