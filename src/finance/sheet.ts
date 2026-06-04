@@ -35,6 +35,7 @@
 import type { Env } from '../env';
 import { SheetsClient, type ValueRange } from '../runtime/sheets';
 import { loadRules, applyRules, upsertRule, type Enrichment } from './rules';
+import { dailyCashFlow } from './cashflow';
 import {
   loadAccountMeta,
   setAccountType,
@@ -88,6 +89,11 @@ const BAL_RANGE = a1(BAL_TAB, 'A2:E');
 const BAL_HEADER = ['Date', 'Account', 'Type', 'Balance', 'account_id'];
 const BAL_COL = { date: 0, account: 1, type: 2, balance: 3, id: 4 } as const;
 const NW_HEADER = ['Date', 'Assets', 'Liabilities', 'Net Worth'];
+
+const CF_TAB = 'Cash Flow';
+const CF_HEADER = ['Date', 'Inflows', 'Outflows', 'Net'];
+/** Rolling window (days) the Cash Flow tab + chart shows. */
+const CF_WINDOW_DAYS = 90;
 
 /** Column letters (1-based A=1) for building A1 cell refs inside formulas. */
 const COL_LETTER = (idx0: number) => String.fromCharCode(65 + idx0);
@@ -219,7 +225,7 @@ async function runReconcile(env: Env, sql: SqlStorage): Promise<ReconcileResult>
   if (!client || !sheetId) return result;
   result.configured = true;
 
-  for (const section of [reconcileTransactions, reconcileAccountsTab, reconcileHistory]) {
+  for (const section of [reconcileTransactions, reconcileAccountsTab, reconcileHistory, reconcileCashFlow]) {
     try {
       await section(client, sheetId, env, sql, result);
     } catch (err) {
@@ -700,6 +706,43 @@ async function captureNetWorthRow(
   }
 }
 
+// ─── Cash Flow tab (daily inflows/outflows, transfers excluded) ──────────────
+
+/**
+ * Fully recomputed each run (cash flow is derived: new transactions arrive,
+ * categories change, transfer pairs complete days later — so a day's value can
+ * change). We clear the data area and rewrite the rolling window, which keeps
+ * the chart (it references whole columns) in sync.
+ */
+async function reconcileCashFlow(
+  client: SheetsClient,
+  sheetId: string,
+  env: Env,
+  sql: SqlStorage,
+  result: ReconcileResult,
+): Promise<void> {
+  const { tabId } = await ensureTab(client, sheetId, CF_TAB, CF_HEADER, []);
+  await ensureLayout(client, sheetId, tabId, CF_TAB, CF_HEADER, [], result);
+  if (await client.countCharts(sheetId, tabId) === 0) {
+    await client.batchUpdate(sheetId, [cashFlowChartRequest(tabId)]);
+  }
+
+  const flow = dailyCashFlow(sql, env.TIMEZONE, CF_WINDOW_DAYS);
+  await client.clearValues(sheetId, a1(CF_TAB, 'A2:D'));
+  if (flow.length > 0) {
+    await client.batchUpdateValues(
+      sheetId,
+      [{ range: a1(CF_TAB, `A2:D${flow.length + 1}`), values: flow.map((f) => [f.date, f.inflow, f.outflow, f.net]) }],
+      'USER_ENTERED',
+    );
+  }
+  await applyFormatting(result, 'cf-format', () =>
+    client.setColumnFormats(sheetId, tabId, [
+      { col: 0, kind: 'date' }, { col: 1, kind: 'currency' }, { col: 2, kind: 'currency' }, { col: 3, kind: 'currency' },
+    ]),
+  );
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Ensure a tab exists with a header row; freeze + bold the header and
@@ -837,6 +880,38 @@ function netWorthChartRequest(tabId: number): unknown {
               { series: colRange(1), targetAxis: 'LEFT_AXIS' }, // Assets
               { series: colRange(2), targetAxis: 'LEFT_AXIS' }, // Liabilities
               { series: colRange(3), targetAxis: 'LEFT_AXIS' }, // Net Worth
+            ],
+          },
+        },
+        position: { overlayPosition: { anchorCell: { sheetId: tabId, rowIndex: 1, columnIndex: 5 } } },
+      },
+    },
+  };
+}
+
+/** A COLUMN chart of daily Inflows vs Outflows for the Cash Flow tab. Open-ended
+ *  source ranges so it grows as the rolling window is rewritten. */
+function cashFlowChartRequest(tabId: number): unknown {
+  const colRange = (col: number) => ({
+    sourceRange: { sources: [{ sheetId: tabId, startRowIndex: 0, startColumnIndex: col, endColumnIndex: col + 1 }] },
+  });
+  return {
+    addChart: {
+      chart: {
+        spec: {
+          title: 'Daily Inflows vs Outflows',
+          basicChart: {
+            chartType: 'COLUMN',
+            legendPosition: 'BOTTOM_LEGEND',
+            headerCount: 1,
+            axis: [
+              { position: 'BOTTOM_AXIS', title: 'Date' },
+              { position: 'LEFT_AXIS', title: 'USD' },
+            ],
+            domains: [{ domain: colRange(0) }],
+            series: [
+              { series: colRange(1), targetAxis: 'LEFT_AXIS' }, // Inflows
+              { series: colRange(2), targetAxis: 'LEFT_AXIS' }, // Outflows
             ],
           },
         },

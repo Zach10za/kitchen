@@ -10,6 +10,7 @@ import { type TransactionRow } from './tools';
 import { runSync } from './sync';
 import { captureError } from '../error-triage';
 import { reconcileSheet } from './sheet';
+import { dailyCashFlow } from './cashflow';
 import { loadRules, upsertRule, type RuleMatchType, type RuleRow } from './rules';
 import {
   spendingFilter,
@@ -48,6 +49,7 @@ export async function executeFinanceTool(name: string, args: any, ctx: FinanceTo
       case 'list_rules':            return toolListRules(ctx);
       case 'category_breakdown':    return toolCategoryBreakdown(args, ctx);
       case 'net_worth':             return toolNetWorth(args, ctx);
+      case 'cash_flow':             return toolCashFlow(args, ctx);
       case 'set_account_type':      return await toolSetAccountType(args, ctx);
       case 'set_nickname':          return await toolSetNickname(args, ctx);
       default:                      return `Unknown finance tool: ${name}`;
@@ -131,6 +133,25 @@ function resolveAccount(
     return { error: `"${query}" matches ${matches.length} accounts: ${matches.map(displayName).join(', ')}. Be more specific.` };
   }
   return { account: matches[0]! };
+}
+
+function toolCashFlow(args: { days?: number }, ctx: FinanceToolCtx): string {
+  const days = Math.max(1, Math.min(365, args.days ?? 30));
+  const flow = dailyCashFlow(ctx.sql, ctx.env.TIMEZONE, days);
+  if (flow.length === 0) return `No cash flow in the last ${days} days.`;
+
+  const totalIn = flow.reduce((s, f) => s + f.inflow, 0);
+  const totalOut = flow.reduce((s, f) => s + f.outflow, 0);
+  // Show the most recent 30 days of detail to keep the reply readable.
+  const lines = flow.slice(-30).map(
+    (f) => `${f.date}: in ${formatMoney(f.inflow)}, out ${formatMoney(f.outflow)}, net ${formatMoneySigned(f.net)}`,
+  );
+  return [
+    `Daily cash flow (last ${days}d, inter-account transfers excluded):`,
+    `Totals — in ${formatMoney(totalIn)}, out ${formatMoney(totalOut)}, net ${formatMoneySigned(totalIn - totalOut)}.`,
+    ...(flow.length > 30 ? [`(showing the last 30 of ${flow.length} active days)`] : []),
+    ...lines,
+  ].join('\n');
 }
 
 async function toolSetAccountType(
