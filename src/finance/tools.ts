@@ -174,6 +174,19 @@ export const FINANCE_TOOLS = [
   {
     type: 'function' as const,
     function: {
+      name: 'cash_flow',
+      description: 'Daily inflows vs outflows over a window, with inter-account transfers excluded (any transaction categorized "Transfer" — the bot auto-tags detected paired flows, and the user can adjust). Mirrors the live Cash Flow tab + chart in the sheet. Use for "what\'s my daily cash flow", "income vs spending by day", "am I cash-flow positive".',
+      parameters: {
+        type: 'object',
+        properties: {
+          days: { type: 'integer', minimum: 1, maximum: 365, description: 'Lookback window. Default 30.' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
       name: 'set_account_type',
       description: 'Set an account\'s type, which controls whether its transactions count as spending and whether its balance is an asset or a liability for net worth. Use when the user says an account is miscategorized ("the Fidelity account is my 401k, not a brokerage", "mark Chase Sapphire as credit"). Types: checking, savings, credit, cash, brokerage, retirement, mortgage, loan, other. Spending types (checking, credit, cash) get transaction-level tracking; the rest are balance-only.',
       parameters: {

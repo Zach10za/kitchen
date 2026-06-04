@@ -1,0 +1,93 @@
+/**
+ * Scratch harness for validating Cash Flow sheet formulas against a real Google
+ * Sheet, before baking them into src/finance/sheet.ts.
+ *
+ * Reads GOOGLE_SERVICE_ACCOUNT_JSON from .dev.vars and writes/reads a throwaway
+ * spreadsheet. Run: `bun run scripts/sheets-test.ts <spreadsheetId>`
+ *
+ * It mirrors the production Transactions layout (Date=A, Amount=C, Category=F)
+ * and tests the daily inflow/outflow SUMIFS — crucially whether SUMIFS matches
+ * dates when they're stored as TEXT (how the bot writes them) vs NATIVE dates.
+ */
+
+import { readFileSync } from 'node:fs';
+import { SheetsClient } from '../src/runtime/sheets';
+
+function loadServiceAccountJson(): string {
+  const env = readFileSync('.dev.vars', 'utf8');
+  for (const line of env.split('\n')) {
+    const i = line.indexOf('=');
+    if (i > 0 && line.slice(0, i).trim() === 'GOOGLE_SERVICE_ACCOUNT_JSON') {
+      return line.slice(i + 1).trim();
+    }
+  }
+  throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON not found in .dev.vars');
+}
+
+const SHEET_ID = process.argv[2] as string;
+if (!SHEET_ID) throw new Error('Usage: bun run scripts/sheets-test.ts <spreadsheetId>');
+
+const client = SheetsClient.fromEnv(loadServiceAccountJson());
+if (!client) throw new Error('Could not build SheetsClient from .dev.vars');
+
+async function ensureTab(title: string): Promise<void> {
+  const tabs = await client!.listTabs(SHEET_ID);
+  if (!tabs.some((t) => t.title === title)) {
+    await client!.batchUpdate(SHEET_ID, [{ addSheet: { properties: { title } } }]);
+  }
+}
+
+const q = (tab: string, range: string) => `'${tab}'!${range}`;
+
+// Sample transactions. Expected (transfers excluded via Category):
+//   2026-06-01: inflow 100, outflow 40   (the -1000 Transfer is dropped)
+//   2026-06-02: inflow 0,   outflow 25   (the +1000 Transfer is dropped)
+const TX_ROWS: (string | number)[][] = [
+  ['2026-06-01', 'Checking', 100, 'paycheck', 'employer', ''],
+  ['2026-06-01', 'Checking', -40, 'dinner', 'restaurant', 'Dining'],
+  ['2026-06-01', 'Checking', -1000, 'to savings', 'transfer', 'Transfer'],
+  ['2026-06-02', 'Checking', -25, 'coffee', 'cafe', ''],
+  ['2026-06-02', 'Savings', 1000, 'from checking', 'transfer', 'Transfer'],
+];
+
+const inflowFormula = (dateCell: string) =>
+  `=SUMIFS(Transactions!$C:$C, Transactions!$A:$A, ${dateCell}, Transactions!$C:$C, ">0", Transactions!$F:$F, "<>Transfer")`;
+const outflowFormula = (dateCell: string) =>
+  `=-SUMIFS(Transactions!$C:$C, Transactions!$A:$A, ${dateCell}, Transactions!$C:$C, "<0", Transactions!$F:$F, "<>Transfer")`;
+
+async function run(label: string, dateInput: 'RAW' | 'USER_ENTERED'): Promise<void> {
+  await ensureTab('Transactions');
+  await ensureTab('CF');
+  await client!.clearValues(SHEET_ID, q('Transactions', 'A1:F1000'));
+  await client!.clearValues(SHEET_ID, q('CF', 'A1:D1000'));
+
+  // Header + rows. Dates written per `dateInput`; amounts as numbers.
+  await client!.batchUpdateValues(
+    SHEET_ID,
+    [{ range: q('Transactions', 'A1:F1'), values: [['Date', 'Account', 'Amount', 'Desc', 'Merchant', 'Category']] }],
+  );
+  // Write dates (col A) with the chosen input option, rest RAW.
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', `A2:A${TX_ROWS.length + 1}`), values: TX_ROWS.map((r) => [r[0] as string]) }], dateInput);
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('Transactions', `B2:F${TX_ROWS.length + 1}`), values: TX_ROWS.map((r) => r.slice(1) as (string | number)[]) }]);
+
+  // CF: two date rows (same input option) + formulas.
+  await client!.batchUpdateValues(SHEET_ID, [{ range: q('CF', 'A2:A3'), values: [['2026-06-01'], ['2026-06-02']] }], dateInput);
+  await client!.batchUpdateValues(
+    SHEET_ID,
+    [{ range: q('CF', 'B2:C3'), values: [[inflowFormula('$A2'), outflowFormula('$A2')], [inflowFormula('$A3'), outflowFormula('$A3')]] }],
+    'USER_ENTERED',
+  );
+
+  const got = await client!.getValuesRendered(SHEET_ID, q('CF', 'B2:C3'), 'UNFORMATTED_VALUE');
+  const n = (v: unknown) => Number(v ?? 0);
+  const results = {
+    d1_in: n(got[0]?.[0]), d1_out: n(got[0]?.[1]),
+    d2_in: n(got[1]?.[0]), d2_out: n(got[1]?.[1]),
+  };
+  const ok = results.d1_in === 100 && results.d1_out === 40 && results.d2_in === 0 && results.d2_out === 25;
+  console.log(`[${label}] dates=${dateInput} →`, results, ok ? '✅ PASS' : '❌ FAIL (expected d1 in100/out40, d2 in0/out25)');
+}
+
+await run('text-dates', 'RAW');
+await run('native-dates', 'USER_ENTERED');
+console.log('\nDone. Use whichever representation PASSED for the Cash Flow tab.');

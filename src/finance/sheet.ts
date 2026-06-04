@@ -35,6 +35,7 @@
 import type { Env } from '../env';
 import { SheetsClient, type ValueRange } from '../runtime/sheets';
 import { loadRules, applyRules, upsertRule, type Enrichment } from './rules';
+import { detectTransferIds, TRANSFER_CATEGORY } from './cashflow';
 import {
   loadAccountMeta,
   setAccountType,
@@ -44,7 +45,6 @@ import {
   summarizeNetWorth,
   coerceType,
   localDate,
-  spendingFilter,
   ACCOUNT_TYPES,
   type AccountMetaRow,
   type AccountBalance,
@@ -88,6 +88,11 @@ const BAL_RANGE = a1(BAL_TAB, 'A2:E');
 const BAL_HEADER = ['Date', 'Account', 'Type', 'Balance', 'account_id'];
 const BAL_COL = { date: 0, account: 1, type: 2, balance: 3, id: 4 } as const;
 const NW_HEADER = ['Date', 'Assets', 'Liabilities', 'Net Worth'];
+
+const CF_TAB = 'Cash Flow';
+const CF_HEADER = ['Date', 'Inflows', 'Outflows', 'Net'];
+/** Rolling window (days) the Cash Flow tab + chart shows. */
+const CF_WINDOW_DAYS = 90;
 
 /** Column letters (1-based A=1) for building A1 cell refs inside formulas. */
 const COL_LETTER = (idx0: number) => String.fromCharCode(65 + idx0);
@@ -219,7 +224,7 @@ async function runReconcile(env: Env, sql: SqlStorage): Promise<ReconcileResult>
   if (!client || !sheetId) return result;
   result.configured = true;
 
-  for (const section of [reconcileTransactions, reconcileAccountsTab, reconcileHistory]) {
+  for (const section of [reconcileTransactions, reconcileAccountsTab, reconcileHistory, reconcileCashFlow]) {
     try {
       await section(client, sheetId, env, sql, result);
     } catch (err) {
@@ -264,16 +269,19 @@ async function reconcileTransactions(
     }
   });
 
-  // Spending accounts only. Investment/loan transactions never enter the sheet.
+  // ALL accounts' transactions go in the sheet now (the analysis is done by
+  // sheet formulas that exclude Category = "Transfer").
   const txs = sql
     .exec<TxForSheet>(
       `SELECT t.id, t.posted, t.amount, t.description, t.normalized_payee, t.account_id
          FROM transactions t
-        WHERE ${spendingFilter('t')}
         ORDER BY t.posted ASC`,
     )
     .toArray();
-  const spendingIds = new Set(txs.map((t) => t.id));
+  const allTxIds = new Set(txs.map((t) => t.id));
+  // Detect inter-account transfers (paired equal/opposite flows across accounts)
+  // so we can PROPOSE the "Transfer" category — the user can override any.
+  const transferIds = detectTransferIds(txs);
 
   const mirror = new Map<string, MirrorRow>();
   for (const m of sql.exec<MirrorRow>('SELECT * FROM sheet_rows').toArray()) mirror.set(m.tx_id, m);
@@ -292,6 +300,10 @@ async function reconcileTransactions(
 
   for (const tx of txs) {
     const proposed: Enrichment = applyRules(rules, tx);
+    // Auto-propose "Transfer" for detected paired flows when no rule already
+    // set a category. Flows through the normal category merge, so the user can
+    // override it in the sheet.
+    if (!proposed.category && transferIds.has(tx.id)) proposed.category = TRANSFER_CATEGORY;
     const existing = sheetByTx.get(tx.id);
 
     if (!existing) {
@@ -346,11 +358,12 @@ async function reconcileTransactions(
     });
   }
 
-  // Rows whose account is no longer spending (reclassified) or whose tx is gone.
+  // Rows whose transaction no longer exists in the ledger (e.g. a pending tx
+  // SimpleFin dropped) — delete them from the sheet.
   const orphanRows: number[] = [];
   const orphanTxIds: string[] = [];
   for (const [txId, row] of sheetByTx) {
-    if (!spendingIds.has(txId)) { orphanRows.push(row.rowIndex); orphanTxIds.push(txId); }
+    if (!allTxIds.has(txId)) { orphanRows.push(row.rowIndex); orphanTxIds.push(txId); }
   }
 
   // Harvest edits into rules. Harvesting reflects what's ALREADY in the sheet
@@ -700,6 +713,61 @@ async function captureNetWorthRow(
   }
 }
 
+// ─── Cash Flow tab (daily inflows/outflows via live formulas) ────────────────
+
+const cfInflowFormula = (row: number) =>
+  `=SUMIFS(Transactions!$C:$C, Transactions!$A:$A, $A${row}, Transactions!$C:$C, ">0", Transactions!$F:$F, "<>${TRANSFER_CATEGORY}")`;
+const cfOutflowFormula = (row: number) =>
+  `=-SUMIFS(Transactions!$C:$C, Transactions!$A:$A, $A${row}, Transactions!$C:$C, "<0", Transactions!$F:$F, "<>${TRANSFER_CATEGORY}")`;
+
+/**
+ * The Cash Flow tab is **live formulas**, not bot-computed values: a rolling
+ * window of dates with SUMIFS that sum the Transactions tab and exclude
+ * Category = "Transfer". So categorizing a row updates the numbers instantly,
+ * no sync. The bot just maintains the date scaffold (so the window rolls) and
+ * the formulas. Dates are written as TEXT to match the Transactions tab's text
+ * dates (SUMIFS matches them — verified against a live sheet).
+ */
+async function reconcileCashFlow(
+  client: SheetsClient,
+  sheetId: string,
+  env: Env,
+  sql: SqlStorage,
+  result: ReconcileResult,
+): Promise<void> {
+  void sql; // analysis is done by the sheet formulas, not the bot
+  const { tabId } = await ensureTab(client, sheetId, CF_TAB, CF_HEADER, []);
+  if ((await client.countCharts(sheetId, tabId)) === 0) {
+    await client.batchUpdate(sheetId, [cashFlowChartRequest(tabId)]);
+  }
+
+  const dates: string[] = [];
+  for (let i = CF_WINDOW_DAYS - 1; i >= 0; i--) {
+    dates.push(new Date(Date.now() - i * 86_400_000).toLocaleDateString('en-CA', { timeZone: env.TIMEZONE }));
+  }
+  const lastRow = dates.length + 1;
+
+  try {
+    await client.batchUpdateValues(sheetId, [{ range: a1(CF_TAB, `A2:A${lastRow}`), values: dates.map((d) => [d]) }]); // RAW text
+    await client.batchUpdateValues(
+      sheetId,
+      [{
+        range: a1(CF_TAB, `B2:D${lastRow}`),
+        values: dates.map((_, i) => [cfInflowFormula(i + 2), cfOutflowFormula(i + 2), `=B${i + 2}-C${i + 2}`]),
+      }],
+      'USER_ENTERED',
+    );
+  } catch (err) {
+    result.errors.push(`cash-flow: ${(err as Error).message}`);
+  }
+
+  await applyFormatting(result, 'cf-format', () =>
+    client.setColumnFormats(sheetId, tabId, [
+      { col: 1, kind: 'currency' }, { col: 2, kind: 'currency' }, { col: 3, kind: 'currency' },
+    ]),
+  );
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Ensure a tab exists with a header row; freeze + bold the header and
@@ -837,6 +905,37 @@ function netWorthChartRequest(tabId: number): unknown {
               { series: colRange(1), targetAxis: 'LEFT_AXIS' }, // Assets
               { series: colRange(2), targetAxis: 'LEFT_AXIS' }, // Liabilities
               { series: colRange(3), targetAxis: 'LEFT_AXIS' }, // Net Worth
+            ],
+          },
+        },
+        position: { overlayPosition: { anchorCell: { sheetId: tabId, rowIndex: 1, columnIndex: 5 } } },
+      },
+    },
+  };
+}
+
+/** A COLUMN chart of daily Inflows vs Outflows for the Cash Flow tab. */
+function cashFlowChartRequest(tabId: number): unknown {
+  const colRange = (col: number) => ({
+    sourceRange: { sources: [{ sheetId: tabId, startRowIndex: 0, startColumnIndex: col, endColumnIndex: col + 1 }] },
+  });
+  return {
+    addChart: {
+      chart: {
+        spec: {
+          title: 'Daily Inflows vs Outflows',
+          basicChart: {
+            chartType: 'COLUMN',
+            legendPosition: 'BOTTOM_LEGEND',
+            headerCount: 1,
+            axis: [
+              { position: 'BOTTOM_AXIS', title: 'Date' },
+              { position: 'LEFT_AXIS', title: 'USD' },
+            ],
+            domains: [{ domain: colRange(0) }],
+            series: [
+              { series: colRange(1), targetAxis: 'LEFT_AXIS' }, // Inflows
+              { series: colRange(2), targetAxis: 'LEFT_AXIS' }, // Outflows
             ],
           },
         },
