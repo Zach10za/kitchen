@@ -133,7 +133,9 @@ export const FINANCE_SPEC: BotSpec = {
       // enrichment columns: it holds the effective merchant/category (for
       // offline analysis) plus the "base" the bot last wrote and per-field
       // lock flags, which together drive the three-way merge in sheet.ts.
-      // `rules` is the learning loop's memory (see rules.ts).
+      // (The `rules` table here is legacy: categorization moved to the sheet's
+      // Mappings tab, so nothing reads it anymore. Kept to avoid rewriting an
+      // already-applied migration; safe to drop in a future schema cleanup.)
       version: 5,
       up: (sql) => {
         sql.exec(`

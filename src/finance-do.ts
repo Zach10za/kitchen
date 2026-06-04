@@ -2,7 +2,6 @@ import type { Env } from './env';
 import type { Interaction } from './discord/types';
 import { runSync } from './finance/sync';
 import { reconcileSheet } from './finance/sheet';
-import { autoCategorize } from './finance/categorize';
 import { syncResultEmbed } from './finance/render';
 import type { AccountRow, TransactionRow } from './finance/tools';
 import { AgentDOBase } from './runtime/agent-do-base';
@@ -136,17 +135,10 @@ export class FinanceDO extends AgentDOBase<Env> {
       }
     }
     try {
-      // Categorize any new merchants (cheap LLM call; no-op once known) before
-      // the reconcile applies the resulting rules to the sheet.
-      await autoCategorize(this.env, this.sql);
-    } catch (err) {
-      console.error('finance auto-categorize failed', err);
-      await captureError(this.env, err, { source: 'finance:auto-categorize' });
-    }
-    try {
       // reconcileSheet is non-throwing by design (per-section/per-write errors
       // land in result.errors); surface those so a failed Sheets write doesn't
-      // disappear without a trace.
+      // disappear without a trace. Categorization happens inside it: the
+      // Mappings tab seeds a clean name + LLM category for every new merchant.
       const recon = await reconcileSheet(this.env, this.sql);
       if (recon.errors.length > 0) {
         await captureError(this.env, new Error(recon.errors.join('; ')), { source: 'finance:sheet-reconcile' });

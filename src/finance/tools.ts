@@ -136,33 +136,8 @@ export const FINANCE_TOOLS = [
   {
     type: 'function' as const,
     function: {
-      name: 'set_rule',
-      description: 'Create or update a categorization rule, then apply it to the sheet. Use for bulk commands like "categorize all amazon as Shopping" or "rename TST* PHILZ to Philz Coffee". A rule can set a cleaned merchant name, a category, or both. Rules apply to all matching transactions except rows the user has manually overridden in the sheet.',
-      parameters: {
-        type: 'object',
-        properties: {
-          match_type: { type: 'string', enum: ['merchant', 'contains'], description: '"merchant" matches the exact normalized merchant name (lowercase, as shown by top_merchants). "contains" matches a case-insensitive substring of the raw bank description — use it when the merchant name is messy or varies.' },
-          pattern: { type: 'string', description: 'For match_type "merchant": the normalized merchant name (lowercase). For "contains": the substring to look for in the raw description.' },
-          merchant: { type: 'string', description: 'Optional. Cleaned merchant name to set on matching rows.' },
-          category: { type: 'string', description: 'Optional. Category to set on matching rows (e.g. "Dining", "Groceries", "Subscriptions").' },
-        },
-        required: ['match_type', 'pattern'],
-      },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
       name: 'categorize_all',
-      description: 'Auto-categorize every uncategorized merchant now (Dining, Groceries, Income, etc.) via the LLM, storing each as a rule and applying it to the sheet. Use when the user asks to "categorize everything" / "fill in categories" / notices categories are empty. Normally new merchants are auto-categorized hourly; this does the whole backlog at once. Manual categorizations are never overwritten, and transfers stay "Transfer".',
-      parameters: { type: 'object', properties: {} },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
-      name: 'list_rules',
-      description: 'List the active categorization/merchant rules, including which were learned from the user\'s manual sheet edits vs. set explicitly. Use when the user asks "what rules do I have", "why is X categorized as Y", or before editing rules.',
+      description: 'Re-seed the Mappings tab so every merchant has a clean name and a category. Use when the user asks to "categorize everything" / "fill in categories" / notices categories are empty. Categorization lives in the Mappings tab: each distinct merchant gets a clean name and an LLM-assigned category ("Transfer" included), and the Transactions tab resolves both with live formulas — so the category applies to every transaction of that merchant. New merchants are seeded hourly; this forces it on demand. To change a merchant or category, the user edits its row in the Mappings tab and it propagates instantly — never overwritten by the bot.',
       parameters: { type: 'object', properties: {} },
     },
   },
