@@ -253,14 +253,18 @@ async function runReconcile(env: Env, sql: SqlStorage): Promise<ReconcileResult>
 /**
  * Maintains the Mappings tab — the single editable source of truth for cleaned
  * merchant names and categories. Two side-by-side tables:
- *   A: Merchant (raw)  B: Clean Name        — one row per distinct merchant key
+ *   A: Merchant (raw)  B: Clean Name        — one row per distinct RAW description
  *   D: Merchant        E: Category          — one row per distinct clean name
  *
- * The bot SEEDS rows (clean = bot's normalized name; category = LLM-classified,
- * incl. "Transfer") and PRESERVES the user's edits — it reads the existing
- * values first, then rewrites the full lists, so a clean name/category the user
- * typed is kept. The Transactions tab resolves both maps with live XLOOKUP
- * formulas, so editing one cell here updates every matching transaction.
+ * The raw side keys on the bank's verbatim description (store #, location and
+ * all), so it stays faithfully "raw" — a merchant with several locations shows
+ * one row per location. The bot SEEDS each row's clean name with its normalized
+ * guess, so those location variants get the SAME seed clean name and re-merge
+ * into a single category-map row; category therefore propagates across all of a
+ * merchant's variants even though the raw rows are separate. The bot PRESERVES
+ * the user's edits (reads existing values first, then rewrites). The
+ * Transactions tab resolves both maps with live XLOOKUP formulas, so editing one
+ * cell here updates every matching transaction.
  */
 async function reconcileMappings(
   client: SheetsClient,
@@ -271,14 +275,20 @@ async function reconcileMappings(
 ): Promise<void> {
   const { tabId } = await ensureTab(client, sheetId, MAP_TAB, MAP_HEADER, []);
 
-  // Merchant map: one row per distinct merchant key (normalized_payee). Preserve
-  // existing clean names; seed new keys with the bot's normalized guess.
+  // Merchant map: one row per distinct RAW description. Preserve existing clean
+  // names; seed new keys with the bot's normalized guess (so a merchant's
+  // location variants share a seed clean name and collapse in the category map).
   const existingClean = await readMap(client, sheetId, a1(MAP_TAB, 'A2:B'));
-  const keys = sql
-    .exec<{ k: string }>("SELECT DISTINCT normalized_payee AS k FROM transactions WHERE TRIM(normalized_payee) <> '' ORDER BY normalized_payee")
-    .toArray()
-    .map((r) => r.k);
-  const merchantRows = keys.map((k) => [k, existingClean.get(k) || k]);
+  const rawRows = sql
+    .exec<{ k: string; clean: string }>(
+      "SELECT description AS k, MAX(normalized_payee) AS clean FROM transactions WHERE TRIM(description) <> '' GROUP BY description ORDER BY description",
+    )
+    .toArray();
+  // Seed clean name: prefer an existing edit keyed on the raw description, then
+  // fall back to one keyed on the normalized name (carries forward renames made
+  // under the prior normalized-keyed map so the migration doesn't lose them),
+  // then the normalized guess.
+  const merchantRows = rawRows.map((r) => [r.k, existingClean.get(r.k) || existingClean.get(r.clean) || r.clean]);
   const cleanNames = [...new Set(merchantRows.map((r) => (r[1] as string).trim()).filter(Boolean))];
 
   // Category map: one row per distinct clean name. Preserve existing categories;
@@ -362,15 +372,18 @@ async function reconcileTransactions(
   const appendTxAccountIds: string[] = [];
 
   for (const tx of txs) {
-    // Mirror the sheet's formula result into SQLite for the chat tools.
-    const clean = cleanByKey.get(tx.normalized_payee) || tx.normalized_payee;
+    // Mirror the sheet's formula result into SQLite for the chat tools. The
+    // merchant_key (K) is the raw description, so the map lookup keys on it; the
+    // category falls back through the normalized name for a better map hit.
+    const clean = cleanByKey.get(tx.description) || tx.normalized_payee;
     const category = categoryByClean.get(clean) ?? '';
     const existing = sheetByTx.get(tx.id);
 
     if (!existing) {
       // B/E/F are formulas filled after append; account_id (I) written last as a
-      // commit marker. merchant_key (K) carries the grouping key for the Merchant formula.
-      appendValues.push([isoDate(tx.posted), '', tx.amount, tx.description, '', '', '', tx.id, '', '', tx.normalized_payee]);
+      // commit marker. merchant_key (K) carries the raw description the Merchant
+      // formula looks up in the Mappings tab.
+      appendValues.push([isoDate(tx.posted), '', tx.amount, tx.description, '', '', '', tx.id, '', '', tx.description]);
       appendTxIds.push(tx.id);
       appendTxAccountIds.push(tx.account_id);
       upsertMirror(sql, mirrorRow(tx.id, category, 0));
@@ -380,8 +393,8 @@ async function reconcileTransactions(
     if (existing.acctId !== tx.account_id) {
       cellUpdates.push({ range: a1(TX_TAB, `I${existing.rowIndex}:I${existing.rowIndex}`), values: [[tx.account_id]] });
     }
-    if (existing.mkey !== tx.normalized_payee) {
-      cellUpdates.push({ range: a1(TX_TAB, `K${existing.rowIndex}:K${existing.rowIndex}`), values: [[tx.normalized_payee]] });
+    if (existing.mkey !== tx.description) {
+      cellUpdates.push({ range: a1(TX_TAB, `K${existing.rowIndex}:K${existing.rowIndex}`), values: [[tx.description]] });
     }
     // Account/Merchant/Category formulas (idempotent — written for every row).
     formulaWrites.push({ range: a1(TX_TAB, `B${existing.rowIndex}:B${existing.rowIndex}`), values: [[accountNameRef(`$I${existing.rowIndex}`)]] });
