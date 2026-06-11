@@ -8,6 +8,7 @@ interface PromptContext {
   recentMeals: RecentMeal[];
   repertoire: RepertoireDish[];
   grocery: GroceryRow[];
+  recentPitches: string[];
   profile: string | null;
   /** Current time in the household timezone — must be injected by callers
    *  so the model can resolve "today" / "tonight" / "tomorrow" without
@@ -19,7 +20,7 @@ interface PromptContext {
 }
 
 export function buildSystemPrompt(args: PromptContext): string {
-  const { today, preferences, pantry, recentMeals, repertoire, grocery, profile, now, dinnerHourLocal } = args;
+  const { today, preferences, pantry, recentMeals, repertoire, grocery, recentPitches, profile, now, dinnerHourLocal } = args;
 
   const freezer = pantry.filter((p) => p.location === 'freezer');
   const fridge = pantry.filter((p) => p.location === 'fridge');
@@ -65,6 +66,9 @@ ${recentMeals.length > 0
     ? recentMeals.map((m) => `- ${m.date}: ${m.name} (${[m.cuisine, m.protein, m.effort].filter(Boolean).join(', ')})${m.rating != null ? ` — rated ${m.rating}/10` : ''}`).join('\n')
     : '(no recent history)'}
 
+RECENTLY PITCHED (dishes you offered in the last 14 days, across ALL conversations — do NOT offer any of these again, or near-clones, unless the user asks for one by name):
+${recentPitches.length > 0 ? recentPitches.map((p) => `- ${p}`).join('\n') : '(none yet)'}
+
 HOUSE REPERTOIRE (dishes they've cooked and rated — their personal cookbook):
 ${repertoire.length > 0
     ? repertoire.map((d) => `- ${d.name} — ${d.rating}/10, cooked ${d.timesCooked}x, last ${d.lastDate}${d.notes ? ` — next time: ${d.notes.split('\n').join('; ')}` : ''}`).join('\n')
@@ -76,7 +80,7 @@ HOW TO SUGGEST (this is the main thing you do):
 - Offer **exactly 3** real, well-known dishes — never more, never fewer. No fusion experiments.
 - Rank by what's on hand: lead with dishes makeable TONIGHT from the fridge and shelf (plus a short Need-to-buy line). **Never build one of the 3 options around a freezer item** — it isn't defrosted, so it isn't an option for tonight — unless the user says it's already thawed.
 - Freezer items are plan-ahead material: at most, end with ONE short line offering to schedule one for a coming day ("Want me to put the chuck roast on for Saturday? I'll set the defrost reminder."). If they ignore the offer, don't repeat it for a week or two.
-- FRESH OPTIONS DAILY: the conversation above shows what you've already pitched on previous days. Never re-offer a dish (or a near-clone) you suggested in the last ~2 weeks unless the user engaged with it. If you catch yourself reaching for the same comfortable braise or pasta again, change the cuisine or the technique.
+- FRESH OPTIONS DAILY: the RECENTLY PITCHED list above is a hard exclusion — those dishes (and near-clones) are off the table no matter which conversation you're in. If you catch yourself reaching for the same comfortable braise or pasta again, change the cuisine or the technique.
 - Honor the request's constraints ("20 minutes", "something light", "I have salmon") and the COOKING PROFILE hard rules (allergies, equipment, diet) — those are law, never violate them.
 - Match the day's energy: weeknights default to ~30 min; Fridays lean low-effort or suggest a no-cook night without judgment. On weekends, one of the three options may be a project — bread, ramen, a long braise — pitched as such ("if you feel like a project…"). Never more than one project option.
 - Cook with the season: braises and soups in the cold months, grilling and raw/bright dishes in the heat, and favor produce that's actually in season on today's date.
