@@ -46,6 +46,7 @@ export const WORKOUT_SPEC: BotSpec = {
     'exercises',
     'gym_equipment',
     'profile',
+    'settings',
     'conversation',
   ],
   scopeColumn: 'thread_id',
@@ -53,7 +54,7 @@ export const WORKOUT_SPEC: BotSpec = {
   buildSystemPrompt: (sql, env) => buildWorkoutSystemPrompt(sql, env.TIMEZONE),
 
   executeTool: (name, args, ctx) =>
-    executeWorkoutTool(name, args, { sql: ctx.sql }),
+    executeWorkoutTool(name, args, { sql: ctx.sql, timezone: ctx.timezone }),
 
   fastRead: (sql, _env, interaction): MessagePayload | null => {
     const cmd = interaction.data?.name ?? '';
@@ -268,6 +269,20 @@ export const WORKOUT_SPEC: BotSpec = {
             updated_at INTEGER NOT NULL
           );
           CREATE INDEX IF NOT EXISTS idx_gym_equipment_category ON gym_equipment(category);
+        `);
+      },
+    },
+    {
+      // v5: key-value settings for the proactive layer (training hiatus,
+      // inactivity-nudge bookkeeping).
+      version: 5,
+      up: (sql) => {
+        sql.exec(`
+          CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+          );
         `);
       },
     },

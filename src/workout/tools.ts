@@ -391,6 +391,29 @@ export const WORKOUT_TOOLS = [
       },
     },
   },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'set_hiatus',
+      description: 'Record a training break (injury, travel, illness, life). Suppresses all proactive check-ins/nudges until the end date, then triggers a welcome-back check-in. Call this whenever the user says they\'ll be off training for a while ("can\'t work out for the next few weeks", "out until July"). If the end is vague ("a few weeks"), pick a reasonable date and say which you picked.',
+      parameters: {
+        type: 'object',
+        properties: {
+          until_date: { type: 'string', description: 'Last day of the break, YYYY-MM-DD (user-local). Check-ins resume the morning after.' },
+          note: { type: 'string', description: 'Optional reason ("shoulder surgery recovery", "travel") — used to shape the comeback plan.' },
+        },
+        required: ['until_date'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'clear_hiatus',
+      description: 'End a recorded training break early — the user is back before the date they originally said. Re-enables proactive check-ins.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
   // Shared Tavily-backed search (executed centrally in AgentDOBase). Use it to
   // ground training advice in reputable sources (returns facts only, no links).
   WEB_SEARCH_TOOL,
