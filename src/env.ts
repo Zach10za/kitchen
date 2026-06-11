@@ -20,6 +20,9 @@ export interface Env {
   SUGGEST_HOUR_LOCAL: string;
   /** Local dinner hour (0-23) defrost reminders are anchored to. Defaults to 18. */
   DINNER_HOUR_LOCAL: string;
+  /** Local hour (0-23) the projects bot's daily alarm fires: Monday weekly
+   *  review + other-day due nudges. Defaults to 9. */
+  PROJECTS_REVIEW_HOUR_LOCAL?: string;
   TIMEZONE: string;
   GITHUB_REPO: string;
   /** Per-channel relay rate limit: max forwarded messages per hour (defaults to 30 if unset). */

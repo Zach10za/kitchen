@@ -3,20 +3,28 @@ import type { MessagePayload } from '../discord/types';
 import { ensureRelayRateSchema } from '../runtime/relay-rate-limit';
 import { ensureUsageSchema } from '../runtime/usage';
 import { TASKS_TOOLS } from './tools';
-import { executeTasksTool, buildTaskStats, TASK_ORDER_SQL, DUE_SOON_WINDOW_MS, type TaskRow } from './loop';
+import {
+  executeTasksTool,
+  buildProjectsSnapshot,
+  TASK_ORDER_SQL,
+  DUE_SOON_WINDOW_MS,
+  type TaskRow,
+} from './loop';
 import { buildTasksSystemPrompt } from './prompts';
-import { taskSummaryEmbed, tasksListEmbed, tasksDueEmbed } from './render';
+import { projectsOverviewEmbed, tasksListEmbed, tasksDueEmbed } from './render';
 
-/** Tasks bot spec — see runtime/bot-spec.ts for the contract. */
+/** Projects bot spec (id stays 'tasks' — DO binding, channel env key, and
+ *  admin ?bot= names are wired to it). See runtime/bot-spec.ts for the
+ *  contract. */
 export const TASKS_SPEC: BotSpec = {
   id: 'tasks',
   channelEnvKey: 'DISCORD_TASKS_CHANNEL_ID',
   commands: new Set([
-    'tasks',
-    'tasks-open',
-    'tasks-next',
-    'tasks-blocked',
-    'tasks-due',
+    'projects',
+    'projects-open',
+    'projects-next',
+    'projects-blocked',
+    'projects-due',
   ]),
   tools: TASKS_TOOLS,
   resetTables: ['tasks', 'task_deps', 'conversation'],
@@ -30,11 +38,11 @@ export const TASKS_SPEC: BotSpec = {
   fastRead: (sql, _env, interaction): MessagePayload | null => {
     const cmd = interaction.data?.name ?? '';
 
-    if (cmd === 'tasks') {
-      return { embeds: [taskSummaryEmbed(buildTaskStats(sql))] };
+    if (cmd === 'projects') {
+      return { embeds: [projectsOverviewEmbed(buildProjectsSnapshot(sql))] };
     }
 
-    if (cmd === 'tasks-open') {
+    if (cmd === 'projects-open') {
       const tasks = sql
         .exec<TaskRow>(
           `SELECT t.* FROM tasks t
@@ -42,10 +50,10 @@ export const TASKS_SPEC: BotSpec = {
            ORDER BY ${TASK_ORDER_SQL}`,
         )
         .toArray();
-      return { embeds: [tasksListEmbed('📋 Open Tasks', tasks)] };
+      return { embeds: [tasksListEmbed('📋 Open Items', tasks)] };
     }
 
-    if (cmd === 'tasks-next') {
+    if (cmd === 'projects-next') {
       const tasks = sql
         .exec<TaskRow>(
           `SELECT t.* FROM tasks t
@@ -58,10 +66,10 @@ export const TASKS_SPEC: BotSpec = {
            ORDER BY ${TASK_ORDER_SQL}`,
         )
         .toArray();
-      return { embeds: [tasksListEmbed('✅ Ready to Work On', tasks)] };
+      return { embeds: [tasksListEmbed('✅ Next Actions (no blockers)', tasks)] };
     }
 
-    if (cmd === 'tasks-blocked') {
+    if (cmd === 'projects-blocked') {
       const tasks = sql
         .exec<TaskRow>(
           `SELECT DISTINCT t.* FROM tasks t
@@ -72,10 +80,10 @@ export const TASKS_SPEC: BotSpec = {
            ORDER BY ${TASK_ORDER_SQL}`,
         )
         .toArray();
-      return { embeds: [tasksListEmbed('⛔ Blocked Tasks', tasks)] };
+      return { embeds: [tasksListEmbed('⛔ Blocked Items', tasks)] };
     }
 
-    if (cmd === 'tasks-due') {
+    if (cmd === 'projects-due') {
       // Overdue + due within the next 7d. Done/cancelled excluded — past-due
       // tasks you already closed aren't actionable.
       const cutoff = Date.now() + DUE_SOON_WINDOW_MS;
