@@ -5,7 +5,8 @@
  */
 
 import { EmbedColor, type Embed } from '../discord/types';
-import type { WorkoutStats, PRRow, WeeklyVolume, FullWorkout, ProfileRow, GymEquipmentRow } from './loop';
+import type { WorkoutStats, PRRow, WeeklyVolume, FullWorkout, ProfileRow, GymEquipmentRow, OpenSessionPlan } from './loop';
+import { barLoadout, formatPerSide } from './loop';
 
 function fmtLbs(n: number | null): string {
   if (n === null) return 'BW';
@@ -282,5 +283,28 @@ export function workoutProfileEmbed(profile: ProfileRow, equipment: GymEquipment
     title: '👤 Lifter Profile',
     color: EmbedColor.inProgress,
     fields,
+  };
+}
+
+export function sessionPlanEmbed(plan: OpenSessionPlan): Embed {
+  const fields = plan.exercises.slice(0, 25).map((e) => {
+    const weightStr = e.weight_lbs === null ? 'BW' : `${e.weight_lbs} lbs`;
+    const perSide = e.weight_lbs !== null && e.equipment === 'barbell'
+      ? ` · ${formatPerSide(barLoadout(e.weight_lbs))}`
+      : '';
+    const rpe = e.rpe_target !== null ? ` @ RPE ${e.rpe_target}` : '';
+    const lines = [`${e.sets}×${e.reps} @ ${weightStr}${rpe}${perSide}`];
+    if (e.why) lines.push(`_${e.why.slice(0, 200)}_`);
+    return {
+      name: `${e.is_new ? '🆕 ' : ''}${e.display_name}`,
+      value: lines.join('\n').slice(0, 1024),
+    };
+  });
+  return {
+    title: `🏋️ ${plan.title} — ${plan.date}`,
+    description: plan.focus ? plan.focus.slice(0, 2048) : undefined,
+    color: EmbedColor.inProgress,
+    fields,
+    footer: { text: 'Say "done" when you finish and it logs as written — or tell me what changed' },
   };
 }

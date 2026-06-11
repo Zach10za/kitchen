@@ -6,15 +6,17 @@
  * All weights are pounds. Bodyweight exercises have NULL weight.
  */
 
-import { localDateAtHour } from '../util/datetime';
+import { localDateAtHour, todayISO } from '../util/datetime';
 import type {
   ExerciseRow, WorkoutRow, SetRow, ProgramRow, RoutineRow,
   ProfileRow, GymEquipmentRow,
+  SessionPlanRow, SessionPlanExerciseRow, NiggleRow,
 } from './tools';
 
 export type {
   ExerciseRow, WorkoutRow, SetRow, ProgramRow, RoutineRow,
   ProfileRow, GymEquipmentRow,
+  SessionPlanRow, SessionPlanExerciseRow, NiggleRow,
 };
 
 export interface WorkoutToolCtx {
@@ -62,6 +64,12 @@ export function executeWorkoutTool(name: string, args: any, ctx: WorkoutToolCtx)
       case 'list_equipment':       return toolListEquipment(args, ctx);
       case 'set_hiatus':           return toolSetHiatus(args, ctx);
       case 'clear_hiatus':         return toolClearHiatus(ctx);
+      case 'plan_session':         return toolPlanSession(args, ctx);
+      case 'log_planned_session':  return toolLogPlannedSession(args, ctx);
+      case 'loadout':              return toolLoadout(args);
+      case 'lift_trends':          return toolLiftTrends(args, ctx);
+      case 'log_niggle':           return toolLogNiggle(args, ctx);
+      case 'resolve_niggle':       return toolResolveNiggle(args, ctx);
       default:                     return `Unknown workout tool: ${name}`;
     }
   } catch (err) {
@@ -277,6 +285,16 @@ function toolShowSummary(ctx: WorkoutToolCtx): string {
     for (const pr of stats.recentPRs) {
       lines.push(`  ${pr.exercise_display}: ${pr.weight_lbs} × ${pr.reps} → ~${pr.estimated_1rm.toLocaleString()} lbs`);
     }
+    lines.push('');
+  }
+
+  const plan = loadOpenSessionPlan(ctx.sql);
+  if (plan) {
+    lines.push(`Planned session [${plan.id}] "${plan.title}" (${plan.date}): ${plan.exercises.map((e) => e.display_name).join(', ')} — "done" logs it as written.`);
+  }
+  const niggles = loadActiveNiggles(ctx.sql);
+  if (niggles.length > 0) {
+    lines.push(`Active niggles: ${niggles.map((n) => `${n.area} [${n.id}]${n.avoid ? ` (avoid: ${n.avoid})` : ''}`).join('; ')}`);
   }
 
   return lines.join('\n').trim();
@@ -341,7 +359,73 @@ function toolEndWorkout(args: { id?: string; notes?: string }, ctx: WorkoutToolC
     .exec<{ n: number }>('SELECT COUNT(*) AS n FROM sets WHERE workout_id = ? AND is_warmup = 0', w.id)
     .toArray()[0]?.n ?? 0;
   const duration = Math.round((now - w.started_at) / 60_000);
-  return `Ended workout [${w.id}] — ${setCount} working sets over ${duration} min.`;
+  const tonnage = workoutTonnage(ctx.sql, w.id);
+  const comparison = tonnageComparison(ctx.sql, w.id, w.started_at, tonnage);
+  return `Ended workout [${w.id}] — ${setCount} working sets, ${tonnage.toLocaleString()} lbs tonnage over ${duration} min.${comparison} Give the user a short SESSION DEBRIEF.`;
+}
+
+/** Sum of weight × reps across working sets. */
+function workoutTonnage(sql: SqlStorage, workoutId: string): number {
+  return Math.round(
+    sql.exec<{ t: number | null }>(
+      'SELECT SUM(weight_lbs * reps) AS t FROM sets WHERE workout_id = ? AND is_warmup = 0 AND weight_lbs IS NOT NULL',
+      workoutId,
+    ).toArray()[0]?.t ?? 0,
+  );
+}
+
+function tonnageComparison(sql: SqlStorage, workoutId: string, startedAt: number, tonnage: number): string {
+  const prev = sql
+    .exec<{ id: string }>(
+      'SELECT id FROM workouts WHERE id != ? AND ended_at IS NOT NULL AND started_at < ? ORDER BY started_at DESC LIMIT 1',
+      workoutId, startedAt,
+    )
+    .toArray()[0];
+  if (!prev) return '';
+  const prevTonnage = workoutTonnage(sql, prev.id);
+  if (prevTonnage <= 0) return '';
+  const delta = tonnage - prevTonnage;
+  return ` vs last session: ${delta >= 0 ? '+' : ''}${delta.toLocaleString()} lbs tonnage.`;
+}
+
+/**
+ * PR check for a working set, evaluated against history BEFORE the set is
+ * inserted. Two kinds: heaviest weight at this-or-more reps, and a new
+ * all-time estimated 1RM. First-ever sets of an exercise are a baseline,
+ * not a PR.
+ */
+function checkSetPr(sql: SqlStorage, exerciseId: string, weight: number | null, reps: number): string | null {
+  if (weight == null || reps <= 0) return null;
+  const priorCount = sql
+    .exec<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM sets WHERE exercise_id = ? AND is_warmup = 0 AND weight_lbs IS NOT NULL',
+      exerciseId,
+    )
+    .toArray()[0]?.n ?? 0;
+  if (priorCount === 0) return null;
+
+  const bestAtReps = sql
+    .exec<{ w: number | null }>(
+      'SELECT MAX(weight_lbs) AS w FROM sets WHERE exercise_id = ? AND is_warmup = 0 AND weight_lbs IS NOT NULL AND reps >= ?',
+      exerciseId, reps,
+    )
+    .toArray()[0]?.w ?? null;
+  const bestE1rm = sql
+    .exec<{ e: number | null }>(
+      'SELECT MAX(weight_lbs * (1 + reps / 30.0)) AS e FROM sets WHERE exercise_id = ? AND is_warmup = 0 AND weight_lbs IS NOT NULL',
+      exerciseId,
+    )
+    .toArray()[0]?.e ?? null;
+
+  const parts: string[] = [];
+  if (bestAtReps === null || weight > bestAtReps) {
+    parts.push(`heaviest ${reps}-rep set ever${bestAtReps !== null ? ` (was ${bestAtReps})` : ''}`);
+  }
+  const e1rm = epley1RM(weight, reps);
+  if (bestE1rm !== null && e1rm > bestE1rm) {
+    parts.push(`new all-time e1RM ~${Math.round(e1rm)} lbs (was ~${Math.round(bestE1rm)})`);
+  }
+  return parts.length > 0 ? `🎉 PR: ${parts.join('; ')} — celebrate this to the user.` : null;
 }
 
 function toolAddSet(
@@ -384,6 +468,9 @@ function toolAddSet(
     .toArray()[0]?.n ?? 0;
   const setIndex = existing + 1;
 
+  // PR check runs against history BEFORE this set lands.
+  const pr = isWarmup ? null : checkSetPr(ctx.sql, exercise.id, weight, args.reps);
+
   const now = Date.now();
   ctx.sql.exec(
     `INSERT INTO sets (workout_id, exercise_id, set_index, weight_lbs, reps, rpe, is_warmup, notes, logged_at)
@@ -395,7 +482,7 @@ function toolAddSet(
   const weightStr = weight === null ? 'BW' : `${weight} lbs`;
   const rpeStr = args.rpe !== undefined ? ` @ RPE ${args.rpe}` : '';
   const warmupStr = isWarmup ? ' (warmup)' : '';
-  return `Logged ${exercise.display_name} #${setIndex}: ${weightStr} × ${args.reps}${rpeStr}${warmupStr} → workout [${workout.id}].`;
+  return `Logged ${exercise.display_name} #${setIndex}: ${weightStr} × ${args.reps}${rpeStr}${warmupStr} → workout [${workout.id}].${pr ? ` ${pr}` : ''}`;
 }
 
 function toolAddSetsBulk(
@@ -437,6 +524,9 @@ function toolAddSetsBulk(
     )
     .toArray()[0]?.n ?? 0;
 
+  // All sets are identical, so one PR check against pre-existing history covers the lot.
+  const pr = isWarmup ? null : checkSetPr(ctx.sql, exercise.id, weight, args.reps);
+
   const now = Date.now();
   for (let i = 1; i <= args.sets; i++) {
     ctx.sql.exec(
@@ -447,7 +537,7 @@ function toolAddSetsBulk(
   }
 
   const weightStr = weight === null ? 'BW' : `${weight} lbs`;
-  return `Logged ${args.sets} × ${args.reps} ${exercise.display_name} at ${weightStr} → workout [${workout.id}].`;
+  return `Logged ${args.sets} × ${args.reps} ${exercise.display_name} at ${weightStr} → workout [${workout.id}].${pr ? ` ${pr}` : ''}`;
 }
 
 function toolExerciseHistory(
@@ -1342,6 +1432,407 @@ function toolClearHiatus(ctx: WorkoutToolCtx): string {
   if (!loadHiatus(ctx.sql)) return 'No training break is currently recorded.';
   clearHiatus(ctx.sql);
   return 'Training break cleared — back to normal check-ins.';
+}
+
+// ─── Barbell math (deterministic — the model must never do plate arithmetic) ──
+
+const PLATES_PER_SIDE = [45, 35, 25, 10, 5, 2.5];
+
+export function barLoadout(target: number, bar = 45): { perSide: number[]; achieved: number } {
+  let remaining = (target - bar) / 2;
+  const perSide: number[] = [];
+  if (remaining > 0) {
+    for (const p of PLATES_PER_SIDE) {
+      while (remaining >= p) {
+        perSide.push(p);
+        remaining -= p;
+      }
+    }
+  }
+  const achieved = bar + 2 * perSide.reduce((a, b) => a + b, 0);
+  return { perSide, achieved };
+}
+
+export function formatPerSide(loadout: { perSide: number[] }): string {
+  return loadout.perSide.length > 0 ? `${loadout.perSide.join('+')} per side` : 'empty bar';
+}
+
+function round5(x: number): number {
+  return Math.round(x / 5) * 5;
+}
+
+/** Warm-up ladder up to (not including) the work weight: bar, ~55%, ~75%, ~90%. */
+export function warmupLadder(work: number, bar = 45): Array<{ weight: number; reps: number }> {
+  const rungs: Array<{ weight: number; reps: number }> = [{ weight: bar, reps: 10 }];
+  for (const [pct, reps] of [[0.55, 5], [0.75, 3], [0.9, 1]] as const) {
+    const w = round5(work * pct);
+    if (w <= bar || w >= work) continue;
+    if (rungs.some((r) => r.weight === w)) continue;
+    rungs.push({ weight: w, reps });
+  }
+  return rungs;
+}
+
+function toolLoadout(args: { work_weight_lbs: number; bar_weight_lbs?: number; warmup?: boolean }): string {
+  const bar = Number(args.bar_weight_lbs) || 45;
+  const work = Number(args.work_weight_lbs);
+  if (!Number.isFinite(work) || work <= 0) return 'work_weight_lbs must be a positive number.';
+  if (work < bar) return `Target ${work} lbs is below the bar (${bar} lbs) — no plates needed; consider dumbbells or a lighter bar.`;
+
+  const main = barLoadout(work, bar);
+  const note = main.achieved !== work ? ` — nearest loadable is ${main.achieved} lbs` : '';
+  const lines = [`Work: ${work} lbs = ${formatPerSide(main)}${note} (${bar} lb bar)`];
+
+  if (args.warmup !== false) {
+    for (const rung of warmupLadder(main.achieved, bar)) {
+      const l = barLoadout(rung.weight, bar);
+      lines.push(`Warm-up: ${rung.weight} × ${rung.reps} (${formatPerSide(l)})`);
+    }
+    lines.push(`Then work sets at ${main.achieved}.`);
+  }
+  return lines.join('\n');
+}
+
+// ─── Session plans (the prescribed session — enables "done" logging) ─────────
+
+export interface OpenSessionPlan {
+  id: string;
+  date: string;
+  title: string;
+  focus: string | null;
+  exercises: Array<SessionPlanExerciseRow & { display_name: string; equipment: string | null }>;
+}
+
+const SELECT_PLAN_EXERCISES = `
+  SELECT spe.*, e.display_name, e.equipment
+  FROM session_plan_exercises spe
+  JOIN exercises e ON e.id = spe.exercise_id
+  WHERE spe.plan_id = ?
+  ORDER BY spe.exercise_order ASC, spe.id ASC
+`;
+
+/** The single open (status='planned') session plan, newest first. */
+export function loadOpenSessionPlan(sql: SqlStorage): OpenSessionPlan | null {
+  const plan = sql
+    .exec<SessionPlanRow>(
+      "SELECT * FROM session_plans WHERE status = 'planned' ORDER BY date DESC, created_at DESC LIMIT 1",
+    )
+    .toArray()[0];
+  if (!plan) return null;
+  const exercises = sql
+    .exec<SessionPlanExerciseRow & { display_name: string; equipment: string | null }>(
+      SELECT_PLAN_EXERCISES, plan.id,
+    )
+    .toArray();
+  return { id: plan.id, date: plan.date, title: plan.title, focus: plan.focus, exercises };
+}
+
+interface PlanSessionExerciseArg {
+  exercise: string;
+  sets: number;
+  reps: number;
+  weight_lbs?: number;
+  rpe_target?: number;
+  why?: string;
+  is_new?: boolean;
+  equipment?: string;
+  primary_muscle?: string;
+}
+
+function toolPlanSession(
+  args: { date?: string; title: string; focus: string; exercises: PlanSessionExerciseArg[] },
+  ctx: WorkoutToolCtx,
+): string {
+  if (!args.title?.trim()) return 'title is required.';
+  if (!Array.isArray(args.exercises) || args.exercises.length === 0) return 'exercises must be a non-empty array.';
+  const date = args.date && /^\d{4}-\d{2}-\d{2}$/.test(args.date)
+    ? args.date
+    : todayISO(ctx.timezone ?? 'UTC');
+
+  const now = Date.now();
+  // One open plan at a time — a new plan supersedes anything still pending.
+  ctx.sql.exec("UPDATE session_plans SET status = 'skipped', updated_at = ? WHERE status = 'planned'", now);
+
+  const id = shortId('sp');
+  ctx.sql.exec(
+    'INSERT INTO session_plans (id, date, title, focus, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    id, date, args.title.trim(), args.focus?.trim() || null, 'planned', now, now,
+  );
+
+  const lines: string[] = [];
+  let order = 0;
+  for (const ex of args.exercises) {
+    const sets = Math.round(Number(ex.sets));
+    const reps = Math.round(Number(ex.reps));
+    if (!Number.isFinite(sets) || sets <= 0 || sets > 15) return `Invalid sets for ${ex.exercise}: ${ex.sets} (1-15).`;
+    if (!Number.isFinite(reps) || reps <= 0 || reps > 50) return `Invalid reps for ${ex.exercise}: ${ex.reps} (1-50).`;
+    const parsed = parseWeight(ex.weight_lbs);
+    if (!parsed.ok) return `${ex.exercise}: ${parsed.error}`;
+
+    const exercise = resolveExercise(ctx.sql, ex.exercise, {
+      equipment: ex.equipment,
+      primary_muscle: ex.primary_muscle,
+      createIfMissing: true,
+    })!;
+    ctx.sql.exec(
+      `INSERT INTO session_plan_exercises (plan_id, exercise_id, exercise_order, sets, reps, weight_lbs, rpe_target, why, is_new)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, exercise.id, order++, sets, reps, parsed.value,
+      ex.rpe_target ?? null, ex.why?.trim() || null, ex.is_new ? 1 : 0,
+    );
+
+    const weightStr = parsed.value === null ? 'BW' : `${parsed.value} lbs`;
+    const perSide = parsed.value !== null && exercise.equipment === 'barbell'
+      ? ` (${formatPerSide(barLoadout(parsed.value))})`
+      : '';
+    lines.push(`${exercise.display_name}: ${sets}×${reps} @ ${weightStr}${perSide}${ex.is_new ? ' 🆕' : ''}`);
+  }
+
+  return `Planned [${id}] "${args.title.trim()}" for ${date}:\n${lines.join('\n')}\nPresent it as the SESSION CARD. When the user finishes they can just say "done" to log it as written.`;
+}
+
+interface SessionAdjustment {
+  exercise: string;
+  weight_lbs?: number;
+  reps_per_set?: number[];
+  sets?: number;
+  rpe?: number;
+  skipped?: boolean;
+}
+
+function toolLogPlannedSession(
+  args: { plan_id?: string; adjustments?: SessionAdjustment[]; notes?: string },
+  ctx: WorkoutToolCtx,
+): string {
+  const plan = args.plan_id
+    ? ctx.sql.exec<SessionPlanRow>('SELECT * FROM session_plans WHERE id = ?', args.plan_id).toArray()[0]
+    : ctx.sql.exec<SessionPlanRow>(
+        "SELECT * FROM session_plans WHERE status = 'planned' ORDER BY date DESC, created_at DESC LIMIT 1",
+      ).toArray()[0];
+  if (!plan) return args.plan_id ? `Plan "${args.plan_id}" not found.` : 'No planned session to log. Generate one first (plan_session), or log sets directly.';
+  if (plan.status !== 'planned') return `Plan [${plan.id}] is already ${plan.status}.`;
+
+  const open = ctx.sql
+    .exec<{ id: string }>('SELECT id FROM workouts WHERE ended_at IS NULL LIMIT 1')
+    .toArray()[0];
+  if (open) {
+    return `There's an open workout [${open.id}] — its sets may overlap this plan. End it (end_workout) or log the remaining sets directly instead of using log_planned_session.`;
+  }
+
+  const planExercises = ctx.sql
+    .exec<SessionPlanExerciseRow & { display_name: string; equipment: string | null }>(
+      SELECT_PLAN_EXERCISES, plan.id,
+    )
+    .toArray();
+  if (planExercises.length === 0) return `Plan [${plan.id}] has no exercises.`;
+
+  const adjMap = new Map<string, SessionAdjustment>();
+  for (const adj of args.adjustments ?? []) {
+    if (adj?.exercise) adjMap.set(normalizeExerciseName(adj.exercise), adjMap.get(normalizeExerciseName(adj.exercise)) ?? adj);
+  }
+  const matchedAdj = new Set<string>();
+
+  const now = Date.now();
+  const workoutId = shortId('w');
+  ctx.sql.exec(
+    `INSERT INTO workouts (id, routine_id, name, started_at, ended_at, is_deload, notes, created_at, updated_at)
+     VALUES (?, NULL, ?, ?, ?, 0, ?, ?, ?)`,
+    workoutId, plan.title, now, now, args.notes?.trim() || null, now, now,
+  );
+
+  const lines: string[] = [];
+  const prLines: string[] = [];
+  let totalSets = 0;
+
+  for (const pe of planExercises) {
+    const key = ctx.sql
+      .exec<{ name: string }>('SELECT name FROM exercises WHERE id = ?', pe.exercise_id)
+      .toArray()[0]!.name;
+    const adj = adjMap.get(key);
+    if (adj) matchedAdj.add(key);
+
+    if (adj?.skipped) {
+      lines.push(`${pe.display_name}: skipped`);
+      continue;
+    }
+
+    let weight = pe.weight_lbs;
+    if (adj?.weight_lbs !== undefined) {
+      const parsed = parseWeight(adj.weight_lbs);
+      if (!parsed.ok) return `${pe.display_name}: ${parsed.error}`;
+      weight = parsed.value;
+    }
+    const repsArr = adj?.reps_per_set?.length
+      ? adj.reps_per_set.map((r) => Math.round(Number(r))).filter((r) => Number.isFinite(r) && r > 0)
+      : Array(Math.max(1, Math.round(adj?.sets ?? pe.sets))).fill(pe.reps) as number[];
+    if (repsArr.length === 0) return `${pe.display_name}: reps_per_set had no valid reps.`;
+
+    // PR check against history before this session's sets land; the best set
+    // of the bunch carries the announcement.
+    let bestPr: string | null = null;
+    let bestE1rm = -1;
+    for (const reps of repsArr) {
+      if (weight === null) break;
+      const e = epley1RM(weight, reps);
+      if (e > bestE1rm) {
+        bestE1rm = e;
+        bestPr = checkSetPr(ctx.sql, pe.exercise_id, weight, reps);
+      }
+    }
+    if (bestPr) prLines.push(`${pe.display_name}: ${bestPr}`);
+
+    repsArr.forEach((reps, i) => {
+      ctx.sql.exec(
+        `INSERT INTO sets (workout_id, exercise_id, set_index, weight_lbs, reps, rpe, is_warmup, notes, logged_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?)`,
+        workoutId, pe.exercise_id, i + 1, weight, reps,
+        // RPE (if given) describes the toughest set — pin it to the last one.
+        adj?.rpe !== undefined && i === repsArr.length - 1 ? adj.rpe : null,
+        now,
+      );
+    });
+
+    totalSets += repsArr.length;
+    const weightStr = weight === null ? 'BW' : `${weight} lbs`;
+    const asWritten = !adj ? ' (as written)' : '';
+    lines.push(`${pe.display_name}: ${repsArr.length}×[${repsArr.join(',')}] @ ${weightStr}${asWritten}`);
+  }
+
+  const unmatched = [...adjMap.keys()].filter((k) => !matchedAdj.has(k));
+  ctx.sql.exec("UPDATE session_plans SET status = 'done', updated_at = ? WHERE id = ?", now, plan.id);
+
+  const tonnage = workoutTonnage(ctx.sql, workoutId);
+  const comparison = tonnageComparison(ctx.sql, workoutId, now, tonnage);
+
+  const out = [
+    `Logged "${plan.title}" as workout [${workoutId}] — ${totalSets} working sets, ${tonnage.toLocaleString()} lbs tonnage.${comparison}`,
+    ...lines.map((l) => `- ${l}`),
+    ...(prLines.length > 0 ? ['', ...prLines] : []),
+    ...(unmatched.length > 0 ? [`⚠️ adjustments didn't match any planned exercise: ${unmatched.join(', ')} — log those with add_set/add_sets_bulk.`] : []),
+    '',
+    'Give the user a SESSION DEBRIEF.',
+  ];
+  return out.join('\n');
+}
+
+// ─── Lift trends / plateau detection ─────────────────────────────────────────
+
+const WEEK_MS = 7 * 24 * 3_600_000;
+
+function toolLiftTrends(args: { exercise?: string; weeks?: number }, ctx: WorkoutToolCtx): string {
+  const weeks = Math.max(4, Math.min(26, Math.round(args.weeks ?? 12)));
+  const since = Date.now() - weeks * WEEK_MS;
+
+  let exercises: Array<{ id: string; display_name: string }>;
+  if (args.exercise) {
+    const ex = resolveExercise(ctx.sql, args.exercise);
+    if (!ex) return `No exercise matching "${args.exercise}" in the catalog.`;
+    exercises = [{ id: ex.id, display_name: ex.display_name }];
+  } else {
+    exercises = ctx.sql
+      .exec<{ id: string; display_name: string }>(
+        `SELECT e.id, e.display_name
+         FROM sets s JOIN exercises e ON e.id = s.exercise_id
+         WHERE s.is_warmup = 0 AND s.weight_lbs IS NOT NULL AND s.logged_at >= ?
+         GROUP BY e.id ORDER BY COUNT(*) DESC LIMIT 5`,
+        since,
+      )
+      .toArray();
+  }
+  if (exercises.length === 0) return `No weighted working sets in the last ${weeks} weeks.`;
+
+  const lines: string[] = [];
+  for (const ex of exercises) {
+    const sets = ctx.sql
+      .exec<{ logged_at: number; weight_lbs: number; reps: number }>(
+        'SELECT logged_at, weight_lbs, reps FROM sets WHERE exercise_id = ? AND is_warmup = 0 AND weight_lbs IS NOT NULL AND logged_at >= ? ORDER BY logged_at ASC',
+        ex.id, since,
+      )
+      .toArray();
+    if (sets.length === 0) continue;
+
+    // Weekly best e1RM buckets (only weeks with data appear).
+    const byWeek = new Map<number, number>();
+    for (const s of sets) {
+      const bucket = Math.floor((s.logged_at - since) / WEEK_MS);
+      const e = epley1RM(s.weight_lbs, s.reps);
+      if (e > (byWeek.get(bucket) ?? 0)) byWeek.set(bucket, e);
+    }
+    const buckets = [...byWeek.entries()].sort((a, b) => a[0] - b[0]);
+    const series = buckets.map(([, e]) => Math.round(e));
+    const first = series[0]!;
+    const last = series[series.length - 1]!;
+    const delta = last - first;
+
+    // Plateau: trained regularly (3+ distinct days in the last 6 weeks) but
+    // the last 4 weeks never beat the prior best in the window.
+    const sixWeeksAgo = Date.now() - 6 * WEEK_MS;
+    const fourWeeksAgo = Date.now() - 4 * WEEK_MS;
+    const recentDays = new Set(
+      sets.filter((s) => s.logged_at >= sixWeeksAgo).map((s) => Math.floor(s.logged_at / 86_400_000)),
+    ).size;
+    const bestBefore = Math.max(0, ...sets.filter((s) => s.logged_at < fourWeeksAgo).map((s) => epley1RM(s.weight_lbs, s.reps)));
+    const bestRecent = Math.max(0, ...sets.filter((s) => s.logged_at >= fourWeeksAgo).map((s) => epley1RM(s.weight_lbs, s.reps)));
+    const plateau = recentDays >= 3 && bestBefore > 0 && bestRecent > 0 && bestRecent <= bestBefore;
+
+    lines.push(
+      `${ex.display_name}: e1RM ~${first} → ~${last} lbs (${delta >= 0 ? '+' : ''}${delta}) over ${weeks}w [weekly bests: ${series.join(', ')}]` +
+      (plateau ? ' ⚠️ PLATEAU — no new e1RM in 4+ weeks despite regular training; prescribe a change (deload week, rep-range switch, or volume bump).' : ''),
+    );
+  }
+  return lines.length > 0 ? lines.join('\n') : `No weighted working sets in the last ${weeks} weeks.`;
+}
+
+// ─── Niggles (first-class injuries with a lifecycle) ─────────────────────────
+
+export function loadActiveNiggles(sql: SqlStorage): NiggleRow[] {
+  return sql
+    .exec<NiggleRow>('SELECT * FROM niggles WHERE resolved_at IS NULL ORDER BY opened_at DESC')
+    .toArray();
+}
+
+function toolLogNiggle(args: { area: string; note?: string; avoid?: string }, ctx: WorkoutToolCtx): string {
+  const area = args.area?.trim().toLowerCase();
+  if (!area) return 'area is required.';
+  const existing = loadActiveNiggles(ctx.sql).find((n) => n.area === area);
+  if (existing) {
+    // Same area mentioned again — refresh the note rather than duplicating.
+    const note = args.note?.trim()
+      ? (existing.note ? `${existing.note}\n${args.note.trim()}` : args.note.trim())
+      : existing.note;
+    ctx.sql.exec(
+      'UPDATE niggles SET note = ?, avoid = COALESCE(?, avoid) WHERE id = ?',
+      note, args.avoid?.trim() || null, existing.id,
+    );
+    return `Updated active niggle [${existing.id}] (${area}). Keep programming around it.`;
+  }
+  const id = shortId('n');
+  ctx.sql.exec(
+    'INSERT INTO niggles (id, area, note, avoid, opened_at, resolved_at) VALUES (?, ?, ?, ?, ?, NULL)',
+    id, area, args.note?.trim() || null, args.avoid?.trim() || null, Date.now(),
+  );
+  return `Logged niggle [${id}]: ${area}${args.avoid ? ` — avoiding: ${args.avoid}` : ''}. Sessions will work around it until resolved.`;
+}
+
+function toolResolveNiggle(args: { id?: string; area?: string }, ctx: WorkoutToolCtx): string {
+  const active = loadActiveNiggles(ctx.sql);
+  if (active.length === 0) return 'No active niggles.';
+  let target: NiggleRow | undefined;
+  if (args.id) {
+    target = active.find((n) => n.id === args.id);
+    if (!target) return `No active niggle with id "${args.id}".`;
+  } else if (args.area) {
+    const q = args.area.trim().toLowerCase();
+    const matches = active.filter((n) => n.area.includes(q) || q.includes(n.area));
+    if (matches.length === 0) return `No active niggle matching "${args.area}". Active: ${active.map((n) => `${n.area} [${n.id}]`).join(', ')}.`;
+    if (matches.length > 1) return `Multiple matches: ${matches.map((n) => `${n.area} [${n.id}]`).join(', ')} — pass the id.`;
+    target = matches[0];
+  } else {
+    return `Pass id or area. Active: ${active.map((n) => `${n.area} [${n.id}]`).join(', ')}.`;
+  }
+  ctx.sql.exec('UPDATE niggles SET resolved_at = ? WHERE id = ?', Date.now(), target!.id);
+  const days = Math.round((Date.now() - target!.opened_at) / 86_400_000);
+  return `Resolved ${target!.area} after ${days} day(s). It no longer constrains session generation.`;
 }
 
 export interface WorkoutStats {

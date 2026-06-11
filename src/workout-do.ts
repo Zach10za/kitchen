@@ -89,12 +89,18 @@ export class WorkoutDO extends AgentDOBase<Env> {
       .toArray();
     const alarm = await this.ctx.storage.getAlarm();
     const hiatus = loadHiatus(this.sql);
+    const sessionPlans = this.sql
+      .exec('SELECT * FROM session_plans ORDER BY created_at DESC LIMIT 10')
+      .toArray();
+    const niggles = this.sql.exec('SELECT * FROM niggles ORDER BY opened_at DESC LIMIT 20').toArray();
     return {
       alarm_at: alarm,
       alarm_iso: alarm ? new Date(alarm).toISOString() : null,
       hiatus: hiatus
         ? { until_iso: new Date(hiatus.until).toISOString(), note: hiatus.note }
         : null,
+      session_plans: sessionPlans,
+      niggles,
       stats,
       recent_workouts: recentWorkouts,
       recent_sets: recentSets,
@@ -148,7 +154,7 @@ export class WorkoutDO extends AgentDOBase<Env> {
       // Weekly recap, but only while training is actually happening.
       if (gapDays > 14) return;
       await this.sendChat(
-        "It's the Monday training recap. Summarize last week from the logged data: sessions, working sets and tonnage vs the week before, any new PRs, and which muscle groups are lagging vs the rest over the last 2 weeks. Close with what this week should look like given the active program. Terse, numbers first.",
+        "It's the Monday training recap. Call lift_trends first, then summarize last week from the logged data: sessions, working sets and tonnage vs the week before, any new PRs, which muscle groups are lagging over the last 2 weeks, and each main lift's trend — flag any plateau WITH a concrete prescription (deload, rep-range switch, volume bump), never just 'you plateaued'. If an active niggle has been open 2+ weeks, ask whether it's cleared. Close with the plan for this week. Terse, numbers first.",
       );
       return;
     }
@@ -160,7 +166,7 @@ export class WorkoutDO extends AgentDOBase<Env> {
     // Stamp BEFORE the network call so a Discord outage can't double-nudge.
     setSetting(this.sql, SETTING_LAST_NUDGE_AT, String(now));
     await this.sendChat(
-      `It's been ${gapDays} days since the user's last logged session. Nudge them with a concrete suggestion for today: pick the routine or movements that fit the active program, what's least recently trained, their health notes, and their equipment. Include target sets x reps @ weight from history. 2-4 lines max — an invitation, not a guilt trip. If they're actually on a break, remind them they can say so and you'll record it (set_hiatus) and stop nudging.`,
+      `It's been ${gapDays} days since the user's last logged session. Generate today's session for them per SESSION GENERATION (history, lagging volume, active niggles, equipment), save it with plan_session, and present the SESSION CARD — lead with one inviting line, not a guilt trip. Remind them they can just say "done" afterward, and that if they're actually on a break they can say so (set_hiatus) and you'll stop nudging.`,
     );
   }
 
