@@ -2,43 +2,53 @@ import type { Env } from './env';
 import type { Interaction } from './discord/types';
 import { EmbedColor } from './discord/types';
 import { runPantryFlow } from './agent/loop';
-import { loadDayDecision } from './agent/context';
+import { loadDayDecision, loadUnratedRecentCooked } from './agent/context';
 import { statusEmbed } from './agent/render';
-import { nextDailyTime, todayISO } from './util/datetime';
+import { nextDailyTime, todayISO, localDateAtHour } from './util/datetime';
 import { captureError } from './error-triage';
 import { AgentDOBase } from './runtime/agent-do-base';
 import { dispatchChat } from './runtime/bot-registry';
 import { KITCHEN_SPEC } from './kitchen/spec';
 
+/** Fire-tolerance for the daily suggestion: the alarm may wake a hair early
+ *  or be woken by a reminder shortly before suggest time. */
+const SUGGEST_TOLERANCE_MS = 60_000;
+
 /**
  * KitchenDO holds all household state. Universal chat IO lives in
  * `AgentDOBase`; kitchen-only concerns here are:
  *
- *  - Daily suggestion alarm (`alarm()` + `armNextSuggest()` + `ensureAlarmSet()`)
- *  - Defrost reminder scheduling (in agent/loop.ts) + dispatch (here)
+ *  - The multiplexed alarm: one DO alarm slot serves BOTH the daily
+ *    suggestion ping and minute-precise defrost/prep reminders. Each wake
+ *    dispatches whatever is due, then re-arms to the earliest next event.
+ *    (Reminders used to ride the hourly cron, so a "pull the fish at 5:40"
+ *    reminder could land at 6:00. The cron heartbeat remains as a safety
+ *    net that re-arms the alarm.)
  *  - The fast in-process `/pantry message: …` flow that bypasses the chat
- *    workflow because it doesn't need conversation history
+ *    workflow because it doesn't need conversation history.
  *
- * Everything else (/cook, /now, /profile, /chat) routes through the unified
- * AgentChatWorkflow via `dispatchChatInteraction`, exactly like the other bots.
+ * Everything else (/cook, /now, /profile, /chat, /grocery) routes through the
+ * unified AgentChatWorkflow via `dispatchChatInteraction`, like the other bots.
  */
 export class KitchenDO extends AgentDOBase<Env> {
   protected getSpec() { return KITCHEN_SPEC; }
 
   protected async onHeartbeat(): Promise<void> {
-    await this.ensureAlarmSet();
+    // Recompute (not just ensure) so reminders scheduled since the last arm
+    // pull the wake time earlier. Also dispatches anything already overdue.
     await this.dispatchDueReminders();
+    await this.armNextWake();
   }
 
   protected async onReset(): Promise<void> {
     // Base already dropped user data; re-arm the daily alarm so it isn't lost.
     await this.ctx.storage.deleteAlarm();
-    await this.armNextSuggest();
+    await this.armNextWake();
   }
 
   protected async handleCustomRoute(_request: Request, url: URL): Promise<Response | null> {
     if (url.pathname === '/ensure-alarm') {
-      await this.ensureAlarmSet();
+      await this.armNextWake();
       return new Response('ok');
     }
     return null;
@@ -50,9 +60,9 @@ export class KitchenDO extends AgentDOBase<Env> {
       (interaction.data?.options ?? []).map((o) => [o.name, o.value]),
     );
 
-    // Read-only commands (/pantry, /profile, /reminders with no message) are
-    // short-circuited via /fast-read in the Worker; by here we're on a path
-    // that mutates state or needs the LLM.
+    // Read-only commands (/pantry, /profile, /reminders, /grocery, /cookbook
+    // with no message) are short-circuited via /fast-read in the Worker; by
+    // here we're on a path that mutates state or needs the LLM.
 
     // /pantry with a message — single LLM extraction call instead of the full
     // chat loop. ~1-2s vs ~5-10s.
@@ -101,10 +111,15 @@ export class KitchenDO extends AgentDOBase<Env> {
           hour: 'numeric', minute: '2-digit', hour12: true,
         });
         return {
-          userMessage: `Right now it is **${nowLocal}** (${this.env.TIMEZONE}). If I've already decided on a meal for today, tell me concretely what I should be doing in the kitchen right now (timing, next step). If I haven't decided yet, suggest 2-3 options for tonight based on what I have.`,
+          userMessage: `Right now it is **${nowLocal}** (${this.env.TIMEZONE}). If I've already decided on a meal for today, give me the back-planned cook-along timeline from now to dinner (clock times, next checkpoint first). If I haven't decided yet, suggest 2-3 options for tonight based on what I have.`,
           titleSeed: 'what to cook now',
         };
       }
+      case 'grocery':
+        return {
+          userMessage: `Update my grocery list: ${message}`,
+          titleSeed: `grocery: ${message}`,
+        };
       case 'profile':
         return {
           userMessage: `The user is updating their cooking profile. Their input, VERBATIM:\n\n"""\n${message}\n"""\n\nCall update_profile. Preserve every detail and the user's wording. If a profile already exists, merge intelligently — never drop information. Organize into clear Markdown sections (## Equipment, ## Dietary, ## Cuisines, ## Style, ## Time, etc.). Do not paraphrase or summarize.`,
@@ -118,8 +133,9 @@ export class KitchenDO extends AgentDOBase<Env> {
   }
 
   protected async customDump(): Promise<Record<string, unknown>> {
-    const meals = this.sql.exec('SELECT id, date, name, cuisine, status, created_at FROM meals ORDER BY date DESC, id DESC LIMIT 30').toArray();
+    const meals = this.sql.exec('SELECT id, date, name, cuisine, protein, effort, status, rating, cook_notes, created_at FROM meals ORDER BY date DESC, id DESC LIMIT 30').toArray();
     const pantry = this.sql.exec('SELECT * FROM pantry ORDER BY added_at DESC').toArray();
+    const grocery = this.sql.exec('SELECT * FROM grocery ORDER BY added_at ASC').toArray();
     const prefs = this.sql.exec('SELECT id, insight, weight, learned_at FROM preferences ORDER BY weight DESC, learned_at DESC').toArray();
     const reminders = this.sql.exec('SELECT id, due_at, type, day, sent_at, message FROM reminders ORDER BY due_at DESC').toArray();
     const settings = this.sql.exec("SELECT key, length(value) as len, substr(value, 1, 500) as preview, updated_at FROM settings").toArray();
@@ -128,7 +144,7 @@ export class KitchenDO extends AgentDOBase<Env> {
     return {
       alarm_at: alarm,
       alarm_iso: alarm ? new Date(alarm).toISOString() : null,
-      meals, pantry, prefs, reminders, settings,
+      meals, pantry, grocery, prefs, reminders, settings,
       recent_conversation: recentConv,
     };
   }
@@ -136,49 +152,102 @@ export class KitchenDO extends AgentDOBase<Env> {
   // ─── Kitchen-only API surface ──────────────────────────────────────────
 
   /**
-   * Daily suggestion alarm. Fires at SUGGEST_HOUR_LOCAL. Posts 2-3 dinner
-   * options into the channel — UNLESS the user has already decided today
-   * (picked a meal or declared a no-cook night). Always re-arms for tomorrow.
+   * Multiplexed alarm: dispatch any due reminders, fire the daily suggestion
+   * if its time has arrived (at most once per day, gated by a settings
+   * stamp), then re-arm to the earliest next event.
    */
   async alarm(): Promise<void> {
     try {
-      const decided = loadDayDecision(this.sql, todayISO(this.env.TIMEZONE));
-      if (decided.length > 0) {
-        // The user already settled tonight — stay quiet.
-        return;
-      }
-      await dispatchChat(
-        this.env,
-        'kitchen',
-        "It's the daily dinner check-in. Suggest 2-3 dinner options for tonight based on my pantry, freezer (prioritize items that are aging), preferences, and recent meals — vary it from what I've had lately. Add a short 'need to buy' line for anything missing. Keep it brief; I haven't decided yet.",
-        this.env.DISCORD_CHANNEL_ID,
-        { column: 'thread_id', value: this.env.DISCORD_CHANNEL_ID },
-      );
+      await this.dispatchDueReminders();
+      await this.maybeSendDailySuggest();
     } catch (err) {
       // Don't let a thrown alarm cancel the next one — captureError + rearm.
       console.error('kitchen alarm failed', err);
       await captureError(this.env, err, { source: 'kitchen:alarm' });
     } finally {
-      await this.armNextSuggest();
+      await this.armNextWake();
     }
   }
 
-  async ensureAlarmSet(): Promise<void> {
-    const current = await this.ctx.storage.getAlarm();
-    if (current === null) {
-      await this.armNextSuggest();
+  /**
+   * Daily suggestion ping at SUGGEST_HOUR_LOCAL — UNLESS the user has already
+   * decided today (picked a meal or declared a no-cook night). If a recent
+   * cooked meal is still unrated, the ping first asks how it went, feeding
+   * the house repertoire.
+   */
+  private async maybeSendDailySuggest(): Promise<void> {
+    const today = todayISO(this.env.TIMEZONE);
+    const suggestAt = localDateAtHour(today, this.suggestHour(), this.env.TIMEZONE);
+    if (Date.now() < suggestAt - SUGGEST_TOLERANCE_MS) return; // woke for a reminder
+    if (this.getSetting('last_suggest_day') === today) return; // already pinged today
+
+    // Stamp BEFORE dispatching so a Discord outage can't double-ping.
+    this.setSetting('last_suggest_day', today);
+
+    const decided = loadDayDecision(this.sql, today);
+    if (decided.length > 0) {
+      // The user already settled tonight — stay quiet.
+      return;
     }
+
+    const unrated = loadUnratedRecentCooked(this.sql, this.env.TIMEZONE);
+    const ratingAsk = unrated
+      ? ` Also: the ${unrated.name} from ${unrated.date} hasn't been rated yet — start by briefly asking how it went (then record with rate_meal), before the options.`
+      : '';
+    await dispatchChat(
+      this.env,
+      'kitchen',
+      `It's the daily dinner check-in. Suggest 2-3 dinner options for tonight based on my pantry, freezer (prioritize items that are aging), preferences, repertoire, and recent meals — vary it from what I've had lately. Add a short 'need to buy' line for anything missing. Keep it brief; I haven't decided yet.${ratingAsk}`,
+      this.env.DISCORD_CHANNEL_ID,
+      { column: 'thread_id', value: this.env.DISCORD_CHANNEL_ID },
+    );
   }
 
-  private async armNextSuggest(): Promise<void> {
-    const hour = Number(this.env.SUGGEST_HOUR_LOCAL) || 12;
-    const next = nextDailyTime(hour, this.env.TIMEZONE);
-    await this.ctx.storage.setAlarm(next.getTime());
+  private suggestHour(): number {
+    return Number(this.env.SUGGEST_HOUR_LOCAL) || 12;
+  }
+
+  /** Arm the single DO alarm to the earliest of: next daily suggest, earliest
+   *  unsent future reminder. Idempotent — recomputed on every wake/heartbeat. */
+  private async armNextWake(): Promise<void> {
+    const today = todayISO(this.env.TIMEZONE);
+    let nextSuggest = nextDailyTime(this.suggestHour(), this.env.TIMEZONE).getTime();
+    if (this.getSetting('last_suggest_day') === today) {
+      // Already pinged today; if nextDailyTime still points at today (e.g. the
+      // ping fired early in the tolerance window), push to tomorrow.
+      const todaySuggest = localDateAtHour(today, this.suggestHour(), this.env.TIMEZONE);
+      if (nextSuggest <= todaySuggest) nextSuggest = todaySuggest + 24 * 3_600_000;
+    }
+
+    const nextReminder = this.sql
+      .exec<{ due_at: number }>(
+        'SELECT due_at FROM reminders WHERE sent_at IS NULL AND due_at > ? ORDER BY due_at ASC LIMIT 1',
+        Date.now(),
+      )
+      .toArray()[0]?.due_at;
+
+    const next = nextReminder != null ? Math.min(nextSuggest, nextReminder) : nextSuggest;
+    await this.ctx.storage.setAlarm(next);
+  }
+
+  private getSetting(key: string): string | null {
+    const row = this.sql
+      .exec<{ value: string }>('SELECT value FROM settings WHERE key = ?', key)
+      .toArray()[0];
+    return row?.value ?? null;
+  }
+
+  private setSetting(key: string, value: string): void {
+    this.sql.exec(
+      'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at',
+      key, value, Date.now(),
+    );
   }
 
   /**
    * Send any reminders whose due_at has passed and that haven't been sent.
-   * Called from the hourly cron heartbeat.
+   * Called from both the multiplexed alarm (minute-precise) and the hourly
+   * cron heartbeat (safety net).
    */
   private async dispatchDueReminders(): Promise<void> {
     const now = Date.now();

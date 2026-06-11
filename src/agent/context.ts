@@ -4,7 +4,7 @@
  * household state — keeping the queries here means the two paths can't drift.
  */
 
-import type { Meal, MealRow, PantryItem, PreferenceRow } from './tools';
+import type { GroceryRow, Meal, MealRow, PantryItem, PreferenceRow, RecipeExtras } from './tools';
 import { buildSystemPrompt } from './prompts';
 import { todayISO } from '../util/datetime';
 
@@ -12,6 +12,20 @@ export interface RecentMeal {
   date: string;
   name: string;
   cuisine: string;
+  protein: string;
+  effort: string;
+  rating: number | null;
+}
+
+/** One dish in the house repertoire: rated at least once, deduped by name,
+ *  carrying the latest rating and accumulated next-time notes. */
+export interface RepertoireDish {
+  name: string;
+  cuisine: string;
+  rating: number;
+  timesCooked: number;
+  lastDate: string;
+  notes: string | null;
 }
 
 export interface AgentContext {
@@ -19,6 +33,8 @@ export interface AgentContext {
   preferences: PreferenceRow[];
   pantry: PantryItem[];
   recentMeals: RecentMeal[];
+  repertoire: RepertoireDish[];
+  grocery: GroceryRow[];
   profile: string | null;
 }
 
@@ -44,7 +60,22 @@ export function parseMeal(row: MealRow): Meal {
     requires_defrost: safeArray(row.requires_defrost_json),
     status: row.status,
     created_at: row.created_at,
+    protein: row.protein ?? null,
+    effort: row.effort ?? null,
+    extras: parseExtras(row.extras_json),
+    rating: row.rating ?? null,
+    cook_notes: row.cook_notes ?? null,
   };
+}
+
+export function parseExtras(json: string | null): RecipeExtras {
+  if (!json) return {};
+  try {
+    const v = JSON.parse(json);
+    return v && typeof v === 'object' ? (v as RecipeExtras) : {};
+  } catch {
+    return {};
+  }
 }
 
 /** All decisions recorded for a given date (usually 0 or 1). A non-empty
@@ -68,6 +99,10 @@ export function loadPantry(sql: SqlStorage): PantryItem[] {
   return sql.exec<PantryItem>('SELECT * FROM pantry ORDER BY added_at DESC').toArray();
 }
 
+export function loadGrocery(sql: SqlStorage): GroceryRow[] {
+  return sql.exec<GroceryRow>('SELECT * FROM grocery ORDER BY added_at ASC').toArray();
+}
+
 export function loadProfile(sql: SqlStorage): string | null {
   const row = sql
     .exec<{ value: string }>("SELECT value FROM settings WHERE key = 'cooking_profile'")
@@ -76,8 +111,9 @@ export function loadProfile(sql: SqlStorage): string | null {
 }
 
 /**
- * Recently cooked or planned dishes, used to discourage repetition. No-cook
- * ('out') and skipped rows are excluded — they aren't dishes.
+ * Recently cooked or planned dishes, used to discourage repetition and to
+ * rotate protein/effort, not just dish names. No-cook ('out') and skipped
+ * rows are excluded — they aren't dishes.
  */
 export function loadRecentMeals(sql: SqlStorage, limit = 12): RecentMeal[] {
   return sql
@@ -86,7 +122,66 @@ export function loadRecentMeals(sql: SqlStorage, limit = 12): RecentMeal[] {
       limit
     )
     .toArray()
-    .map((r) => ({ date: r.date, name: r.name ?? '', cuisine: r.cuisine ?? '' }));
+    .map((r) => ({
+      date: r.date,
+      name: r.name ?? '',
+      cuisine: r.cuisine ?? '',
+      protein: r.protein ?? '',
+      effort: r.effort ?? '',
+      rating: r.rating ?? null,
+    }));
+}
+
+/**
+ * The house repertoire: cooked-and-rated dishes, deduped by name (latest
+ * cook wins for rating/notes), best-rated first. This is the user's personal
+ * cookbook — the prompt serves these back with their notes applied.
+ */
+export function loadRepertoire(sql: SqlStorage, limit = 10): RepertoireDish[] {
+  const rows = sql
+    .exec<MealRow>(
+      "SELECT * FROM meals WHERE status = 'cooked' AND name IS NOT NULL ORDER BY date DESC, id DESC LIMIT 200",
+    )
+    .toArray();
+
+  const byName = new Map<string, { rows: MealRow[] }>();
+  for (const r of rows) {
+    const key = (r.name ?? '').trim().toLowerCase();
+    if (!key) continue;
+    (byName.get(key) ?? byName.set(key, { rows: [] }).get(key)!).rows.push(r);
+  }
+
+  const dishes: RepertoireDish[] = [];
+  for (const { rows: cooks } of byName.values()) {
+    // cooks are date-desc; take the latest non-null rating and notes.
+    const rating = cooks.find((c) => c.rating != null)?.rating ?? null;
+    if (rating == null) continue; // unrated dishes aren't repertoire yet
+    const notes = cooks.find((c) => c.cook_notes)?.cook_notes ?? null;
+    const latest = cooks[0]!;
+    dishes.push({
+      name: latest.name!,
+      cuisine: latest.cuisine ?? '',
+      rating,
+      timesCooked: cooks.length,
+      lastDate: latest.date,
+      notes,
+    });
+  }
+  dishes.sort((a, b) => b.rating - a.rating || (a.lastDate < b.lastDate ? 1 : -1));
+  return dishes.slice(0, limit);
+}
+
+/** The most recent cooked-but-unrated meal within the last few days — the
+ *  daily ping uses this to ask "how was it?" exactly once, while it's fresh. */
+export function loadUnratedRecentCooked(sql: SqlStorage, timezone: string): MealRow | null {
+  const today = todayISO(timezone);
+  const row = sql
+    .exec<MealRow>(
+      "SELECT * FROM meals WHERE status = 'cooked' AND name IS NOT NULL AND rating IS NULL AND cook_notes IS NULL AND date < ? AND date >= date(?, '-3 days') ORDER BY date DESC, id DESC LIMIT 1",
+      today, today,
+    )
+    .toArray()[0];
+  return row ?? null;
 }
 
 export function loadContext(sql: SqlStorage, timezone: string): AgentContext {
@@ -95,6 +190,8 @@ export function loadContext(sql: SqlStorage, timezone: string): AgentContext {
     preferences: loadPreferences(sql),
     pantry: loadPantry(sql),
     recentMeals: loadRecentMeals(sql),
+    repertoire: loadRepertoire(sql),
+    grocery: loadGrocery(sql),
     profile: loadProfile(sql),
   };
 }
@@ -125,9 +222,10 @@ function currentNowFor(timezone: string): { iso: string; localFormatted: string;
   return { iso: date.toISOString(), localFormatted, dayKey };
 }
 
-export function buildSystemPromptFor(sql: SqlStorage, timezone: string): string {
+export function buildSystemPromptFor(sql: SqlStorage, timezone: string, dinnerHourLocal: number): string {
   return buildSystemPrompt({
     ...loadContext(sql, timezone),
     now: currentNowFor(timezone),
+    dinnerHourLocal,
   });
 }

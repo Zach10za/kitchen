@@ -4,11 +4,12 @@ import type {
   DefrostEntry,
   MealRow,
   PantryItem,
+  RecipeExtras,
   RecipeIngredient,
 } from './tools';
 import { EmbedColor } from '../discord/types';
-import { loadDayDecision, loadPantry, loadProfile, loadRecentMeals } from './context';
-import type { ToolResult } from '../runtime/agent-round';
+import { loadDayDecision, loadGrocery, loadPantry, loadProfile, loadRecentMeals, parseExtras } from './context';
+import type { RoundUsage, ToolResult } from '../runtime/agent-round';
 import type { DiscordAPI } from '../discord/api';
 import { makeOpenAIClient } from '../runtime/openai';
 import { extractUsageFromResponse, recordUsage, costFooter } from '../runtime/usage';
@@ -17,20 +18,24 @@ import { todayISO, localDateAtHour } from '../util/datetime';
 export interface ToolCtx { env: Env; sql: SqlStorage; client: OpenAI }
 
 const INSERT_MEAL_SQL =
-  'INSERT INTO meals (date, name, cuisine, description, ingredients_json, steps_json, requires_defrost_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)';
+  'INSERT INTO meals (date, name, cuisine, description, ingredients_json, steps_json, requires_defrost_json, status, created_at, protein, effort, extras_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
 
 /**
  * Tool dispatch for the kitchen bot. Invoked by the unified AgentChatWorkflow
- * via `KITCHEN_SPEC.executeTool`. All tools here are pure SQL (the shared
+ * via `KITCHEN_SPEC.executeTool`. Mostly pure SQL; the cooked-meal paths may
+ * make one extract-model call to reconcile mismatched pantry units (the shared
  * `web_search` tool is executed centrally in AgentDOBase, not here).
  */
-export function executeTool(name: string, args: any, ctx: ToolCtx): ToolResult {
+export async function executeTool(name: string, args: any, ctx: ToolCtx): Promise<ToolResult> {
   try {
     switch (name) {
-      case 'log_meal':          return toolLogMeal(args, ctx);
+      case 'log_meal':          return await toolLogMeal(args, ctx);
       case 'set_no_cook':       return toolSetNoCook(args, ctx);
-      case 'mark_meal_cooked':  return toolMarkMealCooked(args, ctx);
+      case 'mark_meal_cooked':  return await toolMarkMealCooked(args, ctx);
       case 'mark_meal_skipped': return toolMarkMealSkipped(args, ctx);
+      case 'rate_meal':         return toolRateMeal(args, ctx);
+      case 'find_recipes':      return toolFindRecipes(args, ctx);
+      case 'update_grocery':    return toolUpdateGrocery(args, ctx);
       case 'update_pantry':     return toolUpdatePantry(args, ctx);
       case 'record_preference': return toolRecordPreference(args, ctx);
       case 'update_profile':    return toolUpdateProfile(args, ctx);
@@ -50,18 +55,34 @@ interface LogMealArgs {
   name: string;
   cuisine?: string;
   description?: string;
+  protein?: string;
+  effort?: string;
+  headnote?: string;
   ingredients?: RecipeIngredient[];
   steps?: string[];
+  finishing?: string;
+  variations?: string[];
+  keeps?: string;
+  pairing?: string;
   requires_defrost?: DefrostEntry[];
   status?: 'planned' | 'cooked';
 }
 
-function toolLogMeal(args: LogMealArgs, ctx: ToolCtx): string {
+const VALID_EFFORT = new Set(['quick', 'standard', 'project']);
+
+async function toolLogMeal(args: LogMealArgs, ctx: ToolCtx): Promise<ToolResult> {
   const date = args.date || todayISO(ctx.env.TIMEZONE);
   const status: 'planned' | 'cooked' = args.status === 'cooked' ? 'cooked' : 'planned';
   const ingredients = args.ingredients ?? [];
   const steps = args.steps ?? [];
   const defrost = args.requires_defrost ?? [];
+
+  const extras: RecipeExtras = {};
+  if (args.headnote) extras.headnote = args.headnote;
+  if (args.finishing) extras.finishing = args.finishing;
+  if (args.variations?.length) extras.variations = args.variations;
+  if (args.keeps) extras.keeps = args.keeps;
+  if (args.pairing) extras.pairing = args.pairing;
 
   // A day holds at most one open decision — replace any prior planned/out/skipped
   // row for this date (the user changed their mind). Cooked rows are history; keep them.
@@ -78,11 +99,15 @@ function toolLogMeal(args: LogMealArgs, ctx: ToolCtx): string {
     JSON.stringify(defrost),
     status,
     Date.now(),
+    args.protein?.trim().toLowerCase() || null,
+    VALID_EFFORT.has(args.effort ?? '') ? args.effort! : null,
+    Object.keys(extras).length > 0 ? JSON.stringify(extras) : null,
   );
 
   if (status === 'cooked') {
-    const consumed = decrementPantryForMeal(ctx.sql, ingredients);
-    return `Logged ${args.name} as cooked for ${date}. Decremented from pantry: ${consumed.join(', ') || '(nothing)'}.`;
+    const { consumed, usage } = await decrementPantryForMeal(ctx.sql, ingredients, ctx);
+    const output = `Logged ${args.name} as cooked for ${date}. Decremented from pantry: ${consumed.join(', ') || '(nothing)'}.`;
+    return usage ? { output, usage } : output;
   }
 
   const scheduled = scheduleDefrostReminders(ctx, date, args.name, defrost);
@@ -95,22 +120,167 @@ function toolSetNoCook(args: { date?: string; reason?: string }, ctx: ToolCtx): 
   cancelReminders(ctx.sql, date);
   ctx.sql.exec(
     INSERT_MEAL_SQL,
-    date, null, null, args.reason ?? null, null, null, null, 'out', Date.now(),
+    date, null, null, args.reason ?? null, null, null, null, 'out', Date.now(), null, null, null,
   );
   const when = date === todayISO(ctx.env.TIMEZONE) ? 'today' : `on ${date}`;
   return `Got it — no cooking ${when}${args.reason ? ` (${args.reason})` : ''}. I'll stay quiet.`;
 }
 
-function toolMarkMealCooked(args: { date?: string }, ctx: ToolCtx): string {
+async function toolMarkMealCooked(args: { date?: string }, ctx: ToolCtx): Promise<ToolResult> {
   const date = args.date || todayISO(ctx.env.TIMEZONE);
   const row = plannedMealFor(ctx.sql, date);
   if (!row) {
     return `No planned meal for ${date} to mark cooked. If you made something, tell me what and I'll log it.`;
   }
   ctx.sql.exec("UPDATE meals SET status = 'cooked' WHERE id = ?", row.id);
-  const consumed = decrementPantryForMeal(ctx.sql, parseIngredients(row.ingredients_json));
+  const { consumed, usage } = await decrementPantryForMeal(ctx.sql, parseIngredients(row.ingredients_json), ctx);
   cancelReminders(ctx.sql, date);
-  return `Marked ${row.name ?? "today's meal"} cooked. Decremented from pantry: ${consumed.join(', ') || '(nothing)'}.`;
+  const output = `Marked ${row.name ?? "today's meal"} cooked. Decremented from pantry: ${consumed.join(', ') || '(nothing)'}. If the user shares how it turned out, record it with rate_meal.`;
+  return usage ? { output, usage } : output;
+}
+
+// ─── repertoire: ratings, notes, recipe search ──────────────────────────────
+
+function toolRateMeal(args: { date?: string; rating?: number; notes?: string }, ctx: ToolCtx): string {
+  const rating = args.rating != null ? Math.round(Math.max(1, Math.min(10, args.rating))) : null;
+  const notes = args.notes?.trim() || null;
+  if (rating == null && !notes) return 'Nothing to record — pass a rating and/or notes.';
+
+  const row = args.date
+    ? ctx.sql.exec<MealRow>(
+        "SELECT * FROM meals WHERE date = ? AND status = 'cooked' AND name IS NOT NULL ORDER BY id DESC LIMIT 1",
+        args.date,
+      ).toArray()[0]
+    : ctx.sql.exec<MealRow>(
+        "SELECT * FROM meals WHERE status = 'cooked' AND name IS NOT NULL ORDER BY date DESC, id DESC LIMIT 1",
+      ).toArray()[0];
+  if (!row) {
+    return args.date
+      ? `No cooked meal found on ${args.date}.`
+      : 'No cooked meals logged yet — nothing to rate.';
+  }
+
+  // Notes accumulate across feedback rounds; they're the "next time" margin
+  // scribbles that make a re-cook serve the user's own version.
+  const mergedNotes = notes
+    ? (row.cook_notes ? `${row.cook_notes}\n${notes}` : notes)
+    : row.cook_notes;
+  ctx.sql.exec(
+    'UPDATE meals SET rating = COALESCE(?, rating), cook_notes = ? WHERE id = ?',
+    rating, mergedNotes, row.id,
+  );
+
+  const bits: string[] = [];
+  if (rating != null) bits.push(`${rating}/10`);
+  if (notes) bits.push(`note saved: "${notes}"`);
+  return `Recorded for ${row.name} (${row.date}): ${bits.join(', ')}. This feeds the house cookbook — next time they make it, apply the notes.`;
+}
+
+function toolFindRecipes(args: { query: string; limit?: number }, ctx: ToolCtx): string {
+  const q = `%${(args.query ?? '').trim().toLowerCase()}%`;
+  if (q === '%%') return 'Pass a dish name or fragment to search for.';
+  const limit = Math.max(1, Math.min(10, args.limit ?? 5));
+  const rows = ctx.sql
+    .exec<MealRow>(
+      "SELECT * FROM meals WHERE name IS NOT NULL AND LOWER(name) LIKE ? AND status IN ('cooked', 'planned') ORDER BY (rating IS NULL) ASC, rating DESC, date DESC LIMIT ?",
+      q, limit,
+    )
+    .toArray();
+  if (rows.length === 0) return `No saved recipes match "${args.query}".`;
+
+  const lines = rows.map((r) => {
+    const rating = r.rating != null ? ` — rated ${r.rating}/10` : '';
+    const notes = r.cook_notes ? ` — next time: ${r.cook_notes.split('\n').join('; ')}` : '';
+    return `- [${r.date}] ${r.name} (${r.status})${rating}${notes}`;
+  });
+
+  // Full saved page for the best match so the model can serve it back
+  // (with the user's notes applied) without another lookup.
+  const best = rows[0]!;
+  const ingredients = parseIngredients(best.ingredients_json);
+  const steps = parseSteps(best.steps_json);
+  const extras = parseExtras(best.extras_json);
+  const detail = [
+    '',
+    `FULL RECIPE — ${best.name} (${best.date}):`,
+    extras.headnote ? `Headnote: ${extras.headnote}` : '',
+    `Ingredients: ${ingredients.map((i) => `${i.qty} ${i.item}`).join('; ') || '(none saved)'}`,
+    `Steps: ${steps.map((s, i) => `${i + 1}) ${s}`).join(' ') || '(none saved)'}`,
+    extras.finishing ? `To finish: ${extras.finishing}` : '',
+    extras.variations?.length ? `Riffs: ${extras.variations.join(' | ')}` : '',
+    extras.keeps ? `Keeps: ${extras.keeps}` : '',
+    extras.pairing ? `Pairing: ${extras.pairing}` : '',
+    best.cook_notes ? `User's next-time notes (APPLY THESE if re-making): ${best.cook_notes.split('\n').join('; ')}` : '',
+  ].filter(Boolean);
+
+  return `${rows.length} match(es):\n${lines.join('\n')}\n${detail.join('\n')}`;
+}
+
+// ─── grocery list ────────────────────────────────────────────────────────────
+
+interface GroceryItemArg {
+  name: string;
+  qty?: string;
+  for_dish?: string;
+  location?: 'freezer' | 'fridge' | 'shelf';
+}
+
+function toolUpdateGrocery(
+  args: { action: 'add' | 'remove' | 'bought' | 'clear'; items?: GroceryItemArg[] },
+  ctx: ToolCtx,
+): string {
+  const items = (args.items ?? []).filter((i) => i.name?.trim());
+
+  if (args.action === 'clear') {
+    ctx.sql.exec('DELETE FROM grocery');
+    return 'Cleared the grocery list (pantry untouched).';
+  }
+
+  if (args.action === 'add') {
+    if (items.length === 0) return 'Nothing to add — pass items.';
+    for (const item of items) {
+      ctx.sql.exec(
+        'INSERT INTO grocery (name, qty, for_dish, location, added_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET qty=excluded.qty, for_dish=COALESCE(excluded.for_dish, grocery.for_dish), location=excluded.location, added_at=excluded.added_at',
+        item.name.trim().toLowerCase(), item.qty ?? null, item.for_dish ?? null, item.location ?? null, Date.now(),
+      );
+    }
+    const total = loadGrocery(ctx.sql).length;
+    return `Added to grocery list: ${items.map((i) => i.name).join(', ')}. List now has ${total} item(s).`;
+  }
+
+  if (args.action === 'remove') {
+    if (items.length === 0) return 'Nothing to remove — pass items.';
+    for (const item of items) {
+      ctx.sql.exec('DELETE FROM grocery WHERE name = ?', item.name.trim().toLowerCase());
+    }
+    return `Removed from grocery list: ${items.map((i) => i.name).join(', ')}.`;
+  }
+
+  // bought: move named items (or the whole list) into the pantry.
+  const listed = loadGrocery(ctx.sql);
+  const targets: Array<{ name: string; qty: string | null; location: string }> =
+    items.length > 0
+      ? items.map((i) => {
+          const row = listed.find((g) => g.name === i.name.trim().toLowerCase());
+          return {
+            name: i.name.trim().toLowerCase(),
+            qty: i.qty ?? row?.qty ?? null,
+            location: i.location ?? row?.location ?? 'shelf',
+          };
+        })
+      : listed.map((g) => ({ name: g.name, qty: g.qty, location: g.location ?? 'shelf' }));
+  if (targets.length === 0) return 'Grocery list is already empty — nothing to mark bought.';
+
+  for (const t of targets) {
+    const parsed = t.qty ? parseQty(t.qty) : null;
+    ctx.sql.exec(
+      'INSERT INTO pantry (name, qty, qty_value, qty_unit, location, added_at) VALUES (?, NULL, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET qty_value=excluded.qty_value, qty_unit=excluded.qty_unit, location=excluded.location, added_at=excluded.added_at',
+      t.name, parsed?.value ?? null, parsed?.unit ?? null, t.location, Date.now(),
+    );
+    ctx.sql.exec('DELETE FROM grocery WHERE name = ?', t.name);
+  }
+  const remaining = loadGrocery(ctx.sql).length;
+  return `Moved to pantry: ${targets.map((t) => t.name).join(', ')}.${remaining > 0 ? ` ${remaining} item(s) still on the list.` : ' Grocery list is now empty.'}`;
 }
 
 function toolMarkMealSkipped(args: { date?: string }, ctx: ToolCtx): string {
@@ -222,6 +392,7 @@ function toolShowState(ctx: ToolCtx): string {
   const today = loadDayDecision(ctx.sql, todayISO(tz));
   const recent = loadRecentMeals(ctx.sql, 8);
   const pantry = loadPantry(ctx.sql);
+  const grocery = loadGrocery(ctx.sql);
 
   const todayLine = today.length
     ? today.map((m) => m.status === 'out'
@@ -230,7 +401,10 @@ function toolShowState(ctx: ToolCtx): string {
     : 'nothing decided yet';
   const recentLine = recent.length ? recent.map((m) => `${m.date}: ${m.name}`).join('; ') : 'none';
   const pantryLine = pantry.length ? pantry.map((p) => p.name).join(', ') : 'empty';
-  return `Today: ${todayLine}.\nRecent meals: ${recentLine}.\nPantry: ${pantryLine}.`;
+  const groceryLine = grocery.length
+    ? grocery.map((g) => `${g.qty ? g.qty + ' ' : ''}${g.name}`).join(', ')
+    : 'empty';
+  return `Today: ${todayLine}.\nRecent meals: ${recentLine}.\nPantry: ${pantryLine}.\nGrocery list: ${groceryLine}.`;
 }
 
 // ─── shared helpers ─────────────────────────────────────────────────────────
@@ -255,6 +429,16 @@ function parseIngredients(json: string | null): RecipeIngredient[] {
   try {
     const v = JSON.parse(json);
     return Array.isArray(v) ? (v as RecipeIngredient[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseSteps(json: string | null): string[] {
+  if (!json) return [];
+  try {
+    const v = JSON.parse(json);
+    return Array.isArray(v) ? (v as string[]) : [];
   } catch {
     return [];
   }
@@ -291,15 +475,47 @@ function scheduleDefrostReminders(
   return count;
 }
 
+/** Schema for the unit-mismatch reconciliation call in decrementPantryForMeal. */
+const DECREMENT_SCHEMA = {
+  type: 'object',
+  properties: {
+    updates: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Pantry item name, exactly as given' },
+          remaining_value: {
+            type: ['number', 'null'],
+            description: 'Remaining quantity in the SAME unit the pantry uses. null = essentially used up, remove the row.',
+          },
+        },
+        required: ['name', 'remaining_value'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['updates'],
+  additionalProperties: false,
+};
+
 /**
- * Decrement pantry inventory for consumed ingredients. Only touches rows that
- * genuinely match the consumed quantity. If units don't match (pantry has
- * "1.5 lb chicken", recipe says "3 chicken breasts") we skip — the user clearly
- * has more than what was used. Rows with no qty info are treated as a
- * have/don't-have flag and removed on use. Returns the names decremented.
+ * Decrement pantry inventory for consumed ingredients. Exact unit matches are
+ * decremented directly; rows with no qty info are treated as a have/don't-have
+ * flag and removed on use. Unit mismatches (pantry has "1.5 lb chicken", recipe
+ * says "3 chicken breasts") used to be silently skipped — which let the pantry
+ * drift wrong. Now one extract-model call estimates the remaining quantity in
+ * the pantry's own unit; if that call fails, we fall back to skipping (the old
+ * behavior). Returns the names decremented + LLM usage when the call ran.
  */
-export function decrementPantryForMeal(sql: SqlStorage, ingredients: RecipeIngredient[]): string[] {
+export async function decrementPantryForMeal(
+  sql: SqlStorage,
+  ingredients: RecipeIngredient[],
+  ctx?: ToolCtx,
+): Promise<{ consumed: string[]; usage: RoundUsage | null }> {
   const consumed: string[] = [];
+  const mismatched: Array<{ name: string; have_value: number; have_unit: string; recipe_used: string }> = [];
+
   for (const ing of ingredients) {
     const itemName = ing.item.toLowerCase().trim();
     const row = sql.exec<PantryItem>('SELECT * FROM pantry WHERE name = ?', itemName).toArray()[0];
@@ -316,10 +532,54 @@ export function decrementPantryForMeal(sql: SqlStorage, ingredients: RecipeIngre
     } else if (row.qty_value == null && row.qty_unit == null) {
       sql.exec('DELETE FROM pantry WHERE name = ?', itemName);
       consumed.push(itemName);
+    } else if (row.qty_value != null) {
+      mismatched.push({
+        name: itemName,
+        have_value: row.qty_value,
+        have_unit: row.qty_unit ?? 'count',
+        recipe_used: ing.qty,
+      });
     }
-    // Otherwise: pantry has qty info that doesn't match recipe units → skip.
   }
-  return consumed;
+
+  if (mismatched.length === 0 || !ctx) return { consumed, usage: null };
+
+  // Unit-mismatch reconciliation: a best estimate beats a silently wrong
+  // inventory. Failure here is non-fatal — skip, like the old behavior.
+  try {
+    const response = await ctx.client.responses.create({
+      model: ctx.env.OPENAI_MODEL_EXTRACT,
+      input: [
+        {
+          role: 'system',
+          content:
+            'You reconcile a kitchen pantry after cooking. For each pantry item you get what is on hand (value + unit) and what the recipe used (free text in possibly different units). Estimate the remaining quantity IN THE PANTRY\'S OWN UNIT using sensible cooking conversions (a chicken breast ≈ 0.5 lb, a medium onion ≈ 1 count ≈ 0.5 lb, 1 cup rice ≈ 0.4 lb, etc.). If the item is essentially used up (≤5% left), return null.',
+        },
+        { role: 'user', content: JSON.stringify(mismatched) },
+      ],
+      text: {
+        format: { type: 'json_schema', name: 'pantry_decrement', schema: DECREMENT_SCHEMA, strict: true },
+      },
+    });
+    const usage = extractUsageFromResponse(response);
+    const parsed = JSON.parse(response.output_text || '{}') as {
+      updates?: Array<{ name: string; remaining_value: number | null }>;
+    };
+    for (const update of parsed.updates ?? []) {
+      const name = update.name?.toLowerCase().trim();
+      if (!name || !mismatched.some((m) => m.name === name)) continue; // only rows we asked about
+      if (update.remaining_value == null || update.remaining_value <= 0) {
+        sql.exec('DELETE FROM pantry WHERE name = ?', name);
+      } else {
+        sql.exec('UPDATE pantry SET qty_value = ? WHERE name = ?', update.remaining_value, name);
+      }
+      consumed.push(name);
+    }
+    return { consumed, usage };
+  } catch (err) {
+    console.error('pantry decrement reconciliation failed', err);
+    return { consumed, usage: null };
+  }
 }
 
 /**

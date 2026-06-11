@@ -5,7 +5,7 @@ import { ensureRelayRateSchema } from '../runtime/relay-rate-limit';
 import { ensureUsageSchema } from '../runtime/usage';
 import { TOOLS as KITCHEN_TOOLS } from '../agent/tools';
 import { executeTool as runKitchenTool } from '../agent/loop';
-import { buildSystemPromptFor } from '../agent/context';
+import { buildSystemPromptFor, loadRepertoire } from '../agent/context';
 import { statusEmbed } from '../agent/render';
 import type { ReminderRow } from '../kitchen-do';
 
@@ -79,6 +79,26 @@ const SCHEMA_V6_MEALS_DDL = `
   CREATE INDEX IF NOT EXISTS idx_meals_date ON meals(date);
 `;
 
+// v7: the living-cookbook layer — post-cook feedback + cookbook-page extras on
+// meals, and an item-level grocery list (distinct from the weekly
+// grocery_lists table v6 dropped).
+const SCHEMA_V7_GROCERY_DDL = `
+  CREATE TABLE IF NOT EXISTS grocery (
+    name TEXT PRIMARY KEY,
+    qty TEXT,
+    for_dish TEXT,
+    location TEXT,
+    added_at INTEGER NOT NULL
+  );
+`;
+const MEALS_V7_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ['protein', 'TEXT'],
+  ['effort', 'TEXT'],
+  ['extras_json', 'TEXT'],
+  ['rating', 'INTEGER'],
+  ['cook_notes', 'TEXT'],
+];
+
 /**
  * Kitchen bot spec. Daily-first: the agent suggests dinner for today and records
  * a decision only when the user makes one. Conversation is partitioned by
@@ -91,15 +111,16 @@ export const KITCHEN_SPEC: BotSpec = {
     // Kitchen owns /chat as the catch-all chat command for the household.
     // `botForCommand` in bot-registry uses Kitchen as the fallback when a
     // command isn't listed in any other bot's set.
-    'cook', 'chat', 'now', 'pantry', 'profile', 'reminders',
+    'cook', 'chat', 'now', 'pantry', 'profile', 'reminders', 'grocery', 'cookbook',
   ]),
   tools: KITCHEN_TOOLS,
   // Drop user data tables, preserve `settings` (schema_version + cooking_profile).
   // KitchenDO overrides onReset() to re-arm the daily suggestion alarm.
-  resetTables: ['meals', 'conversation', 'pantry', 'preferences', 'reminders'],
+  resetTables: ['meals', 'conversation', 'pantry', 'preferences', 'reminders', 'grocery'],
   scopeColumn: 'thread_id',
 
-  buildSystemPrompt: (sql, env) => buildSystemPromptFor(sql, env.TIMEZONE),
+  buildSystemPrompt: (sql, env) =>
+    buildSystemPromptFor(sql, env.TIMEZONE, Number(env.DINNER_HOUR_LOCAL) || 18),
 
   executeTool: (name, args, ctx) =>
     runKitchenTool(name, args, { env: ctx.env, sql: ctx.sql, client: ctx.client }),
@@ -154,6 +175,54 @@ export const KITCHEN_SPEC: BotSpec = {
         description: `**${items.length}** items`,
         color: EmbedColor.inProgress,
         fields,
+      }] };
+    }
+
+    if (cmd === 'grocery') {
+      const items = sql
+        .exec<{ name: string; qty: string | null; for_dish: string | null }>(
+          'SELECT name, qty, for_dish FROM grocery ORDER BY added_at ASC',
+        )
+        .toArray();
+      if (items.length === 0) {
+        return { embeds: [statusEmbed({
+          title: '🛒 Grocery list',
+          description: 'Nothing on the list. Items land here when you pick a dish that needs something, or say `/grocery message: add ...`.',
+          color: EmbedColor.archived,
+        })] };
+      }
+      const lines = items.map((i) => {
+        const qty = i.qty ? `${i.qty} ` : '';
+        const why = i.for_dish ? ` — _${i.for_dish}_` : '';
+        return `• ${qty}${i.name}${why}`;
+      });
+      return { embeds: [{
+        title: `🛒 Grocery list — ${items.length} item${items.length === 1 ? '' : 's'}`,
+        description: lines.join('\n').slice(0, 4096),
+        color: EmbedColor.inProgress,
+        footer: { text: 'Say "got everything" after shopping and it all moves to the pantry' },
+      }] };
+    }
+
+    if (cmd === 'cookbook') {
+      const dishes = loadRepertoire(sql, 15);
+      if (dishes.length === 0) {
+        return { embeds: [statusEmbed({
+          title: '📖 House cookbook',
+          description: 'No rated dishes yet. After you cook something, tell me how it went — rated dishes build your repertoire here.',
+          color: EmbedColor.archived,
+        })] };
+      }
+      const lines = dishes.map((d) => {
+        const times = d.timesCooked > 1 ? `, cooked ${d.timesCooked}x` : '';
+        const notes = d.notes ? `\n  ↳ _${d.notes.slice(0, 150)}_` : '';
+        return `**${d.name}** — ${d.rating}/10${times}, last ${d.lastDate}${notes}`;
+      });
+      return { embeds: [{
+        title: `📖 House cookbook — ${dishes.length} rated dish${dishes.length === 1 ? '' : 'es'}`,
+        description: lines.join('\n').slice(0, 4096),
+        color: EmbedColor.approved,
+        footer: { text: 'Ask for any of these and you get YOUR version, notes applied' },
       }] };
     }
 
@@ -242,6 +311,24 @@ export const KITCHEN_SPEC: BotSpec = {
           sql.exec('ALTER TABLE conversation ADD COLUMN thread_id TEXT');
           sql.exec('CREATE INDEX IF NOT EXISTS idx_conversation_thread ON conversation(thread_id, id DESC)');
         }
+      },
+    },
+    {
+      // Living cookbook: rating + next-time notes + cookbook-page extras on
+      // meals, plus the running grocery list.
+      version: 7,
+      up: (sql) => {
+        const cols = sql
+          .exec<{ name: string }>('SELECT name FROM pragma_table_info(?)', 'meals')
+          .toArray()
+          .map((r) => r.name);
+        const have = new Set(cols);
+        for (const [col, type] of MEALS_V7_COLUMNS) {
+          if (!have.has(col)) {
+            sql.exec(`ALTER TABLE meals ADD COLUMN ${col} ${type}`);
+          }
+        }
+        sql.exec(SCHEMA_V7_GROCERY_DDL);
       },
     },
   ],
