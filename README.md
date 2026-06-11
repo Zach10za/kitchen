@@ -2,7 +2,7 @@
 
 A daily cooking assistant that lives in your Discord. No app to open, no UI to maintain.
 
-Ask "what should I cook today?" and the bot suggests 2–3 dishes drawn from what's actually in your pantry and freezer, your dietary profile, and what you've eaten recently — with a short "need to buy" line for anything missing. Every day at noon it proactively pings you with options, *unless you've already decided* (picked a meal or said it's a date-night / takeout day). Pick one and it saves the recipe, schedules defrost reminders, and decrements your pantry when you cook it. No rigid weekly plan to maintain.
+Ask "what should I cook today?" and the bot suggests 2–3 dishes drawn from what's actually in your fridge and pantry, your dietary profile, and what you've eaten recently — with a short "need to buy" line for anything missing. (Freezer items are plan-ahead material: they're never pitched for tonight, since nothing frozen is cookable without defrosting — instead the bot offers to schedule one for a coming day and sets the defrost reminder.) Every day at noon it proactively pings you with options, *unless you've already decided* (picked a meal or said it's a date-night / takeout day). Pick one and it saves the recipe, schedules defrost reminders, and decrements your pantry when you cook it. No rigid weekly plan to maintain.
 
 ## Architecture
 

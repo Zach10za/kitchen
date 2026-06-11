@@ -35,6 +35,7 @@ export interface AgentContext {
   recentMeals: RecentMeal[];
   repertoire: RepertoireDish[];
   grocery: GroceryRow[];
+  recentPitches: string[];
   profile: string | null;
 }
 
@@ -184,6 +185,43 @@ export function loadUnratedRecentCooked(sql: SqlStorage, timezone: string): Meal
   return row ?? null;
 }
 
+/** Matches the suggestion-format header the prompt mandates:
+ *  `**1. Dish Name** — ~25 min, easy` (also tolerates `1)` and a model that
+ *  bolds the whole line — the ` — ` suffix is stripped). */
+const PITCH_HEADER_RE = /\*\*\s*\d+[.)]\s*([^*\n]+?)\s*\*\*/g;
+
+/**
+ * Dish names the bot has pitched recently, parsed from its own replies across
+ * ALL conversation scopes (noon pings, /cook threads, chat threads). The
+ * anti-repeat rule injects these into every prompt deterministically instead
+ * of hoping the right scope's history happens to be in view — per-scope
+ * history can't see what was offered in other threads.
+ */
+export function loadRecentPitches(sql: SqlStorage, days = 14, cap = 30): string[] {
+  const cutoff = Date.now() - days * 86_400_000;
+  const rows = sql
+    .exec<{ content: string }>(
+      "SELECT content FROM conversation WHERE role = 'assistant' AND ts >= ? ORDER BY id DESC LIMIT 200",
+      cutoff,
+    )
+    .toArray();
+
+  const seen = new Set<string>();
+  const pitches: string[] = [];
+  for (const row of rows) {
+    for (const match of row.content.matchAll(PITCH_HEADER_RE)) {
+      const name = match[1]!.split(' — ')[0]!.trim();
+      if (name.length < 3 || name.length > 80) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pitches.push(name);
+      if (pitches.length >= cap) return pitches;
+    }
+  }
+  return pitches;
+}
+
 export function loadContext(sql: SqlStorage, timezone: string): AgentContext {
   return {
     today: loadDayDecision(sql, todayISO(timezone)),
@@ -192,6 +230,7 @@ export function loadContext(sql: SqlStorage, timezone: string): AgentContext {
     recentMeals: loadRecentMeals(sql),
     repertoire: loadRepertoire(sql),
     grocery: loadGrocery(sql),
+    recentPitches: loadRecentPitches(sql),
     profile: loadProfile(sql),
   };
 }

@@ -197,7 +197,7 @@ export class KitchenDO extends AgentDOBase<Env> {
     await dispatchChat(
       this.env,
       'kitchen',
-      `It's the daily dinner check-in. Suggest 2-3 dinner options for tonight based on my pantry, freezer (prioritize items that are aging), preferences, repertoire, and recent meals — vary it from what I've had lately. Add a short 'need to buy' line for anything missing. Keep it brief; I haven't decided yet.${ratingAsk}`,
+      `It's the daily dinner check-in. Suggest 2-3 dinner options for tonight from my fridge/shelf pantry, preferences, repertoire, and recent meals. The RECENTLY PITCHED list shows everything you've offered lately — all of it is off the table; give me something genuinely different. Don't build options around frozen items (nothing is defrosted); at most offer to schedule one aging freezer item for a future day. Add a short 'need to buy' line for anything missing. Keep it brief; I haven't decided yet.${ratingAsk}`,
       this.env.DISCORD_CHANNEL_ID,
       { column: 'thread_id', value: this.env.DISCORD_CHANNEL_ID },
     );
