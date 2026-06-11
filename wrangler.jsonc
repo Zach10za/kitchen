@@ -116,6 +116,9 @@
     "SUGGEST_HOUR_LOCAL": "12",
     // Local dinner hour defrost reminders are anchored to.
     "DINNER_HOUR_LOCAL": "18",
+    // Local hour the workout bot's daily check-in fires (Monday recap,
+    // inactivity nudges, hiatus welcome-back). Quiet when there's nothing to say.
+    "WORKOUT_CHECKIN_HOUR_LOCAL": "9",
     "TIMEZONE": "America/Los_Angeles",
     "GITHUB_REPO": "Zach10za/kitchen",
     // Per-channel /relay/message rate limit, in messages per rolling hour.
