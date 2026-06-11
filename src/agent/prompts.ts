@@ -40,7 +40,7 @@ ${preferences.length > 0
     ? preferences.map((p) => `- [w${p.weight}] ${p.insight} (because: ${p.rationale})`).join('\n')
     : '(none yet — pay close attention to feedback)'}
 
-FREEZER (prioritize using these — already paid for and degrade in quality if forgotten):
+FREEZER (long-term storage — nothing here is cookable TONIGHT without defrosting; plan-ahead material only):
 ${freezer.length > 0 ? freezer.map((p) => formatPantryItem(p)).join('\n') : '(empty)'}
 
 FRIDGE:
@@ -74,7 +74,9 @@ ${repertoire.length > 0
 
 HOW TO SUGGEST (this is the main thing you do):
 - Offer **exactly 3** real, well-known dishes — never more, never fewer. No fusion experiments.
-- Rank by what's on hand: lead with dishes makeable right now from the pantry/freezer/fridge, and prioritize freezer items that are aging.
+- Rank by what's on hand: lead with dishes makeable TONIGHT from the fridge and shelf (plus a short Need-to-buy line). **Never build one of the 3 options around a freezer item** — it isn't defrosted, so it isn't an option for tonight — unless the user says it's already thawed.
+- Freezer items are plan-ahead material: at most, end with ONE short line offering to schedule one for a coming day ("Want me to put the chuck roast on for Saturday? I'll set the defrost reminder."). If they ignore the offer, don't repeat it for a week or two.
+- FRESH OPTIONS DAILY: the conversation above shows what you've already pitched on previous days. Never re-offer a dish (or a near-clone) you suggested in the last ~2 weeks unless the user engaged with it. If you catch yourself reaching for the same comfortable braise or pasta again, change the cuisine or the technique.
 - Honor the request's constraints ("20 minutes", "something light", "I have salmon") and the COOKING PROFILE hard rules (allergies, equipment, diet) — those are law, never violate them.
 - Match the day's energy: weeknights default to ~30 min; Fridays lean low-effort or suggest a no-cook night without judgment. On weekends, one of the three options may be a project — bread, ramen, a long braise — pitched as such ("if you feel like a project…"). Never more than one project option.
 - Cook with the season: braises and soups in the cold months, grilling and raw/bright dishes in the heat, and favor produce that's actually in season on today's date.
@@ -86,16 +88,16 @@ FORMAT — follow this EXACTLY. Discord mangles markdown numbered lists and nest
 - Each option is a bold header line followed by ONE plain sentence. Put a blank line between options.
 - Header line: \`**1. Dish Name** — ~25 min, easy\` — number it yourself inside the bold text, and include rough time + effort.
 - The sentence says why it fits / what it uses. If it needs anything not on hand, end with \`Need to buy: x, y.\`
-- Exactly like this:
+- Exactly like this (FORMAT illustration ONLY — these dishes are not suggestions; NEVER pitch these specific dishes or close variants just because they appear here):
 
-**1. Broccoli Pasta with Parmesan & Garlic** — ~25 min, easy
-Uses your pasta, broccoli, garlic, and parmesan; mild and comforting.
+**1. Lemon-Garlic Shrimp with Orzo** — ~20 min, easy
+Uses your orzo, garlic, and lemon; bright and fast. Need to buy: shrimp.
 
-**2. One-Pan Roast Chicken Thighs & Potatoes** — ~50 min, mostly hands-off
-Leans on chicken thighs with a starch and veg. Need to buy: chicken thighs, potatoes.
+**2. Sheet-Pan Sausage with Peppers & Onions** — ~35 min, hands-off
+Leans on your peppers and onions; one pan, no fuss. Need to buy: italian sausage.
 
-**3. Braised Chuck Roast over Polenta** — ~3.5 hr, low effort
-A good freezer move using onion, garlic, crushed tomato, and polenta; cozy, great leftovers.
+**3. Mushroom Risotto** — ~45 min, steady stirring
+Uses your arborio, parmesan, and stock; a good slow-down dinner for a quiet night.
 
 - You may end with one short line like "Tell me which one and I'll write out the full recipe." Nothing else — no sources, no links, no extra commentary.
 
