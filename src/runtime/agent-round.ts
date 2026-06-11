@@ -10,7 +10,7 @@
 
 import type OpenAI from 'openai';
 
-export const MAX_TOOL_ROUNDS = 6;
+export const MAX_TOOL_ROUNDS = 10;
 
 /** OpenAI Chat-Completions-style function tool. The runtime converts these
  *  into Responses-API form on the wire. */

@@ -3,7 +3,7 @@
  * agent always answers from the actual logged sets.
  */
 
-import { buildWorkoutStats } from './loop';
+import { buildWorkoutStats, loadHiatus } from './loop';
 import type { GymEquipmentRow } from './tools';
 
 export function buildWorkoutSystemPrompt(sql: SqlStorage, timezone: string): string {
@@ -83,10 +83,15 @@ export function buildWorkoutSystemPrompt(sql: SqlStorage, timezone: string): str
       .join('\n');
   })();
 
+  const hiatus = loadHiatus(sql);
+  const hiatusLine = hiatus && hiatus.until > Date.now()
+    ? `\nTRAINING BREAK: the user is off training until ${new Date(hiatus.until).toISOString().slice(0, 10)}${hiatus.note ? ` (${hiatus.note})` : ''}. Don't push workouts or progression. Help with planning, recovery questions, and the comeback; if they say they're back early, call clear_hiatus.\n`
+    : '';
+
   return `You are the user's home-gym training partner. You collaborate with them through a Discord channel to log workouts, track progression, and shape their training program. Style: terse, lifter-grade, specific. Quote weights in pounds.
 
 RIGHT NOW: ${nowLocal}. Today's date is ${today}.
-${openSessionLine}
+${openSessionLine}${hiatusLine}
 LIFTER PROFILE:
 ${profileBlock}
 
@@ -127,6 +132,8 @@ LOGGING RULES:
 - Use RPE when the user provides it — it's high signal for progression decisions.
 - When the user mentions a tweak, soreness, or injury — even casually ("my back is feeling iffy today") — append a date-stamped line to health_notes via update_profile. Don't lose it.
 - When the user mentions new gear ("just got a trap bar") — call add_equipment so future suggestions can use it.
+- When the user says they'll be off training for a while ("can't work out for the next few weeks", "traveling until the 20th") — call set_hiatus so the proactive check-ins go quiet and a comeback check-in fires when it ends. If they're back early, clear_hiatus.
+- Coming back from a break: ramp, don't resume. First session back, suggest roughly 10–20% off their last working weights at reduced volume, scaled to how long they were out, then rebuild over 1–2 weeks. Factor in the break reason if recorded (injury recovery ramps slower than travel).
 
 COACHING:
 - When asked "what should I do today?": check active program + recent muscle volume + open injuries/niggles + owned equipment, then recommend a routine or movement. Be specific about sets × reps and a weight target based on history.

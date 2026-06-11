@@ -106,7 +106,7 @@
   // Public env (non-secret). Secrets go via `wrangler secret put`.
   "vars": {
     // Planner / steering model — strongest reasoning we use.
-    "OPENAI_MODEL": "gpt-5.4-mini",
+    "OPENAI_MODEL": "gpt-5.4",
     // Pure structured-output extraction (pantry parse, recipe materialize).
     // Cheap + fast; no creativity needed.
     "OPENAI_MODEL_EXTRACT": "gpt-5.4-nano",
@@ -116,17 +116,23 @@
     "SUGGEST_HOUR_LOCAL": "12",
     // Local dinner hour defrost reminders are anchored to.
     "DINNER_HOUR_LOCAL": "18",
+    // Local hour the projects bot's daily alarm fires (Monday weekly review,
+    // other days a due-check that stays quiet when nothing is due).
+    "PROJECTS_REVIEW_HOUR_LOCAL": "9",
+    // Local hour the workout bot's daily check-in fires (Monday recap,
+    // inactivity nudges, hiatus welcome-back). Quiet when there's nothing to say.
+    "WORKOUT_CHECKIN_HOUR_LOCAL": "9",
     "TIMEZONE": "America/Los_Angeles",
     "GITHUB_REPO": "Zach10za/kitchen",
     // Per-channel /relay/message rate limit, in messages per rolling hour.
     "RELAY_RATE_LIMIT_PER_HOUR": "30",
     // OpenAI pricing — update when OpenAI changes prices, no code deploy needed.
-    // Defaults reflect gpt-5.4-mini per OpenAI's published pricing as of 2026-05;
+    // Defaults reflect gpt-5.4 per OpenAI's published pricing as of 2026-06;
     // cached input is 90% off standard. Built-in tool prices are flat per-call.
     // Override per-environment if you switch to a different model tier.
-    "PRICE_INPUT_PER_M": "0.75",
-    "PRICE_CACHED_INPUT_PER_M": "0.075",
-    "PRICE_OUTPUT_PER_M": "4.50",
+    "PRICE_INPUT_PER_M": "2.50",
+    "PRICE_CACHED_INPUT_PER_M": "0.25",
+    "PRICE_OUTPUT_PER_M": "15.00",
     "PRICE_WEB_SEARCH_PER_CALL": "0.025",
     "PRICE_CODE_INTERPRETER_PER_CALL": "0.03",
   },

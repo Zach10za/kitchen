@@ -6,6 +6,7 @@
  * All weights are pounds. Bodyweight exercises have NULL weight.
  */
 
+import { localDateAtHour } from '../util/datetime';
 import type {
   ExerciseRow, WorkoutRow, SetRow, ProgramRow, RoutineRow,
   ProfileRow, GymEquipmentRow,
@@ -18,6 +19,9 @@ export type {
 
 export interface WorkoutToolCtx {
   sql: SqlStorage;
+  /** IANA timezone for the household. Used to resolve bare YYYY-MM-DD hiatus
+   *  end dates to end-of-day in the user's local time instead of UTC. */
+  timezone?: string;
 }
 
 // ─── Public constants ────────────────────────────────────────────────
@@ -56,6 +60,8 @@ export function executeWorkoutTool(name: string, args: any, ctx: WorkoutToolCtx)
       case 'update_equipment':     return toolUpdateEquipment(args, ctx);
       case 'remove_equipment':     return toolRemoveEquipment(args, ctx);
       case 'list_equipment':       return toolListEquipment(args, ctx);
+      case 'set_hiatus':           return toolSetHiatus(args, ctx);
+      case 'clear_hiatus':         return toolClearHiatus(ctx);
       default:                     return `Unknown workout tool: ${name}`;
     }
   } catch (err) {
@@ -1259,6 +1265,83 @@ export function fullWorkout(sql: SqlStorage, workoutId: string): FullWorkout {
   }));
 
   return { workout, exercises };
+}
+
+// ─── Settings + training hiatus ──────────────────────────────────────
+
+/** Keys in the `settings` table (migration v5). */
+export const SETTING_HIATUS_UNTIL = 'hiatus_until';
+export const SETTING_HIATUS_NOTE = 'hiatus_note';
+export const SETTING_LAST_NUDGE_AT = 'last_inactivity_nudge_at';
+
+export function getSetting(sql: SqlStorage, key: string): string | null {
+  const row = sql
+    .exec<{ value: string }>('SELECT value FROM settings WHERE key = ?', key)
+    .toArray()[0];
+  return row?.value ?? null;
+}
+
+export function setSetting(sql: SqlStorage, key: string, value: string): void {
+  sql.exec(
+    'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+    key, value, Date.now(),
+  );
+}
+
+export function deleteSetting(sql: SqlStorage, key: string): void {
+  sql.exec('DELETE FROM settings WHERE key = ?', key);
+}
+
+export interface HiatusInfo {
+  /** ms epoch the break ends (end of that day, user-local). */
+  until: number;
+  note: string | null;
+}
+
+/** The currently recorded training break, expired or not — the DO's alarm
+ *  decides what an expired one means (send the welcome-back, then clear). */
+export function loadHiatus(sql: SqlStorage): HiatusInfo | null {
+  const raw = getSetting(sql, SETTING_HIATUS_UNTIL);
+  if (!raw) return null;
+  const until = Number(raw);
+  if (!Number.isFinite(until)) return null;
+  return { until, note: getSetting(sql, SETTING_HIATUS_NOTE) };
+}
+
+export function clearHiatus(sql: SqlStorage): void {
+  deleteSetting(sql, SETTING_HIATUS_UNTIL);
+  deleteSetting(sql, SETTING_HIATUS_NOTE);
+}
+
+function toolSetHiatus(args: { until_date: string; note?: string }, ctx: WorkoutToolCtx): string {
+  const trimmed = String(args.until_date ?? '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    return `until_date must be YYYY-MM-DD (got "${args.until_date}").`;
+  }
+  // End of that day in the user's local timezone; the next morning's alarm
+  // is the first one that sees the break as over.
+  const until = ctx.timezone
+    ? localDateAtHour(trimmed, 23, ctx.timezone)
+    : Date.parse(`${trimmed}T23:59:59Z`);
+  if (!Number.isFinite(until)) {
+    return `Could not parse until_date "${args.until_date}".`;
+  }
+  if (until < Date.now()) {
+    return `until_date ${trimmed} is in the past. Use clear_hiatus if the break is already over.`;
+  }
+  setSetting(ctx.sql, SETTING_HIATUS_UNTIL, String(until));
+  if (args.note && args.note.trim()) {
+    setSetting(ctx.sql, SETTING_HIATUS_NOTE, args.note.trim());
+  } else {
+    deleteSetting(ctx.sql, SETTING_HIATUS_NOTE);
+  }
+  return `Training break recorded through ${trimmed}${args.note ? ` (${args.note.trim()})` : ''}. I'll stay quiet until then, and check in when it's over.`;
+}
+
+function toolClearHiatus(ctx: WorkoutToolCtx): string {
+  if (!loadHiatus(ctx.sql)) return 'No training break is currently recorded.';
+  clearHiatus(ctx.sql);
+  return 'Training break cleared — back to normal check-ins.';
 }
 
 export interface WorkoutStats {

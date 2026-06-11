@@ -1,11 +1,12 @@
 /**
- * Discord embed builders for tasks fast-read commands. Agent replies are
- * plain markdown; these embeds are only for the deterministic fast paths
- * (/tasks bare, /tasks-open, /tasks-next, /tasks-blocked, /tasks-due).
+ * Discord embed builders for projects fast-read commands and the daily due
+ * nudge. Agent replies are plain markdown; these embeds are only for the
+ * deterministic paths (/projects bare, /projects-open, /projects-next,
+ * /projects-blocked, /projects-due, and the alarm's due-check post).
  */
 
 import { EmbedColor, type Embed } from '../discord/types';
-import type { TaskRow } from './loop';
+import type { ProjectsSnapshot, TaskRow } from './loop';
 
 const STATUS_ICON: Record<string, string> = {
   todo: '⬜',
@@ -43,84 +44,6 @@ function taskLine(t: TaskRow): string {
   return `${icon} ${badge}**${t.title}**${typeLabel}${due} \`${t.id}\``;
 }
 
-export function taskSummaryEmbed(stats: {
-  total: number;
-  byStatus: Record<string, number>;
-  byPriority: Record<string, number>;
-  readyTasks: TaskRow[];
-  blockedTasks: Array<TaskRow & { blocker_count: number }>;
-  inProgressTasks: TaskRow[];
-  overdueTasks: TaskRow[];
-}): Embed {
-  const { total, byStatus, byPriority, readyTasks, blockedTasks, inProgressTasks, overdueTasks } = stats;
-  const open = (byStatus['todo'] ?? 0) + (byStatus['in_progress'] ?? 0) + (byStatus['blocked'] ?? 0);
-
-  if (total === 0) {
-    return {
-      title: '📋 Tasks',
-      description: 'No tasks yet. Use `/tasks message: add a task` or just chat to get started.',
-      color: EmbedColor.archived,
-    };
-  }
-
-  const descLines = [
-    `**${open}** open · **${byStatus['done'] ?? 0}** done · **${byStatus['cancelled'] ?? 0}** cancelled`,
-  ];
-  const callouts = [
-    (byPriority['urgent'] ?? 0) > 0 ? `🔥 ${byPriority['urgent']} urgent` : null,
-    (byPriority['high'] ?? 0) > 0 ? `⬆️ ${byPriority['high']} high` : null,
-    overdueTasks.length > 0 ? `⚠️ ${overdueTasks.length} overdue` : null,
-  ].filter(Boolean);
-  if (callouts.length > 0) descLines.push(callouts.join(' · '));
-
-  const fields = [];
-
-  // Overdue is the most urgent surface — put it first.
-  if (overdueTasks.length > 0) {
-    fields.push({
-      name: '⚠️ Overdue',
-      value: overdueTasks.slice(0, 5).map(taskLine).join('\n').slice(0, 1024),
-    });
-  }
-
-  if (inProgressTasks.length > 0) {
-    fields.push({
-      name: '🔄 In progress',
-      value: inProgressTasks.map(taskLine).join('\n').slice(0, 1024),
-    });
-  }
-
-  if (readyTasks.length > 0) {
-    fields.push({
-      name: '✅ Ready to start',
-      value: readyTasks.map(taskLine).join('\n').slice(0, 1024),
-    });
-  }
-
-  if (blockedTasks.length > 0) {
-    fields.push({
-      name: '⛔ Blocked',
-      value: blockedTasks
-        .map((t) => `${taskLine(t)} — ${t.blocker_count} blocker(s)`)
-        .join('\n')
-        .slice(0, 1024),
-    });
-  }
-
-  const color = overdueTasks.length > 0
-    ? EmbedColor.error
-    : open > 0
-    ? EmbedColor.inProgress
-    : EmbedColor.approved;
-
-  return {
-    title: `📋 Tasks — ${total} total`,
-    description: descLines.join('\n'),
-    color,
-    fields: fields.length > 0 ? fields : undefined,
-  };
-}
-
 export function tasksListEmbed(title: string, tasks: TaskRow[]): Embed {
   if (tasks.length === 0) {
     return {
@@ -144,6 +67,80 @@ export function tasksListEmbed(title: string, tasks: TaskRow[]): Embed {
     description: lines.join('\n').slice(0, 4096),
     color: EmbedColor.inProgress,
     footer: { text: `${tasks.length} task${tasks.length === 1 ? '' : 's'}` },
+  };
+}
+
+function progressBar(done: number, total: number): string {
+  if (total === 0) return '`no steps yet`';
+  const filled = Math.round((done / total) * 5);
+  return `\`${'▰'.repeat(filled)}${'▱'.repeat(5 - filled)}\` ${done}/${total} steps`;
+}
+
+export function projectsOverviewEmbed(snapshot: ProjectsSnapshot): Embed {
+  const { projects, loose } = snapshot;
+
+  if (projects.length === 0 && loose.length === 0) {
+    return {
+      title: '📁 Projects',
+      description:
+        'No projects yet. Describe one and I\'ll break it into steps — e.g. `/projects message: new project: reseed the lawn — buy seed, dethatch, overseed`.',
+      color: EmbedColor.archived,
+    };
+  }
+
+  const fields = projects.slice(0, 10).map((p) => {
+    const t = p.project;
+    const badge = PRIORITY_BADGE[t.priority ?? 'normal'] ?? '';
+    const due = formatDueChip(t.due_at ?? null);
+    const staleDays = Math.floor((Date.now() - p.lastActivity) / 86_400_000);
+    const lines = [progressBar(p.doneSteps, p.totalSteps) + due];
+    if (p.nextSteps.length > 0) {
+      lines.push(...p.nextSteps.map((s) => `↳ ${taskLine(s)}`));
+    } else if (p.totalSteps > 0 && p.doneSteps === p.totalSteps) {
+      lines.push('🎉 all steps done — close it out?');
+    }
+    if (p.stale) lines.push(`⚠️ stale — no activity in ${staleDays}d`);
+    return {
+      name: `📁 ${badge}${t.title} \`${t.id}\``,
+      value: lines.join('\n').slice(0, 1024),
+    };
+  });
+
+  if (loose.length > 0) {
+    fields.push({
+      name: '📌 Loose tasks',
+      value: loose.slice(0, 8).map(taskLine).join('\n').slice(0, 1024),
+    });
+  }
+
+  const anyStale = projects.some((p) => p.stale);
+  return {
+    title: `📁 Projects — ${projects.length} active`,
+    color: anyStale ? EmbedColor.error : EmbedColor.inProgress,
+    fields,
+    footer: { text: 'Chat to add steps, mark things done, or start a new project' },
+  };
+}
+
+export function projectsNudgeEmbed(newlyOverdue: TaskRow[], dueToday: TaskRow[]): Embed {
+  const fields = [];
+  if (newlyOverdue.length > 0) {
+    fields.push({
+      name: `⚠️ Just went overdue (${newlyOverdue.length})`,
+      value: newlyOverdue.map(taskLine).join('\n').slice(0, 1024),
+    });
+  }
+  if (dueToday.length > 0) {
+    fields.push({
+      name: `🕒 Due today (${dueToday.length})`,
+      value: dueToday.map(taskLine).join('\n').slice(0, 1024),
+    });
+  }
+  return {
+    title: '⏰ Due check',
+    color: newlyOverdue.length > 0 ? EmbedColor.error : EmbedColor.inProgress,
+    fields,
+    footer: { text: 'Mark done or push the date — e.g. /projects message: done with the door seal' },
   };
 }
 

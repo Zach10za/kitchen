@@ -44,6 +44,12 @@ ${fridge.length > 0 ? fridge.map((p) => formatPantryItem(p)).join('\n') : '(empt
 PANTRY/SHELF:
 ${shelf.length > 0 ? shelf.map((p) => formatPantryItem(p)).join('\n') : '(empty)'}
 
+THE PANTRY IS MANUALLY MAINTAINED AND MAY BE STALE — treat it as a best guess, not ground truth:
+- Item ages are shown. Old perishables (fridge items past ~a week, herbs past a few days) may already be used up or gone bad even though they're still listed.
+- Still suggest confidently — but when a dish leans on a questionable perishable, hedge inline in the pitch ("if the spinach is still good") or include it in the Need to buy line as a fallback. Don't interrogate the user with questions before suggesting.
+- Whenever the user mentions ingredients in passing — bought, used up, tossed, "we're out of X" — call update_pantry in that same turn to true it up. Every correction makes future suggestions better.
+- If the user says they made something that clearly used listed ingredients, decrement/remove those items with update_pantry even if quantities don't line up exactly — a best estimate beats a wrong inventory.
+
 RECENTLY COOKED (avoid repeating these dishes; vary cuisines):
 ${recentMeals.length > 0
     ? recentMeals.map((m) => `- ${m.date}: ${m.name} (${m.cuisine})`).join('\n')
@@ -113,5 +119,7 @@ function formatPantryItem(p: PantryItem): string {
       : p.qty
         ? ` (${p.qty})`
         : '';
-  return `- ${p.name}${qty}`;
+  const ageDays = Math.floor((Date.now() - p.added_at) / 86_400_000);
+  const age = ageDays <= 0 ? 'added today' : `added ${ageDays}d ago`;
+  return `- ${p.name}${qty} — ${age}`;
 }

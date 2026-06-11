@@ -264,16 +264,16 @@ function isFastReadCommand(interaction: Interaction): boolean {
       return true;            // pure read
     case 'accounts':
       return true;            // pure read
-    // Tasks
-    case 'tasks':
-      return !hasMessage;     // /tasks (alone) = summary; with message = agent
-    case 'tasks-open':
+    // Projects
+    case 'projects':
+      return !hasMessage;     // /projects (alone) = board; with message = agent
+    case 'projects-open':
       return true;            // pure read
-    case 'tasks-next':
+    case 'projects-next':
       return true;            // pure read
-    case 'tasks-blocked':
+    case 'projects-blocked':
       return true;            // pure read
-    case 'tasks-due':
+    case 'projects-due':
       return true;            // pure read
     // Workout
     case 'workout':
