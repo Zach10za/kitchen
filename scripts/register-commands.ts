@@ -54,7 +54,7 @@ const COMMANDS = [
   },
   {
     name: 'grocery',
-    description: 'Show or update the grocery list (fills from "need to buy" picks; "got everything" moves it to the pantry)',
+    description: 'Show or update the grocery list ("got everything" moves it all to the pantry)',
     options: [
       { name: 'message', description: 'What to add/remove/mark bought (omit to view the list)', type: STRING, required: false },
     ],
