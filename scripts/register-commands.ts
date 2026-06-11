@@ -52,6 +52,17 @@ const COMMANDS = [
     name: 'reminders',
     description: 'Show upcoming defrost/prep reminders',
   },
+  {
+    name: 'grocery',
+    description: 'Show or update the grocery list (fills from "need to buy" picks; "got everything" moves it to the pantry)',
+    options: [
+      { name: 'message', description: 'What to add/remove/mark bought (omit to view the list)', type: STRING, required: false },
+    ],
+  },
+  {
+    name: 'cookbook',
+    description: "Your house cookbook: dishes you've cooked and rated, with your next-time notes",
+  },
   // ─── Finance bot ──────────────────────────────────────────────────
   // Lives in #finance. Shares the same Discord app + bot token.
   {

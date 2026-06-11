@@ -66,7 +66,7 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/projects`, `/projects-open`, `/projects-next`, `/projects-blocked`, `/projects-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
+You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/grocery`, `/cookbook`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/projects`, `/projects-open`, `/projects-next`, `/projects-blocked`, `/projects-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
 
 ### 6. Deploy the Worker
 
@@ -147,11 +147,27 @@ In your Discord channel, either slash commands:
 /profile message:I have a wok and don't eat pork
 /profile                    (no message) show current profile
 /reminders                  show upcoming defrost/prep reminders
+/grocery                    show the grocery list (fills itself from "need to buy" picks)
+/grocery message:got everything   move the list into the pantry after shopping
+/cookbook                   your house cookbook: rated dishes + your next-time notes
 ```
 
 Tell the bot you're not cooking ("date night tonight", "ordering in") and it records a
 no-cook day — silencing that day's noon ping. Say you made a dish and it logs the recipe
-and decrements your pantry.
+and decrements your pantry (an extract-model call reconciles mismatched units, so
+"3 chicken breasts" correctly draws down "1.5 lb chicken").
+
+Recipes are written cookbook-style — headnote, sensory checkpoints with the why behind
+load-bearing steps, a finishing move, riffs keyed to your pantry, a keeps note, and a
+one-line pairing — and the full page is saved, not just the steps.
+
+After you cook something, the bot asks how it went (once, never twice). Ratings and
+"next time" notes build your **house repertoire**: proven winners re-enter the
+suggestion rotation, and re-making a dish serves *your* version with your notes
+applied. Suggestions rotate protein/cuisine/technique, match the day's energy
+(weeknight quick, weekend projects), cook with the season, and think in arcs
+(Sunday roast → Tuesday soup). Defrost/prep reminders fire at their exact minute
+via the DO alarm rather than on the hourly cron.
 
 In your `#finance` channel:
 

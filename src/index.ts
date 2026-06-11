@@ -255,6 +255,10 @@ function isFastReadCommand(interaction: Interaction): boolean {
       return !hasMessage;     // /pantry (alone) = read; with message = write
     case 'reminders':
       return true;            // simple list, fits in one message
+    case 'grocery':
+      return !hasMessage;     // /grocery (alone) = read; with message = agent
+    case 'cookbook':
+      return true;            // pure read
     // Finance
     case 'finance':
       return !hasMessage;     // /finance (alone) = read; with message = agent
