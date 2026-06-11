@@ -116,6 +116,9 @@
     "SUGGEST_HOUR_LOCAL": "12",
     // Local dinner hour defrost reminders are anchored to.
     "DINNER_HOUR_LOCAL": "18",
+    // Local hour the projects bot's daily alarm fires (Monday weekly review,
+    // other days a due-check that stays quiet when nothing is due).
+    "PROJECTS_REVIEW_HOUR_LOCAL": "9",
     "TIMEZONE": "America/Los_Angeles",
     "GITHUB_REPO": "Zach10za/kitchen",
     // Per-channel /relay/message rate limit, in messages per rolling hour.

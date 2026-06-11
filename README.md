@@ -50,7 +50,7 @@ In the Cloudflare dashboard:
    - Right-click your server → **Copy Server ID** → `DISCORD_GUILD_ID`
    - Right-click the channel the bot lives in → **Copy Channel ID** → `DISCORD_CHANNEL_ID`
    - If you add a `#finance` channel: right-click → **Copy Channel ID** → `DISCORD_FINANCE_CHANNEL_ID`
-   - If you add a `#tasks` channel: right-click → **Copy Channel ID** → `DISCORD_TASKS_CHANNEL_ID`
+   - If you add a `#projects` channel: right-click → **Copy Channel ID** → `DISCORD_TASKS_CHANNEL_ID`
    - If you add a `#workout` channel: right-click → **Copy Channel ID** → `DISCORD_WORKOUT_CHANNEL_ID`
 
 ### 4. Set local secrets for development
@@ -66,7 +66,7 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/tasks`, `/tasks-open`, `/tasks-next`, `/tasks-blocked`, `/tasks-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
+You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/projects`, `/projects-open`, `/projects-next`, `/projects-blocked`, `/projects-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
 
 ### 6. Deploy the Worker
 
@@ -84,7 +84,7 @@ bunx wrangler secret put DISCORD_APP_ID
 bunx wrangler secret put DISCORD_GUILD_ID
 bunx wrangler secret put DISCORD_CHANNEL_ID         # channel the kitchen bot posts daily dinner suggestions to
 bunx wrangler secret put DISCORD_FINANCE_CHANNEL_ID  # optional; enables finance bot
-bunx wrangler secret put DISCORD_TASKS_CHANNEL_ID    # optional; enables tasks bot
+bunx wrangler secret put DISCORD_TASKS_CHANNEL_ID    # optional; enables projects bot
 bunx wrangler secret put DISCORD_WORKOUT_CHANNEL_ID   # optional; enables workout bot
 bunx wrangler secret put OPENAI_API_KEY
 bunx wrangler secret put AI_GATEWAY_URL
@@ -164,16 +164,21 @@ In your `#finance` channel:
 /finance-sync            force a SimpleFin pull (normally hourly)
 ```
 
-In your `#tasks` channel:
+In your `#projects` channel:
 
 ```
-/tasks                   task summary (open, ready, blocked, overdue counts)
-/tasks message:...       add tasks, update status, set priority/due dates, ask what to work on next
-/tasks-open              list all open tasks
-/tasks-next              show tasks with no unfinished blockers (ready to start)
-/tasks-blocked           show tasks waiting on other tasks
-/tasks-due               show overdue tasks and anything due within 7 days
+/projects                the project board: each project's step progress + next actions
+/projects message:...    describe a project and it's broken into steps; report progress in passing
+/projects-open           list all open items
+/projects-next           next actions — steps with no unfinished blockers
+/projects-blocked        items waiting on other steps
+/projects-due            overdue items and anything due within 7 days
 ```
+
+The projects bot also speaks first: Monday mornings it posts a short project
+review (progress, the one next action per project, stale-project callouts),
+and on other days it posts a due-check only when something is due today or
+just went overdue. Hour is `PROJECTS_REVIEW_HOUR_LOCAL` (default 9).
 
 In your `#workout` channel:
 

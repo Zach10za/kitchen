@@ -84,30 +84,31 @@ const COMMANDS = [
     name: 'finance-sync',
     description: 'Pull latest from SimpleFin now (normally syncs hourly)',
   },
-  // ─── Tasks bot ────────────────────────────────────────────────────
-  // Lives in #tasks. Shares the same Discord app + bot token.
+  // ─── Projects bot ─────────────────────────────────────────────────
+  // Lives in #projects (env key is still DISCORD_TASKS_CHANNEL_ID).
+  // Shares the same Discord app + bot token.
   {
-    name: 'tasks',
-    description: 'Manage tasks, projects, and todos. Without a message shows a summary.',
+    name: 'projects',
+    description: 'Track your projects and todos. Without a message shows the project board.',
     options: [
-      { name: 'message', description: 'What you want to do (omit to see a summary)', type: STRING, required: false },
+      { name: 'message', description: 'What you want to do (omit to see the project board)', type: STRING, required: false },
     ],
   },
   {
-    name: 'tasks-open',
-    description: 'List all open tasks (todo, in progress, blocked)',
+    name: 'projects-open',
+    description: 'List all open items (todo, in progress, blocked)',
   },
   {
-    name: 'tasks-next',
-    description: 'Show tasks that are ready to work on (no unfinished blockers)',
+    name: 'projects-next',
+    description: 'Show next actions — steps ready to work on (no unfinished blockers)',
   },
   {
-    name: 'tasks-blocked',
-    description: 'Show tasks blocked by unfinished dependencies',
+    name: 'projects-blocked',
+    description: 'Show items blocked by unfinished dependencies',
   },
   {
-    name: 'tasks-due',
-    description: 'Show overdue tasks and anything due within the next 7 days',
+    name: 'projects-due',
+    description: 'Show overdue items and anything due within the next 7 days',
   },
   // ─── Workout bot ──────────────────────────────────────────────────
   // Lives in #workout. Shares the same Discord app + bot token.

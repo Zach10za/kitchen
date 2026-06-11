@@ -63,6 +63,7 @@ export function executeTasksTool(name: string, args: any, ctx: TasksToolCtx): st
   try {
     switch (name) {
       case 'show_summary':      return toolShowSummary(ctx);
+      case 'show_projects':     return projectsOverviewText(ctx.sql);
       case 'list_tasks':        return toolListTasks(args, ctx);
       case 'get_task':          return toolGetTask(args, ctx);
       case 'add_task':          return toolAddTask(args, ctx);
@@ -542,6 +543,143 @@ function toolRemoveDependency(
     args.task_id, args.depends_on_id
   );
   return `Removed dependency: [${args.task_id}] is no longer blocked by [${args.depends_on_id}].`;
+}
+
+// ─── Project board ────────────────────────────────────────────────────
+
+/** A project goes stale when nothing in it has been touched for 2 weeks. */
+export const STALE_PROJECT_MS = 14 * 24 * 3600 * 1000;
+
+/** A "project" is a top-level task that is long-type or has steps (subtasks).
+ *  Everything else top-level is a loose one-off task. */
+const SELECT_OPEN_PROJECTS = `
+  SELECT t.* FROM tasks t
+  WHERE t.parent_id IS NULL
+    AND t.status NOT IN ('done', 'cancelled')
+    AND (t.type = 'long' OR EXISTS (SELECT 1 FROM tasks c WHERE c.parent_id = t.id))
+  ORDER BY ${TASK_ORDER_SQL}
+`;
+
+const SELECT_PROJECT_STEP_COUNTS = `
+  SELECT
+    COUNT(*) AS total,
+    SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done,
+    MAX(updated_at) AS last_step_activity
+  FROM tasks WHERE parent_id = ?
+`;
+
+const SELECT_PROJECT_NEXT_STEPS = `
+  SELECT t.* FROM tasks t
+  WHERE t.parent_id = ?
+    AND t.status IN ('todo', 'in_progress')
+    AND NOT EXISTS (
+      SELECT 1 FROM task_deps d
+      JOIN tasks blocker ON blocker.id = d.depends_on_id
+      WHERE d.task_id = t.id AND blocker.status NOT IN ('done', 'cancelled')
+    )
+  ORDER BY ${TASK_ORDER_SQL}
+  LIMIT 3
+`;
+
+const SELECT_LOOSE_TASKS = `
+  SELECT t.* FROM tasks t
+  WHERE t.parent_id IS NULL
+    AND t.status NOT IN ('done', 'cancelled')
+    AND t.type = 'short'
+    AND NOT EXISTS (SELECT 1 FROM tasks c WHERE c.parent_id = t.id)
+  ORDER BY ${TASK_ORDER_SQL}
+`;
+
+/** Daily-nudge window: due in the next 24h or became overdue in the last 24h.
+ *  Long-overdue items are deliberately excluded — the weekly review covers
+ *  them, and re-pinging the same item every day trains the user to ignore
+ *  the channel. */
+const SELECT_NUDGE_WINDOW = `
+  SELECT t.* FROM tasks t
+  WHERE t.status NOT IN ('done', 'cancelled')
+    AND t.due_at IS NOT NULL
+    AND t.due_at >= ? AND t.due_at <= ?
+  ORDER BY t.due_at ASC
+`;
+
+export interface ProjectOverview {
+  project: TaskRow;
+  totalSteps: number;
+  doneSteps: number;
+  /** Up to 3 actionable steps: todo/in_progress with no unfinished blockers. */
+  nextSteps: TaskRow[];
+  /** Most recent updated_at across the project and all of its steps. */
+  lastActivity: number;
+  stale: boolean;
+}
+
+export interface ProjectsSnapshot {
+  projects: ProjectOverview[];
+  loose: TaskRow[];
+}
+
+export function buildProjectsSnapshot(sql: SqlStorage): ProjectsSnapshot {
+  const now = Date.now();
+  const projects = sql.exec<TaskRow>(SELECT_OPEN_PROJECTS).toArray().map((project) => {
+    const counts = sql
+      .exec<{ total: number; done: number | null; last_step_activity: number | null }>(
+        SELECT_PROJECT_STEP_COUNTS, project.id,
+      )
+      .toArray()[0];
+    const nextSteps = sql.exec<TaskRow>(SELECT_PROJECT_NEXT_STEPS, project.id).toArray();
+    const lastActivity = Math.max(project.updated_at, counts?.last_step_activity ?? 0);
+    return {
+      project,
+      totalSteps: counts?.total ?? 0,
+      doneSteps: counts?.done ?? 0,
+      nextSteps,
+      lastActivity,
+      stale: now - lastActivity > STALE_PROJECT_MS,
+    };
+  });
+  const loose = sql.exec<TaskRow>(SELECT_LOOSE_TASKS).toArray();
+  return { projects, loose };
+}
+
+/** Text form of the project board — used by the show_projects tool and the
+ *  system-prompt snapshot so the model always sees the same picture. */
+export function projectsOverviewText(sql: SqlStorage): string {
+  const { projects, loose } = buildProjectsSnapshot(sql);
+  if (projects.length === 0 && loose.length === 0) {
+    return 'No open projects or tasks.';
+  }
+
+  const lines: string[] = [];
+  if (projects.length > 0) {
+    lines.push(`Active projects (${projects.length}):`);
+    for (const p of projects) {
+      const progress = p.totalSteps > 0 ? `${p.doneSteps}/${p.totalSteps} steps done` : 'no steps yet';
+      const staleDays = Math.floor((Date.now() - p.lastActivity) / 86_400_000);
+      const staleNote = p.stale ? ` — ⚠️ stale, no activity in ${staleDays}d` : '';
+      lines.push(`${formatTaskShort(p.project)} — ${progress}${staleNote}`);
+      if (p.nextSteps.length > 0) {
+        lines.push(...p.nextSteps.map((s) => `    ↳ next: ${formatTaskShort(s).trim()}`));
+      } else if (p.totalSteps > 0 && p.doneSteps === p.totalSteps) {
+        lines.push('    ↳ all steps done — confirm with the user, then mark the project done');
+      }
+    }
+  }
+  if (loose.length > 0) {
+    if (lines.length > 0) lines.push('');
+    lines.push(`Loose tasks (${loose.length}):`);
+    lines.push(...loose.map(formatTaskShort));
+  }
+  return lines.join('\n');
+}
+
+export function dueNudgeTasks(sql: SqlStorage): { newlyOverdue: TaskRow[]; dueToday: TaskRow[] } {
+  const now = Date.now();
+  const day = 86_400_000;
+  const rows = sql.exec<TaskRow>(SELECT_NUDGE_WINDOW, now - day, now + day).toArray();
+  return {
+    newlyOverdue: rows.filter((t) => (t.due_at ?? 0) < now),
+    dueToday: rows.filter((t) => (t.due_at ?? 0) >= now),
+  };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────

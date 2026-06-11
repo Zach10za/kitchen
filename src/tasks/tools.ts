@@ -10,8 +10,16 @@ export const TASKS_TOOLS = [
   {
     type: 'function' as const,
     function: {
+      name: 'show_projects',
+      description: 'The project board: every active project with step progress (n/m done), the next actionable steps, and staleness, plus loose one-off tasks. Call this first for open-ended questions ("where do my projects stand?", "what should I work on this weekend?") and for the weekly review.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
       name: 'show_summary',
-      description: 'Get a high-level summary of the task list: counts by status, next ready tasks, and any blocked tasks. Call this first when the user asks an open-ended question about their tasks or asks what they should work on.',
+      description: 'Flat status summary: counts by status/priority, overdue items, ready and blocked tasks. Prefer show_projects for project-level questions; use this for quick status counts.',
       parameters: { type: 'object', properties: {} },
     },
   },
