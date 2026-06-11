@@ -131,6 +131,10 @@ const COMMANDS = [
     ],
   },
   {
+    name: 'workout-today',
+    description: 'Show today\'s planned session card (say "done" in chat to log it as written)',
+  },
+  {
     name: 'workout-last',
     description: 'Show the most recent workout (every set, grouped by exercise)',
   },

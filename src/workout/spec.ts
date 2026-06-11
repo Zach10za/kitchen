@@ -9,6 +9,7 @@ import {
   topPRs,
   weeklyVolume,
   fullWorkout,
+  loadOpenSessionPlan,
   type WorkoutRow,
 } from './loop';
 import { buildWorkoutSystemPrompt } from './prompts';
@@ -19,7 +20,47 @@ import {
   workoutWeekEmbed,
   workoutProgramEmbed,
   workoutProfileEmbed,
+  sessionPlanEmbed,
 } from './render';
+
+// v6 DDL hoisted to a module constant so the multi-statement schema is passed
+// to sql.exec() by reference. REFERENCES clauses are documentation only.
+const SCHEMA_V6_COACH_DDL = `
+  CREATE TABLE IF NOT EXISTS session_plans (
+    id TEXT PRIMARY KEY,
+    date TEXT NOT NULL,
+    title TEXT NOT NULL,
+    focus TEXT,
+    status TEXT NOT NULL DEFAULT 'planned',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_session_plans_status ON session_plans(status, date DESC);
+
+  CREATE TABLE IF NOT EXISTS session_plan_exercises (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id TEXT NOT NULL REFERENCES session_plans(id),
+    exercise_id TEXT NOT NULL REFERENCES exercises(id),
+    exercise_order INTEGER NOT NULL DEFAULT 0,
+    sets INTEGER NOT NULL,
+    reps INTEGER NOT NULL,
+    weight_lbs REAL,
+    rpe_target REAL,
+    why TEXT,
+    is_new INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_spe_plan ON session_plan_exercises(plan_id, exercise_order);
+
+  CREATE TABLE IF NOT EXISTS niggles (
+    id TEXT PRIMARY KEY,
+    area TEXT NOT NULL,
+    note TEXT,
+    avoid TEXT,
+    opened_at INTEGER NOT NULL,
+    resolved_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_niggles_open ON niggles(resolved_at) WHERE resolved_at IS NULL;
+`;
 
 /** Workout bot spec — see runtime/bot-spec.ts for the contract. */
 export const WORKOUT_SPEC: BotSpec = {
@@ -27,6 +68,7 @@ export const WORKOUT_SPEC: BotSpec = {
   channelEnvKey: 'DISCORD_WORKOUT_CHANNEL_ID',
   commands: new Set([
     'workout',
+    'workout-today',
     'workout-last',
     'workout-prs',
     'workout-week',
@@ -43,6 +85,9 @@ export const WORKOUT_SPEC: BotSpec = {
     'routine_exercises',
     'routines',
     'programs',
+    'session_plan_exercises',
+    'session_plans',
+    'niggles',
     'exercises',
     'gym_equipment',
     'profile',
@@ -65,6 +110,16 @@ export const WORKOUT_SPEC: BotSpec = {
     if (cmd === 'workout') {
       const stats = buildWorkoutStats(sql);
       return { embeds: [workoutSummaryEmbed(stats)] };
+    }
+
+    if (cmd === 'workout-today') {
+      const plan = loadOpenSessionPlan(sql);
+      if (!plan) {
+        return {
+          content: "No session planned. Ask for one — `/workout message: what's today's workout` — and I'll build it from your recent training.",
+        };
+      }
+      return { embeds: [sessionPlanEmbed(plan)] };
     }
 
     if (cmd === 'workout-last') {
@@ -284,6 +339,16 @@ export const WORKOUT_SPEC: BotSpec = {
             updated_at INTEGER NOT NULL
           );
         `);
+      },
+    },
+    {
+      // v6: the coach layer. session_plans hold the bot-prescribed session
+      // (so "done" can log the whole thing as written); niggles make
+      // injuries first-class with an open/resolved lifecycle instead of an
+      // append-only health_notes blob.
+      version: 6,
+      up: (sql) => {
+        sql.exec(SCHEMA_V6_COACH_DDL);
       },
     },
   ],

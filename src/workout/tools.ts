@@ -414,6 +414,132 @@ export const WORKOUT_TOOLS = [
       parameters: { type: 'object', properties: {} },
     },
   },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'plan_session',
+      description: "Save today's prescribed session (the SESSION CARD you composed from their history). ALWAYS call this after generating a workout for the user — it's what lets them later say just \"done\" to log the whole thing. Replaces any other still-planned session. Use concrete integer reps (not ranges) so as-written logging is unambiguous; for an AMRAP final set, prescribe the floor and note AMRAP in why.",
+      parameters: {
+        type: 'object',
+        properties: {
+          date: { type: 'string', description: 'YYYY-MM-DD the session is for. Omit for today.' },
+          title: { type: 'string', description: 'Short session name, e.g. "Push — heavy bench focus".' },
+          focus: { type: 'string', description: 'The coach blurb: why this session today, how it connects to last time, what it builds toward. 2-3 sentences.' },
+          exercises: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                exercise: { type: 'string', description: 'Exercise name (catalog-matched; auto-created if new).' },
+                sets: { type: 'integer', description: 'Working sets.' },
+                reps: { type: 'integer', description: 'Target reps per set — concrete integer.' },
+                weight_lbs: { type: 'number', description: 'Target weight. Omit for bodyweight.' },
+                rpe_target: { type: 'number', description: 'Target RPE if relevant.' },
+                why: { type: 'string', description: 'One-line rationale or cue ("RPE 7 last week → +5 lb", "elbows ~45°").' },
+                is_new: { type: 'boolean', description: 'True if this movement is new/rotated-in for freshness.' },
+                equipment: { type: 'string', description: 'barbell/dumbbell/machine/cable/bodyweight/kettlebell/band/other — helps catalog + plate math.' },
+                primary_muscle: { type: 'string', description: 'Primary muscle, lowercase.' },
+              },
+              required: ['exercise', 'sets', 'reps'],
+            },
+          },
+        },
+        required: ['title', 'focus', 'exercises'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'log_planned_session',
+      description: 'Log the planned session as performed — the "done" path. With no adjustments, every exercise is logged exactly as prescribed. Pass adjustments only for what deviated (different weight, per-set reps like [5,5,4], extra/fewer sets, or skipped). Creates the workout, runs PR detection, and marks the plan done. Returns debrief stats.',
+      parameters: {
+        type: 'object',
+        properties: {
+          plan_id: { type: 'string', description: 'Specific plan (sp_…). Omit for the current open plan.' },
+          adjustments: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                exercise: { type: 'string', description: 'Which planned exercise this adjusts.' },
+                weight_lbs: { type: 'number', description: 'Actual weight if it differed.' },
+                reps_per_set: { type: 'array', items: { type: 'integer' }, description: 'Actual reps per set, e.g. [5,5,4]. Overrides sets count too.' },
+                sets: { type: 'integer', description: 'Actual set count if it differed (same reps each).' },
+                rpe: { type: 'number', description: 'RPE of the toughest set.' },
+                skipped: { type: 'boolean', description: 'True if they skipped this exercise.' },
+              },
+              required: ['exercise'],
+            },
+          },
+          notes: { type: 'string', description: 'Session notes ("felt strong", "cut short").' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'loadout',
+      description: 'Deterministic barbell math: per-side plate breakdown for a target weight plus a warm-up ladder (each rung with its own plates). Use when presenting any barbell work weight so the numbers are exact — never do plate arithmetic yourself.',
+      parameters: {
+        type: 'object',
+        properties: {
+          work_weight_lbs: { type: 'number', description: 'The working weight including the bar.' },
+          bar_weight_lbs: { type: 'number', description: 'Bar weight. Default 45.' },
+          warmup: { type: 'boolean', description: 'Include the warm-up ladder. Default true.' },
+        },
+        required: ['work_weight_lbs'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'lift_trends',
+      description: "Estimated-1RM trend per lift over recent weeks: weekly best e1RM series, net change, and a plateau flag (no improvement in 4+ weeks despite regular training). Without an exercise, covers the most-trained lifts. Use for the weekly recap and any 'how's my bench coming along?' question.",
+      parameters: {
+        type: 'object',
+        properties: {
+          exercise: { type: 'string', description: 'One exercise. Omit for the top trained lifts.' },
+          weeks: { type: 'integer', description: 'Lookback window in weeks. Default 12.' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'log_niggle',
+      description: 'Record an active niggle/injury as a first-class item: the area, what aggravates it, what to avoid. Call when the user mentions ANY pain/tweak/click ("knee was clicking on squats") — even casually. Sessions you generate must work around active niggles. Use update_profile health_notes only for chronic/structural conditions, not transient niggles.',
+      parameters: {
+        type: 'object',
+        properties: {
+          area: { type: 'string', description: 'Body area, e.g. "right shoulder", "lower back".' },
+          note: { type: 'string', description: 'What happened / what aggravates it.' },
+          avoid: { type: 'string', description: 'Movements/patterns to avoid while active, e.g. "overhead pressing, dips".' },
+        },
+        required: ['area'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'resolve_niggle',
+      description: 'Mark a niggle as healed/cleared so it stops constraining session generation. Match by id (n_…) or area.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Niggle id (n_…).' },
+          area: { type: 'string', description: 'Or the body area, if unambiguous.' },
+        },
+        required: [],
+      },
+    },
+  },
   // Shared Tavily-backed search (executed centrally in AgentDOBase). Use it to
   // ground training advice in reputable sources (returns facts only, no links).
   WEB_SEARCH_TOOL,
@@ -516,5 +642,40 @@ export interface GymEquipmentRow {
   notes: string | null;
   created_at: number;
   updated_at: number;
+  [key: string]: SqlStorageValue;
+}
+
+export interface SessionPlanRow {
+  id: string;
+  date: string;
+  title: string;
+  focus: string | null;
+  status: 'planned' | 'done' | 'skipped';
+  created_at: number;
+  updated_at: number;
+  [key: string]: SqlStorageValue;
+}
+
+export interface SessionPlanExerciseRow {
+  id: number;
+  plan_id: string;
+  exercise_id: string;
+  exercise_order: number;
+  sets: number;
+  reps: number;
+  weight_lbs: number | null;
+  rpe_target: number | null;
+  why: string | null;
+  is_new: 0 | 1;
+  [key: string]: SqlStorageValue;
+}
+
+export interface NiggleRow {
+  id: string;
+  area: string;
+  note: string | null;
+  avoid: string | null;
+  opened_at: number;
+  resolved_at: number | null;
   [key: string]: SqlStorageValue;
 }

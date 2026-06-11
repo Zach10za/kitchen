@@ -66,7 +66,7 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/grocery`, `/cookbook`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/projects`, `/projects-open`, `/projects-next`, `/projects-blocked`, `/projects-due`, `/workout`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
+You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/grocery`, `/cookbook`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/projects`, `/projects-open`, `/projects-next`, `/projects-blocked`, `/projects-due`, `/workout`, `/workout-today`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
 
 ### 6. Deploy the Worker
 
@@ -199,24 +199,35 @@ just went overdue. Hour is `PROJECTS_REVIEW_HOUR_LOCAL` (default 9).
 In your `#workout` channel:
 
 ```
-/workout                 summary: last workout, active program, weekly volume, top e1RMs
-/workout message:...     log sets, track progression, plan programs (e.g. "log 3x5 squat at 225")
+/workout                 summary: last workout, planned session, weekly volume, top e1RMs
+/workout message:...     ask for today's session, log sets, ask about progress
+/workout-today           today's planned session card (say "done" in chat to log it as written)
 /workout-last            full breakdown of the most recent workout
 /workout-prs             top estimated 1RMs across all lifts (optional exercise filter)
 /workout-week            sets + tonnage by muscle group for the last 7 days (configurable)
-/workout-program         active training program with all routines and planned exercises
+/workout-program         optional fixed program (the adaptive session generator is the default)
 /workout-profile         your bio/goals/preferences/health-notes + home-gym inventory
 ```
 
-The bot reads four kinds of context on every reply:
+The bot is a coach, not a logbook. Ask "what should I do today?" and it **writes the
+session fresh from your history** — progression per lift driven by your last weights and
+RPE, lagging muscle groups topped up, accessories rotated for freshness (at most one 🆕
+movement per session, with technique cues), niggles and equipment respected — then saves
+it as a session card with exact weights, per-side plate math, and a warm-up ladder.
+When you finish, say **"done"** and the whole session logs as written; only deviations
+need words ("bench was 5,5,4"). PRs are detected at log time and celebrated in the
+moment; every session ends with a short debrief (tonnage vs last time, one observation,
+what's next).
+
+Context it reads on every reply:
 - **Profile**: bio, goals, preferences (free text — set via chat)
-- **Health notes**: injuries, current niggles, movement restrictions. Mention a tweak in chat ("my back's been iffy") and the agent appends a date-stamped entry; it then steers around it in future suggestions.
-- **Home gym inventory**: what you actually own. The bot will only suggest movements you can actually do; if you don't have a cable stack, no cable rows.
-- **Training state**: active program, recent workouts, weekly volume, PRs.
+- **Active niggles**: first-class tweaks with a lifecycle. Mention "knee was clicking on squats" and it's recorded, programmed around, and after two quiet weeks the bot asks if it's cleared. Health notes remain for chronic/structural stuff.
+- **Home gym inventory**: what you actually own. No cable stack → no cable rows.
+- **Training state**: planned session, recent workouts, weekly volume, PRs, lift trends.
 
 It also speaks first (hour is `WORKOUT_CHECKIN_HOUR_LOCAL`, default 9):
-- **Monday recap** — last week's sessions/volume/PRs and what's lagging, while you're actively training.
-- **Inactivity nudge** — after 3+ days without a session (at most every 3 days, and it goes quiet past 3 weeks rather than nag).
+- **Monday recap** — last week vs the one before, e1RM trend per main lift with plateau call-outs (and a concrete fix, not just a flag), while you're actively training.
+- **Inactivity nudge** — after 3+ days without a session it generates and posts today's session card (at most every 3 days; goes quiet past 3 weeks rather than nag).
 - **Training breaks** — say "I can't work out for the next few weeks" and it records a hiatus: no nudges until the end date, then one welcome-back message with a ramp-back first session. Back early? Just say so.
 
 …or just talk in any channel. The Fly.io relay forwards messages to the right bot based on channel ID, so plain messages work without slash commands. Per-channel rate limit: `RELAY_RATE_LIMIT_PER_HOUR` (default 30/hr) prevents unbounded LLM spend.

@@ -282,6 +282,8 @@ function isFastReadCommand(interaction: Interaction): boolean {
     // Workout
     case 'workout':
       return !hasMessage;     // /workout (alone) = summary; with message = agent
+    case 'workout-today':
+      return true;            // pure read
     case 'workout-last':
       return true;            // pure read
     case 'workout-prs':
