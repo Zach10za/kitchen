@@ -8,6 +8,10 @@ import { TASKS_SPEC } from './tasks/spec';
 import { buildTaskStats, buildProjectsSnapshot, dueNudgeTasks } from './tasks/loop';
 import { projectsNudgeEmbed } from './tasks/render';
 
+/** Per-message attachment cap and per-file size cap for /files/ingest. */
+const MAX_FILES_PER_MESSAGE = 5;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+
 /**
  * TasksDO holds the projects bot's state (the internal id stays 'tasks' —
  * the DO binding, channel env key, and admin ?bot= names are wired to it).
@@ -29,6 +33,53 @@ export class TasksDO extends AgentDOBase<Env> {
     // Base already dropped user data; re-arm the daily alarm so it isn't lost.
     await this.ctx.storage.deleteAlarm();
     await this.armNextReview();
+  }
+
+  /**
+   * /files/ingest — called by the Worker's /relay/message handler when a
+   * forwarded Discord message carries attachments. Downloads each file from
+   * the Discord CDN (those URLs expire — R2 is the durable home), stores the
+   * bytes, and indexes a row with project_id NULL (the inbox). The agent
+   * files it to a project via attach_file based on the message's caption.
+   */
+  protected async handleCustomRoute(request: Request, url: URL): Promise<Response | null> {
+    if (url.pathname === '/files/ingest' && request.method === 'POST') {
+      const body = (await request.json()) as {
+        attachments?: Array<{ url: string; filename: string; content_type?: string | null; size?: number }>;
+      };
+      const saved: Array<{ id: string; filename: string; size: number }> = [];
+      const skipped: string[] = [];
+
+      for (const att of (body.attachments ?? []).slice(0, MAX_FILES_PER_MESSAGE)) {
+        if (!att?.url || !att.filename) continue;
+        if ((att.size ?? 0) > MAX_FILE_BYTES) {
+          skipped.push(`${att.filename} (over the ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB limit)`);
+          continue;
+        }
+        try {
+          const res = await fetch(att.url);
+          if (!res.ok || !res.body) {
+            skipped.push(`${att.filename} (download failed: ${res.status})`);
+            continue;
+          }
+          const id = `f_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+          const key = `projects/${id}/${att.filename}`;
+          await this.env.FILES.put(key, res.body, {
+            httpMetadata: att.content_type ? { contentType: att.content_type } : undefined,
+          });
+          this.sql.exec(
+            'INSERT INTO project_files (id, project_id, filename, r2_key, content_type, size, note, created_at) VALUES (?, NULL, ?, ?, ?, ?, NULL, ?)',
+            id, att.filename, key, att.content_type ?? null, att.size ?? null, Date.now(),
+          );
+          saved.push({ id, filename: att.filename, size: att.size ?? 0 });
+        } catch (err) {
+          console.error('file ingest failed', { filename: att.filename, err });
+          skipped.push(`${att.filename} (error storing)`);
+        }
+      }
+      return Response.json({ files: saved, skipped });
+    }
+    return null;
   }
 
   protected async dispatchCommand(interaction: Interaction): Promise<void> {

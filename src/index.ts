@@ -65,8 +65,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       messageId?: string;
       userMessage: string;
       author?: string;
+      /** Discord attachments on the message — CDN URLs (expiring) + metadata. */
+      attachments?: Array<{ url: string; filename: string; content_type?: string | null; size?: number }>;
     };
-    if (!body.channelId || !body.messageId || !body.userMessage) {
+    const hasAttachments = (body.attachments?.length ?? 0) > 0;
+    if (!body.channelId || !body.messageId || (!body.userMessage && !hasAttachments)) {
       return new Response('bad request', { status: 400 });
     }
 
@@ -90,6 +93,41 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       return new Response('rate limited', { status: 429 });
     }
 
+    // Attachments: the projects bot stores them durably (Discord CDN URLs
+    // expire) and the agent files them to a project from the caption. Other
+    // bots just get told a file was attached — they have no file store.
+    let userMessage = body.userMessage ?? '';
+    if (hasAttachments) {
+      if (bot.id === 'tasks') {
+        try {
+          const ingestRes = await stub.fetch('https://internal/files/ingest', {
+            method: 'POST',
+            body: JSON.stringify({ attachments: body.attachments }),
+          });
+          const ingest = (await ingestRes.json()) as {
+            files: Array<{ id: string; filename: string; size: number }>;
+            skipped: string[];
+          };
+          const lines = [
+            ...ingest.files.map((f) => `[Attached file saved: ${f.id} ${f.filename}]`),
+            ...ingest.skipped.map((s) => `[Attachment NOT saved: ${s}]`),
+          ];
+          if (ingest.files.length > 0) {
+            lines.push('File the saved file(s) to the right project with attach_file, inferring from my message.');
+          }
+          userMessage = [userMessage, ...lines].filter(Boolean).join('\n');
+        } catch (err) {
+          ctx.waitUntil(captureError(env, err, { source: 'relay:file-ingest' }));
+          userMessage = [userMessage, '[Attachments could not be stored — tell the user to retry.]']
+            .filter(Boolean).join('\n');
+        }
+      } else {
+        const names = body.attachments!.map((a) => a.filename).join(', ');
+        userMessage = [userMessage, `[User attached: ${names} — file storage lives in the projects channel.]`]
+          .filter(Boolean).join('\n');
+      }
+    }
+
     // Two reply paths:
     //  1) Top-level message → open a fresh thread anchored to the user's msg.
     //  2) Already in a thread → reuse that thread, no new thread creation.
@@ -104,7 +142,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           env,
           channelId: body.channelId,
           parentMessageId: body.messageId,
-          titleSeed: body.userMessage,
+          titleSeed: body.userMessage || body.attachments?.[0]?.filename || 'attachment',
         });
       } catch (err) {
         ctx.waitUntil(captureError(env, err, { source: 'relay:thread-create' }));
@@ -114,7 +152,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
     // Dispatch into the unified AgentChatWorkflow. The registry resolves the
     // bot's default conversation scope (thread_id — the reply thread).
-    ctx.waitUntil(dispatchChat(env, bot.id, body.userMessage, replyChannelId));
+    ctx.waitUntil(dispatchChat(env, bot.id, userMessage, replyChannelId));
 
     return Response.json({ ok: true });
   }

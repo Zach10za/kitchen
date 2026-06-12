@@ -61,6 +61,41 @@ export class DiscordAPI {
     return firstId!;
   }
 
+  /**
+   * Post a message with a file attachment (multipart upload). Used to send
+   * stored project files (images, STLs, …) back into Discord. Subject to the
+   * guild's bot upload cap (~10 MB on non-boosted servers) — callers should
+   * surface the thrown error rather than retry.
+   */
+  async postFile(
+    channelId: string,
+    filename: string,
+    data: ArrayBuffer | Uint8Array,
+    content?: string,
+  ): Promise<{ id: string }> {
+    const form = new FormData();
+    form.append(
+      'payload_json',
+      JSON.stringify({
+        content: content ?? '',
+        allowed_mentions: { parse: [] },
+        attachments: [{ id: 0, filename }],
+      }),
+    );
+    const bytes = data instanceof Uint8Array
+      ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer
+      : data;
+    form.append('files[0]', new Blob([bytes]), filename);
+    const res = await fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
+      method: 'POST',
+      // No explicit Content-Type: fetch sets the multipart boundary itself.
+      headers: { Authorization: `Bot ${this.botToken}` },
+      body: form,
+    });
+    if (!res.ok) throw new Error(`Discord postFile failed: ${res.status} ${await res.text()}`);
+    return (await res.json()) as { id: string };
+  }
+
   /** Send a follow-up message in response to an interaction (after deferring). */
   async followUp(interactionToken: string, input: Sendable): Promise<void> {
     const payload = normalize(input);

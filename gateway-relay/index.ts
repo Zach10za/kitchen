@@ -247,9 +247,19 @@ async function resolveThreadParent(channelId: string): Promise<string | null> {
 async function forwardMessage(msg: any): Promise<void> {
   // Ignore bot messages (including our own replies).
   if (msg.author?.bot) return;
-  // Ignore empty messages (embed-only, attachments without text).
   const content = (msg.content ?? '').trim();
-  if (!content) return;
+  // Forward attachments (images, STLs, …) so the Worker can store them —
+  // Discord CDN URLs expire, so the Worker downloads them immediately.
+  const attachments = (Array.isArray(msg.attachments) ? msg.attachments : [])
+    .filter((a: any) => a?.url && a?.filename)
+    .map((a: any) => ({
+      url: a.url as string,
+      filename: a.filename as string,
+      content_type: (a.content_type ?? null) as string | null,
+      size: (a.size ?? 0) as number,
+    }));
+  // Ignore truly empty messages (embed-only, stickers).
+  if (!content && attachments.length === 0) return;
 
   // Two paths:
   //  1) Top-level message in a watched channel → forward as-is.
@@ -262,7 +272,8 @@ async function forwardMessage(msg: any): Promise<void> {
   }
 
   const where = parentChannelId ? `thread of ${parentChannelId}` : 'channel';
-  console.log(`Forwarding from ${msg.author?.username} (${where}): ${content.slice(0, 80)}`);
+  const attachNote = attachments.length > 0 ? ` [+${attachments.length} attachment(s)]` : '';
+  console.log(`Forwarding from ${msg.author?.username} (${where}): ${content.slice(0, 80)}${attachNote}`);
 
   try {
     const res = await fetch(`${WORKER_URL}/relay/message`, {
@@ -277,6 +288,7 @@ async function forwardMessage(msg: any): Promise<void> {
         messageId: msg.id,
         author: msg.author?.username,
         userMessage: content,
+        attachments,
       }),
     });
     if (!res.ok) {

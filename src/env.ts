@@ -9,6 +9,9 @@ export interface Env {
    *  one Cloudflare Workflow class (`AgentChatWorkflow`) serves every bot,
    *  parameterized by `botId` in the workflow params. */
   AGENT_CHAT_WORKFLOW: Workflow;
+  /** R2 bucket for project files (plan images, STLs, ...). Create once with
+   *  `bunx wrangler r2 bucket create kitchen-files`. */
+  FILES: R2Bucket;
 
   // Vars
   OPENAI_MODEL: string;

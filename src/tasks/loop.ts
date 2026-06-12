@@ -4,13 +4,19 @@
  * universal `/workflow/agent/exec-tool` endpoint on TasksDO.
  */
 
-import type { SupplyRow, TaskRow } from './tools';
+import type { Env } from '../env';
+import { DiscordAPI } from '../discord/api';
+import type { FileRow, SupplyRow, TaskRow } from './tools';
 
 export interface TasksToolCtx {
   sql: SqlStorage;
   /** IANA timezone for the household. Used to convert bare YYYY-MM-DD
    *  due-dates into end-of-day in the user's local time instead of UTC. */
   timezone?: string;
+  /** Needed by the file tools (R2 access + posting attachments back). */
+  env?: Env;
+  /** The reply thread/channel — where send_file posts the attachment. */
+  replyChannelId?: string;
 }
 
 // ─── Public constants ────────────────────────────────────────────────
@@ -59,7 +65,7 @@ export const TASK_ORDER_SQL = `
 
 // ─── Tool dispatch ───────────────────────────────────────────────────
 
-export function executeTasksTool(name: string, args: any, ctx: TasksToolCtx): string {
+export async function executeTasksTool(name: string, args: any, ctx: TasksToolCtx): Promise<string> {
   try {
     switch (name) {
       case 'show_summary':      return toolShowSummary(ctx);
@@ -70,6 +76,10 @@ export function executeTasksTool(name: string, args: any, ctx: TasksToolCtx): st
       case 'update_task':       return toolUpdateTask(args, ctx);
       case 'update_plan':       return toolUpdatePlan(args, ctx);
       case 'update_supplies':   return toolUpdateSupplies(args, ctx);
+      case 'attach_file':       return toolAttachFile(args, ctx);
+      case 'list_files':        return toolListFiles(args, ctx);
+      case 'send_file':         return await toolSendFile(args, ctx);
+      case 'remove_file':       return await toolRemoveFile(args, ctx);
       case 'add_dependency':    return toolAddDependency(args, ctx);
       case 'remove_dependency': return toolRemoveDependency(args, ctx);
       default:                  return `Unknown tasks tool: ${name}`;
@@ -382,6 +392,12 @@ function toolGetTask(args: { id: string }, ctx: TasksToolCtx): string {
       lines.push('');
       lines.push(`Supplies (${needed.length} needed${bought > 0 ? `, ${bought} bought` : ''}):`);
       lines.push(...needed.map((s) => `  🛒 ${s.qty ? s.qty + ' ' : ''}${s.name}${s.spec ? ` — ${s.spec}` : ''}${s.notes ? ` (${s.notes})` : ''}`));
+    }
+    const files = filesForProject(ctx.sql, task.id);
+    if (files.length > 0) {
+      lines.push('');
+      lines.push('Files (send_file to share one into the conversation):');
+      lines.push(...files.map((f) => `  📎 [${f.id}] ${f.filename}${fmtSize(f.size)}${f.note ? ` — ${f.note}` : ''}`));
     }
     if (task.plan) {
       lines.push('');
@@ -802,6 +818,76 @@ function toolUpdateSupplies(
   return `${verb}: ${hits.map((h) => h.name).join(', ')}.${misses.length > 0 ? ` No match for: ${misses.join(', ')}.` : ''} ${needed} item(s) still needed for "${found.project.title}".`;
 }
 
+// ─── Project files (bytes in R2; index rows here) ─────────────────────
+
+export function filesForProject(sql: SqlStorage, projectId: string): FileRow[] {
+  return sql
+    .exec<FileRow>('SELECT * FROM project_files WHERE project_id = ? ORDER BY created_at ASC', projectId)
+    .toArray();
+}
+
+function fmtSize(size: number | null): string {
+  if (size == null || size <= 0) return '';
+  if (size < 1024 * 1024) return ` (${Math.max(1, Math.round(size / 1024))} KB)`;
+  return ` (${(size / (1024 * 1024)).toFixed(1)} MB)`;
+}
+
+function getFile(sql: SqlStorage, fileId: string): FileRow | null {
+  return sql.exec<FileRow>('SELECT * FROM project_files WHERE id = ?', fileId).toArray()[0] ?? null;
+}
+
+function toolAttachFile(args: { file_id: string; project_id: string; note?: string }, ctx: TasksToolCtx): string {
+  const file = getFile(ctx.sql, args.file_id);
+  if (!file) return `No file with id "${args.file_id}".`;
+  const found = requireProject(ctx.sql, args.project_id);
+  if (!found.ok) return found.error;
+  ctx.sql.exec(
+    'UPDATE project_files SET project_id = ?, note = COALESCE(?, note) WHERE id = ?',
+    args.project_id, args.note?.trim() || null, args.file_id,
+  );
+  return `Filed ${file.filename} [${file.id}] to "${found.project.title}"${args.note ? ` — ${args.note.trim()}` : ''}.`;
+}
+
+function toolListFiles(args: { project_id?: string }, ctx: TasksToolCtx): string {
+  if (args.project_id) {
+    const found = requireProject(ctx.sql, args.project_id);
+    if (!found.ok) return found.error;
+    const files = filesForProject(ctx.sql, args.project_id);
+    if (files.length === 0) return `No files on "${found.project.title}".`;
+    return `Files on "${found.project.title}":\n${files.map((f) => `- [${f.id}] ${f.filename}${fmtSize(f.size)}${f.note ? ` — ${f.note}` : ''}`).join('\n')}`;
+  }
+  const all = ctx.sql
+    .exec<FileRow & { project_title: string | null }>(
+      'SELECT f.*, t.title AS project_title FROM project_files f LEFT JOIN tasks t ON t.id = f.project_id ORDER BY f.created_at DESC LIMIT 50',
+    )
+    .toArray();
+  if (all.length === 0) return 'No files stored yet. The user can drop a file in the channel with a caption and it lands here.';
+  return all
+    .map((f) => `- [${f.id}] ${f.filename}${fmtSize(f.size)} — ${f.project_title ?? '📥 INBOX (not filed — attach_file it)'}${f.note ? ` — ${f.note}` : ''}`)
+    .join('\n');
+}
+
+async function toolSendFile(args: { file_id: string }, ctx: TasksToolCtx): Promise<string> {
+  const file = getFile(ctx.sql, args.file_id);
+  if (!file) return `No file with id "${args.file_id}".`;
+  if (!ctx.env || !ctx.replyChannelId) return 'File sending is unavailable in this context.';
+  const object = await ctx.env.FILES.get(file.r2_key);
+  if (!object) return `Stored bytes for ${file.filename} are missing from the bucket (key ${file.r2_key}). The index row may be stale — offer remove_file.`;
+  const data = await object.arrayBuffer();
+  await new DiscordAPI(ctx.env.DISCORD_BOT_TOKEN, ctx.env.DISCORD_APP_ID).postFile(
+    ctx.replyChannelId, file.filename, data, file.note ? `📎 ${file.filename} — ${file.note}` : `📎 ${file.filename}`,
+  );
+  return `Sent ${file.filename}${fmtSize(file.size)} into the conversation. Don't repeat its contents — the user can see the attachment.`;
+}
+
+async function toolRemoveFile(args: { file_id: string }, ctx: TasksToolCtx): Promise<string> {
+  const file = getFile(ctx.sql, args.file_id);
+  if (!file) return `No file with id "${args.file_id}".`;
+  if (ctx.env) await ctx.env.FILES.delete(file.r2_key);
+  ctx.sql.exec('DELETE FROM project_files WHERE id = ?', args.file_id);
+  return `Deleted ${file.filename} [${file.id}] permanently.`;
+}
+
 export function suppliesForProject(sql: SqlStorage, projectId: string): SupplyRow[] {
   return sql
     .exec<SupplyRow>(
@@ -871,7 +957,7 @@ function wouldCycle(sql: SqlStorage, taskId: string, dependsOnId: string): boole
 
 // ─── Re-exports for DO and fast-read path ────────────────────────────
 
-export type { SupplyRow, TaskRow };
+export type { FileRow, SupplyRow, TaskRow };
 
 export interface TaskStats {
   total: number;

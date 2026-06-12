@@ -8,6 +8,7 @@ import {
   buildProjectsSnapshot,
   findProjectByName,
   loadNeededSupplies,
+  filesForProject,
   TASK_ORDER_SQL,
   DUE_SOON_WINDOW_MS,
   type TaskRow,
@@ -17,6 +18,23 @@ import { projectsOverviewEmbed, tasksListEmbed, tasksDueEmbed, suppliesEmbed, pl
 
 // v5 DDL hoisted to a module constant. REFERENCES is documentation only —
 // DO SQLite doesn't enable foreign_keys.
+// v6: file attachments for projects (plan images, STLs). Bytes live in the
+// FILES R2 bucket; rows here are the index. project_id NULL = inbox (saved
+// from a Discord message but not yet filed to a project by the agent).
+const SCHEMA_V6_FILES_DDL = `
+  CREATE TABLE IF NOT EXISTS project_files (
+    id TEXT PRIMARY KEY,
+    project_id TEXT REFERENCES tasks(id),
+    filename TEXT NOT NULL,
+    r2_key TEXT NOT NULL,
+    content_type TEXT,
+    size INTEGER,
+    note TEXT,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_files_project ON project_files(project_id);
+`;
+
 const SCHEMA_V5_SUPPLIES_DDL = `
   CREATE TABLE IF NOT EXISTS supplies (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,13 +67,20 @@ export const TASKS_SPEC: BotSpec = {
     'plan',
   ]),
   tools: TASKS_TOOLS,
-  resetTables: ['supplies', 'tasks', 'task_deps', 'conversation'],
+  // Note: /reset clears project_files rows but leaves R2 objects behind —
+  // they're orphaned, not leaked secrets, and reset is a dev/admin escape hatch.
+  resetTables: ['supplies', 'project_files', 'tasks', 'task_deps', 'conversation'],
   scopeColumn: 'thread_id',
 
   buildSystemPrompt: (sql, env) => buildTasksSystemPrompt(sql, env.TIMEZONE),
 
   executeTool: (name, args, ctx) =>
-    executeTasksTool(name, args, { sql: ctx.sql, timezone: ctx.timezone }),
+    executeTasksTool(name, args, {
+      sql: ctx.sql,
+      timezone: ctx.timezone,
+      env: ctx.env,
+      replyChannelId: ctx.scope.value,
+    }),
 
   fastRead: (sql, _env, interaction): MessagePayload | null => {
     const cmd = interaction.data?.name ?? '';
@@ -138,7 +163,7 @@ export const TASKS_SPEC: BotSpec = {
       if (!project) {
         return { content: `No project matching "${query}".` };
       }
-      return { embeds: [planEmbed(project)] };
+      return { embeds: [planEmbed(project, filesForProject(sql, project.id))] };
     }
 
     return null;
@@ -220,6 +245,13 @@ export const TASKS_SPEC: BotSpec = {
           sql.exec('ALTER TABLE tasks ADD COLUMN plan TEXT');
         }
         sql.exec(SCHEMA_V5_SUPPLIES_DDL);
+      },
+    },
+    {
+      // v6: project file attachments (index rows; bytes live in R2).
+      version: 6,
+      up: (sql) => {
+        sql.exec(SCHEMA_V6_FILES_DDL);
       },
     },
   ],

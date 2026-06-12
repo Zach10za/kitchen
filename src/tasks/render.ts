@@ -6,7 +6,7 @@
  */
 
 import { EmbedColor, type Embed } from '../discord/types';
-import type { ProjectsSnapshot, SupplyRow, TaskRow } from './loop';
+import type { FileRow, ProjectsSnapshot, SupplyRow, TaskRow } from './loop';
 
 const STATUS_ICON: Record<string, string> = {
   todo: '⬜',
@@ -176,12 +176,23 @@ export function suppliesEmbed(items: Array<SupplyRow & { project_title: string }
   };
 }
 
-export function planEmbed(project: TaskRow): Embed {
+export function planEmbed(project: TaskRow, files: FileRow[] = []): Embed {
+  const fileField = files.length > 0
+    ? [{
+        name: `📎 Files (${files.length})`,
+        value: files
+          .map((f) => `\`${f.id}\` ${f.filename}${f.note ? ` — _${f.note}_` : ''}`)
+          .join('\n')
+          .slice(0, 1024),
+      }]
+    : undefined;
+
   if (!project.plan) {
     return {
       title: `📐 ${project.title}`,
       description: 'No plan yet. Talk it through — "let\'s plan the sprinkler manifold" — and I\'ll keep a living plan doc here as decisions land.',
       color: EmbedColor.archived,
+      fields: fileField,
     };
   }
   const truncated = project.plan.length > 4096;
@@ -189,10 +200,11 @@ export function planEmbed(project: TaskRow): Embed {
     title: `📐 ${project.title} — plan`,
     description: truncated ? project.plan.slice(0, 4093) + '…' : project.plan,
     color: EmbedColor.inProgress,
+    fields: fileField,
     footer: {
       text: truncated
-        ? 'Truncated — ask for a specific section in chat. Updates via conversation.'
-        : 'A living doc — talk through changes and it stays current',
+        ? 'Truncated — ask for a specific section in chat. Ask for any file by name.'
+        : 'A living doc — talk through changes and it stays current. Ask for any file by name.',
     },
   };
 }

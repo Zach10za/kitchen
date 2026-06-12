@@ -72,6 +72,7 @@ You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/
 
 ```bash
 bunx wrangler login        # interactive
+bunx wrangler r2 bucket create kitchen-files   # one-time; stores project files (plan images, STLs)
 bunx wrangler deploy
 ```
 
@@ -203,6 +204,12 @@ Complex projects get more than a step list:
   matters at the store ("7× sprinkler head, adjustable 90° nozzle"). Say "got
   the PVC" to check things off. The bot flags when a next step is blocked on
   unbought supplies, and `/supplies` is the combined store-run list.
+- **Files**: drop an image, STL, PDF — anything — into the channel with a
+  caption and it's stored durably in R2 (Discord's own attachment links
+  expire) and filed to the project. Files show in `/plan` and `get_task`;
+  ask for one by name ("send me the manifold sketch") and the bot posts it
+  back as an attachment. Up to 25 MB stored per file; sending back is subject
+  to Discord's bot upload cap (~10 MB on non-boosted servers).
 
 The projects bot also speaks first: Monday mornings it posts a short project
 review (progress, the one next action per project, stale-project and
