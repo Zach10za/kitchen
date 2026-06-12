@@ -140,6 +140,49 @@ export const TASKS_TOOLS = [
   {
     type: 'function' as const,
     function: {
+      name: 'update_plan',
+      description: "Save or update a project's living plan — a markdown document for design decisions, measurements, layout, and build sequence (e.g. a sprinkler system's manifold design + zone layout). Pass the COMPLETE merged document every time: read the current plan (get_task shows it), fold in what changed, never drop existing detail. Use sections like ## Design, ## Materials, ## Sequence, ## Decisions. Keep the plan and the project's steps in sync — when the sequence changes, update the subtasks too.",
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: { type: 'string', description: 'The project (top-level task id, t_…).' },
+          content: { type: 'string', description: 'Full merged plan as Markdown. Replaces the stored plan.' },
+        },
+        required: ['project_id', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'update_supplies',
+      description: 'Maintain a project\'s supplies/shopping list (no prices — just what to buy). "add" items with qty + spec ("7x sprinkler head, adjustable 90° nozzle"; "3x 10ft 1in sch-40 PVC"). "bought" marks them acquired ("got the PVC"). "remove" drops mistakes. Call this whenever the user mentions materials a project needs or reports buying them.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project_id: { type: 'string', description: 'The project (top-level task id, t_…).' },
+          action: { type: 'string', enum: ['add', 'bought', 'remove'] },
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', description: 'Item name, lowercase ("sprinkler head", "pvc pipe").' },
+                qty: { type: 'string', description: 'e.g. "7", "3x 10ft sticks". Omit if unknown.' },
+                spec: { type: 'string', description: 'Variant/spec that matters at the store: "adjustable 90° nozzle", "1in schedule 40".' },
+                notes: { type: 'string', description: 'Optional: where to buy, alternatives.' },
+              },
+              required: ['name'],
+            },
+          },
+        },
+        required: ['project_id', 'action', 'items'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
       name: 'add_dependency',
       description: 'Add a dependency: task A cannot start until task B is done. Use when one task is blocked by another. Prevents cycles.',
       parameters: {
@@ -183,6 +226,8 @@ export interface TaskRow {
   parent_id: string | null;
   notes: string | null;
   due_at: number | null;
+  /** Living plan document (markdown). Only meaningful on projects (top-level tasks). */
+  plan: string | null;
   created_at: number;
   updated_at: number;
   [key: string]: SqlStorageValue;
@@ -192,5 +237,19 @@ export interface TaskDepRow {
   id: number;
   task_id: string;
   depends_on_id: string;
+  [key: string]: SqlStorageValue;
+}
+
+/** One supplies/shopping-list row, always attached to a project. */
+export interface SupplyRow {
+  id: number;
+  project_id: string;
+  name: string;
+  qty: string | null;
+  spec: string | null;
+  status: 'needed' | 'bought';
+  notes: string | null;
+  created_at: number;
+  updated_at: number;
   [key: string]: SqlStorageValue;
 }

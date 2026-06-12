@@ -6,12 +6,32 @@ import { TASKS_TOOLS } from './tools';
 import {
   executeTasksTool,
   buildProjectsSnapshot,
+  findProjectByName,
+  loadNeededSupplies,
   TASK_ORDER_SQL,
   DUE_SOON_WINDOW_MS,
   type TaskRow,
 } from './loop';
 import { buildTasksSystemPrompt } from './prompts';
-import { projectsOverviewEmbed, tasksListEmbed, tasksDueEmbed } from './render';
+import { projectsOverviewEmbed, tasksListEmbed, tasksDueEmbed, suppliesEmbed, planEmbed } from './render';
+
+// v5 DDL hoisted to a module constant. REFERENCES is documentation only —
+// DO SQLite doesn't enable foreign_keys.
+const SCHEMA_V5_SUPPLIES_DDL = `
+  CREATE TABLE IF NOT EXISTS supplies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL REFERENCES tasks(id),
+    name TEXT NOT NULL,
+    qty TEXT,
+    spec TEXT,
+    status TEXT NOT NULL DEFAULT 'needed',
+    notes TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_supplies_project ON supplies(project_id, status);
+  CREATE INDEX IF NOT EXISTS idx_supplies_needed ON supplies(status) WHERE status = 'needed';
+`;
 
 /** Projects bot spec (id stays 'tasks' — DO binding, channel env key, and
  *  admin ?bot= names are wired to it). See runtime/bot-spec.ts for the
@@ -25,9 +45,11 @@ export const TASKS_SPEC: BotSpec = {
     'projects-next',
     'projects-blocked',
     'projects-due',
+    'supplies',
+    'plan',
   ]),
   tools: TASKS_TOOLS,
-  resetTables: ['tasks', 'task_deps', 'conversation'],
+  resetTables: ['supplies', 'tasks', 'task_deps', 'conversation'],
   scopeColumn: 'thread_id',
 
   buildSystemPrompt: (sql, env) => buildTasksSystemPrompt(sql, env.TIMEZONE),
@@ -100,6 +122,25 @@ export const TASKS_SPEC: BotSpec = {
       return { embeds: [tasksDueEmbed(tasks)] };
     }
 
+    if (cmd === 'supplies') {
+      return { embeds: [suppliesEmbed(loadNeededSupplies(sql))] };
+    }
+
+    if (cmd === 'plan') {
+      const optionMap = Object.fromEntries(
+        (interaction.data?.options ?? []).map((o) => [o.name, o.value]),
+      );
+      const query = String(optionMap.project ?? '').trim();
+      if (!query) {
+        return { content: 'Pass a project name, e.g. `/plan project:sprinkler`.' };
+      }
+      const project = findProjectByName(sql, query);
+      if (!project) {
+        return { content: `No project matching "${query}".` };
+      }
+      return { embeds: [planEmbed(project)] };
+    }
+
     return null;
   },
 
@@ -164,6 +205,21 @@ export const TASKS_SPEC: BotSpec = {
         }
         sql.exec("CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_at) WHERE due_at IS NOT NULL");
         sql.exec("CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority)");
+      },
+    },
+    {
+      // v5: the planning layer — a living plan doc per project (markdown
+      // column on tasks) and a per-project supplies/shopping list.
+      version: 5,
+      up: (sql) => {
+        const existingColumns = sql
+          .exec<{ name: string }>("PRAGMA table_info(tasks)")
+          .toArray()
+          .map((r) => r.name);
+        if (!existingColumns.includes('plan')) {
+          sql.exec('ALTER TABLE tasks ADD COLUMN plan TEXT');
+        }
+        sql.exec(SCHEMA_V5_SUPPLIES_DDL);
       },
     },
   ],

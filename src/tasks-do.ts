@@ -45,6 +45,18 @@ export class TasksDO extends AgentDOBase<Env> {
       return;
     }
 
+    // /supplies with a message → agent ("got the pvc", "the sprinkler project
+    // needs 7 heads"). Bare /supplies is a fast read.
+    if (commandName === 'supplies' && optionMap.message) {
+      const message = String(optionMap.message);
+      await this.dispatchChatInteraction(
+        interaction,
+        `Supplies update: ${message}`,
+        `supplies: ${message}`,
+      );
+      return;
+    }
+
     await this.discord.editOriginal(
       interaction.token,
       `Unknown projects command: \`${commandName}\``,
@@ -54,8 +66,9 @@ export class TasksDO extends AgentDOBase<Env> {
   protected async customDump(): Promise<Record<string, unknown>> {
     const stats = buildTaskStats(this.sql);
     const snapshot = buildProjectsSnapshot(this.sql);
-    const recentTasks = this.sql.exec('SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 30').toArray();
+    const recentTasks = this.sql.exec('SELECT id, title, status, type, priority, parent_id, due_at, updated_at, length(plan) AS plan_len FROM tasks ORDER BY updated_at DESC LIMIT 30').toArray();
     const deps = this.sql.exec('SELECT * FROM task_deps').toArray();
+    const supplies = this.sql.exec('SELECT * FROM supplies ORDER BY status, created_at DESC LIMIT 50').toArray();
     const recentConv = this.sql.exec(
       'SELECT id, role, ts, substr(content, 1, 200) AS preview FROM conversation ORDER BY id DESC LIMIT 30',
     ).toArray();
@@ -85,6 +98,7 @@ export class TasksDO extends AgentDOBase<Env> {
       overdue: stats.overdueTasks,
       recent_tasks: recentTasks,
       deps,
+      supplies,
       recent_conversation: recentConv,
     };
   }
@@ -123,7 +137,7 @@ export class TasksDO extends AgentDOBase<Env> {
     await dispatchChat(
       this.env,
       'tasks',
-      "It's the Monday morning project review. Call show_projects first, then write a short review of where things stand: for each active project, progress and the single next action to knock out this week. Flag anything overdue or due this week. For projects stale 2+ weeks, ask whether they're still happening or the next step should be split smaller. If a project's steps are all done, ask to close it. End with a one-line 'if you only do one thing this week' pick. Keep it tight — this is a nudge, not a report.",
+      "It's the Monday morning project review. Call show_projects first, then write a short review of where things stand: for each active project, progress and the single next action to knock out this week. Flag anything overdue or due this week, and any project whose next step is blocked on unbought supplies (suggest one combined store run if several projects need things). For projects stale 2+ weeks, ask whether they're still happening or the next step should be split smaller. If a project's steps are all done, ask to close it. End with a one-line 'if you only do one thing this week' pick. Keep it tight — this is a nudge, not a report.",
       this.env.DISCORD_TASKS_CHANNEL_ID,
       { column: 'thread_id', value: this.env.DISCORD_TASKS_CHANNEL_ID },
     );

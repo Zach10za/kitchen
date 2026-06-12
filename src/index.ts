@@ -279,6 +279,10 @@ function isFastReadCommand(interaction: Interaction): boolean {
       return true;            // pure read
     case 'projects-due':
       return true;            // pure read
+    case 'supplies':
+      return !hasMessage;     // /supplies (alone) = read; with message = agent
+    case 'plan':
+      return true;            // pure read (project option resolved in fastRead)
     // Workout
     case 'workout':
       return !hasMessage;     // /workout (alone) = summary; with message = agent
