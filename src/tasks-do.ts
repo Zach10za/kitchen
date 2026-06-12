@@ -12,6 +12,28 @@ import { projectsNudgeEmbed } from './tasks/render';
 const MAX_FILES_PER_MESSAGE = 5;
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
+/** Hosts Discord serves user attachments from. Exact, lowercased hostname
+ *  match — never endsWith/includes, which `evil.cdn.discordapp.com.x.dev`
+ *  style hosts can defeat. */
+const DISCORD_CDN_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
+
+function isDiscordCdnUrl(raw: string): boolean {
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:' && DISCORD_CDN_HOSTS.has(u.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+/** Keep filenames safe for R2 keys and Discord re-upload: basename only,
+ *  printable subset, bounded length. */
+function sanitizeFilename(raw: string): string {
+  const base = raw.split(/[/\\]/).pop() ?? 'file';
+  const clean = base.replace(/[^\w.\- ()]/g, '_').trim();
+  return (clean || 'file').slice(0, 120);
+}
+
 /**
  * TasksDO holds the projects bot's state (the internal id stays 'tasks' —
  * the DO binding, channel env key, and admin ?bot= names are wired to it).
@@ -52,29 +74,38 @@ export class TasksDO extends AgentDOBase<Env> {
 
       for (const att of (body.attachments ?? []).slice(0, MAX_FILES_PER_MESSAGE)) {
         if (!att?.url || !att.filename) continue;
+        // SSRF guard: only fetch Discord's CDN. The relay is authenticated,
+        // but a leaked relay secret must not turn this DO into an
+        // arbitrary-URL fetcher. redirect:'manual' below keeps a 3xx from
+        // re-introducing an arbitrary host.
+        if (!isDiscordCdnUrl(att.url)) {
+          skipped.push(`${att.filename} (unexpected attachment host)`);
+          continue;
+        }
+        const filename = sanitizeFilename(att.filename);
         if ((att.size ?? 0) > MAX_FILE_BYTES) {
-          skipped.push(`${att.filename} (over the ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB limit)`);
+          skipped.push(`${filename} (over the ${Math.round(MAX_FILE_BYTES / 1024 / 1024)} MB limit)`);
           continue;
         }
         try {
-          const res = await fetch(att.url);
+          const res = await fetch(att.url, { redirect: 'manual' });
           if (!res.ok || !res.body) {
-            skipped.push(`${att.filename} (download failed: ${res.status})`);
+            skipped.push(`${filename} (download failed: ${res.status})`);
             continue;
           }
           const id = `f_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-          const key = `projects/${id}/${att.filename}`;
+          const key = `projects/${id}/${filename}`;
           await this.env.FILES.put(key, res.body, {
             httpMetadata: att.content_type ? { contentType: att.content_type } : undefined,
           });
           this.sql.exec(
             'INSERT INTO project_files (id, project_id, filename, r2_key, content_type, size, note, created_at) VALUES (?, NULL, ?, ?, ?, ?, NULL, ?)',
-            id, att.filename, key, att.content_type ?? null, att.size ?? null, Date.now(),
+            id, filename, key, att.content_type ?? null, att.size ?? null, Date.now(),
           );
-          saved.push({ id, filename: att.filename, size: att.size ?? 0 });
+          saved.push({ id, filename, size: att.size ?? 0 });
         } catch (err) {
-          console.error('file ingest failed', { filename: att.filename, err });
-          skipped.push(`${att.filename} (error storing)`);
+          console.error('file ingest failed', { filename, err });
+          skipped.push(`${filename} (error storing)`);
         }
       }
       return Response.json({ files: saved, skipped });
