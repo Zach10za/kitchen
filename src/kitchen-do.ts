@@ -1,7 +1,6 @@
 import type { Env } from './env';
 import type { Interaction } from './discord/types';
 import { EmbedColor } from './discord/types';
-import { runPantryFlow } from './agent/loop';
 import { loadDayDecision, loadUnratedRecentCooked } from './agent/context';
 import { statusEmbed } from './agent/render';
 import { nextDailyTime, todayISO, localDateAtHour } from './util/datetime';
@@ -24,10 +23,8 @@ const SUGGEST_TOLERANCE_MS = 60_000;
  *    (Reminders used to ride the hourly cron, so a "pull the fish at 5:40"
  *    reminder could land at 6:00. The cron heartbeat remains as a safety
  *    net that re-arms the alarm.)
- *  - The fast in-process `/pantry message: …` flow that bypasses the chat
- *    workflow because it doesn't need conversation history.
  *
- * Everything else (/cook, /now, /profile, /chat, /grocery) routes through the
+ * Everything (/cook, /now, /profile, /chat, /grocery) routes through the
  * unified AgentChatWorkflow via `dispatchChatInteraction`, like the other bots.
  */
 export class KitchenDO extends AgentDOBase<Env> {
@@ -60,22 +57,9 @@ export class KitchenDO extends AgentDOBase<Env> {
       (interaction.data?.options ?? []).map((o) => [o.name, o.value]),
     );
 
-    // Read-only commands (/pantry, /profile, /reminders, /grocery, /cookbook
+    // Read-only commands (/profile, /reminders, /grocery, /cookbook
     // with no message) are short-circuited via /fast-read in the Worker; by
     // here we're on a path that mutates state or needs the LLM.
-
-    // /pantry with a message — single LLM extraction call instead of the full
-    // chat loop. ~1-2s vs ~5-10s.
-    if (commandName === 'pantry' && optionMap.message) {
-      const replyChannelId = await this.openReplyThread(
-        interaction, `pantry: ${optionMap.message}`,
-      );
-      await runPantryFlow({
-        env: this.env, sql: this.sql, discord: this.discord, replyChannelId,
-        userMessage: String(optionMap.message),
-      });
-      return;
-    }
 
     // /chat needs a message; everything else routes through the chat workflow.
     if (commandName === 'chat' && !String(optionMap.message ?? '').trim()) {
@@ -101,7 +85,7 @@ export class KitchenDO extends AgentDOBase<Env> {
         return {
           userMessage: message
             ? `What should I cook today? ${message}`
-            : 'What should I cook today? Give me 2-3 options based on what I have.',
+            : 'What should I cook today? Suggest 2-3 varied dinner options.',
           titleSeed: message ? `cook: ${message}` : 'what to cook today',
         };
       case 'now': {
@@ -111,7 +95,7 @@ export class KitchenDO extends AgentDOBase<Env> {
           hour: 'numeric', minute: '2-digit', hour12: true,
         });
         return {
-          userMessage: `Right now it is **${nowLocal}** (${this.env.TIMEZONE}). If I've already decided on a meal for today, give me the back-planned cook-along timeline from now to dinner (clock times, next checkpoint first). If I haven't decided yet, suggest 2-3 options for tonight based on what I have.`,
+          userMessage: `Right now it is **${nowLocal}** (${this.env.TIMEZONE}). If I've already decided on a meal for today, give me the back-planned cook-along timeline from now to dinner (clock times, next checkpoint first). If I haven't decided yet, suggest 2-3 options for tonight.`,
           titleSeed: 'what to cook now',
         };
       }
@@ -134,9 +118,7 @@ export class KitchenDO extends AgentDOBase<Env> {
 
   protected async customDump(): Promise<Record<string, unknown>> {
     const meals = this.sql.exec('SELECT id, date, name, cuisine, protein, effort, status, rating, cook_notes, created_at FROM meals ORDER BY date DESC, id DESC LIMIT 30').toArray();
-    const pantry = this.sql.exec('SELECT * FROM pantry ORDER BY added_at DESC').toArray();
     const grocery = this.sql.exec('SELECT * FROM grocery ORDER BY added_at ASC').toArray();
-    const prefs = this.sql.exec('SELECT id, insight, weight, learned_at FROM preferences ORDER BY weight DESC, learned_at DESC').toArray();
     const reminders = this.sql.exec('SELECT id, due_at, type, day, sent_at, message FROM reminders ORDER BY due_at DESC').toArray();
     const settings = this.sql.exec("SELECT key, length(value) as len, substr(value, 1, 500) as preview, updated_at FROM settings").toArray();
     const recentConv = this.sql.exec('SELECT id, thread_id, role, ts, substr(content, 1, 200) as preview FROM conversation ORDER BY id DESC LIMIT 30').toArray();
@@ -144,7 +126,7 @@ export class KitchenDO extends AgentDOBase<Env> {
     return {
       alarm_at: alarm,
       alarm_iso: alarm ? new Date(alarm).toISOString() : null,
-      meals, pantry, grocery, prefs, reminders, settings,
+      meals, grocery, reminders, settings,
       recent_conversation: recentConv,
     };
   }
@@ -197,7 +179,7 @@ export class KitchenDO extends AgentDOBase<Env> {
     await dispatchChat(
       this.env,
       'kitchen',
-      `It's the daily dinner check-in. Suggest 2-3 dinner options for tonight from my fridge/shelf pantry, preferences, repertoire, and recent meals. The RECENTLY PITCHED list shows everything you've offered lately — all of it is off the table; give me something genuinely different. Don't build options around frozen items (nothing is defrosted); at most offer to schedule one aging freezer item for a future day. Add a short 'need to buy' line for anything missing. Keep it brief; I haven't decided yet.${ratingAsk}`,
+      `It's the daily dinner check-in. Suggest 2-3 dinner options for tonight. The RECENTLY PITCHED list shows everything you've offered lately — all of it is off the table; give me something genuinely different. Vary cuisine, protein, and technique aggressively — no repeats of what's in RECENTLY COOKED. Keep it brief; I haven't decided yet.${ratingAsk}`,
       this.env.DISCORD_CHANNEL_ID,
       { column: 'thread_id', value: this.env.DISCORD_CHANNEL_ID },
     );

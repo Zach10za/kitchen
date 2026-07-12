@@ -111,7 +111,7 @@ export const KITCHEN_SPEC: BotSpec = {
     // Kitchen owns /chat as the catch-all chat command for the household.
     // `botForCommand` in bot-registry uses Kitchen as the fallback when a
     // command isn't listed in any other bot's set.
-    'cook', 'chat', 'now', 'pantry', 'profile', 'reminders', 'grocery', 'cookbook',
+    'cook', 'chat', 'now', 'profile', 'reminders', 'grocery', 'cookbook',
   ]),
   tools: KITCHEN_TOOLS,
   // Drop user data tables, preserve `settings` (schema_version + cooking_profile).
@@ -146,38 +146,6 @@ export const KITCHEN_SPEC: BotSpec = {
       }] };
     }
 
-    if (cmd === 'pantry') {
-      const items = sql
-        .exec<any>('SELECT * FROM pantry ORDER BY location, added_at DESC')
-        .toArray();
-      if (items.length === 0) {
-        return { embeds: [statusEmbed({
-          title: '🥫 Pantry',
-          description: 'Pantry is empty. Use `/pantry message: I have ...` to add items.',
-          color: EmbedColor.archived,
-        })] };
-      }
-      const grouped: Record<string, string[]> = {};
-      for (const item of items) {
-        const loc = item.location || 'shelf';
-        const qty = item.qty_value != null ? ` (${item.qty_value}${item.qty_unit ? ' ' + item.qty_unit : ''})` : '';
-        (grouped[loc] ??= []).push(`• ${item.name}${qty}`);
-      }
-      const fields = (['freezer', 'fridge', 'shelf'] as const)
-        .filter((l) => grouped[l]?.length)
-        .map((l) => ({
-          name: `${l === 'freezer' ? '🧊' : l === 'fridge' ? '🧴' : '🥫'} ${l.toUpperCase()}`,
-          value: grouped[l]!.join('\n').slice(0, 1024),
-          inline: true,
-        }));
-      return { embeds: [{
-        title: '🥫 Pantry',
-        description: `**${items.length}** items`,
-        color: EmbedColor.inProgress,
-        fields,
-      }] };
-    }
-
     if (cmd === 'grocery') {
       const items = sql
         .exec<{ name: string; qty: string | null; for_dish: string | null }>(
@@ -200,7 +168,7 @@ export const KITCHEN_SPEC: BotSpec = {
         title: `🛒 Grocery list — ${items.length} item${items.length === 1 ? '' : 's'}`,
         description: lines.join('\n').slice(0, 4096),
         color: EmbedColor.inProgress,
-        footer: { text: 'Say "got everything" after shopping and it all moves to the pantry' },
+        footer: { text: 'Say "got everything" after shopping to clear the list' },
       }] };
     }
 

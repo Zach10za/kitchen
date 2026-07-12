@@ -251,8 +251,6 @@ function isFastReadCommand(interaction: Interaction): boolean {
     // Kitchen
     case 'profile':
       return !hasMessage;     // /profile (alone) = read; with message = write
-    case 'pantry':
-      return !hasMessage;     // /pantry (alone) = read; with message = write
     case 'reminders':
       return true;            // simple list, fits in one message
     case 'grocery':
