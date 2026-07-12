@@ -16,7 +16,7 @@ export const TOOLS = [
     type: 'function' as const,
     function: {
       name: 'log_meal',
-      description: "Record that the user has decided to make a specific dish. Call this when they pick one of your suggestions or tell you what they're cooking. Save the FULL cookbook-grade recipe — ingredients, steps, headnote, finishing, riffs, keeps, pairing — so the saved page is worth returning to. Defaults to today and status 'planned'. Pass status 'cooked' if they say they already made it (this also decrements the pantry).",
+      description: "Record that the user has decided to make a specific dish. Call this when they pick one of your suggestions or tell you what they're cooking. Save the FULL cookbook-grade recipe — ingredients, steps, headnote, finishing, riffs, keeps, pairing — so the saved page is worth returning to. Defaults to today and status 'planned'. Pass status 'cooked' if they say they already made it.",
       parameters: {
         type: 'object',
         properties: {
@@ -33,7 +33,7 @@ export const TOOLS = [
             items: {
               type: 'object',
               properties: {
-                item: { type: 'string', description: 'Lowercase ingredient name, normalized to match pantry rows' },
+                item: { type: 'string', description: 'Lowercase ingredient name' },
                 qty: { type: 'string', description: 'e.g. "1 lb", "2 cups", "3 count"' },
               },
               required: ['item', 'qty'],
@@ -41,7 +41,7 @@ export const TOOLS = [
           },
           steps: { type: 'array', items: { type: 'string' }, description: 'Ordered cooking steps with sensory checkpoints and the why behind load-bearing steps.' },
           finishing: { type: 'string', description: 'The finishing move + plating: acid/herb/flake salt/texture, and a "serve with" line.' },
-          variations: { type: 'array', items: { type: 'string' }, description: '1-2 riffs keyed to the pantry, e.g. "No anchovies? Two minced capers and extra parm."' },
+          variations: { type: 'array', items: { type: 'string' }, description: '1-2 riffs, e.g. "No anchovies? Two minced capers and extra parm."' },
           keeps: { type: 'string', description: 'Storage/leftover note, e.g. "Keeps 3 days; the flavors are better on day two."' },
           pairing: { type: 'string', description: 'One-line drink pairing (wine/beer/NA).' },
           requires_defrost: {
@@ -50,7 +50,7 @@ export const TOOLS = [
             items: {
               type: 'object',
               properties: {
-                item: { type: 'string', description: 'Frozen ingredient name (lowercase, matches pantry)' },
+                item: { type: 'string', description: 'Frozen ingredient name (lowercase)' },
                 hours: { type: 'integer', description: 'Hours of fridge defrost before dinner (~12 thin fish, 24 chicken/beef, 36-48 large roasts)' },
               },
               required: ['item', 'hours'],
@@ -97,7 +97,7 @@ export const TOOLS = [
     type: 'function' as const,
     function: {
       name: 'update_grocery',
-      description: 'Maintain the running grocery list. "add" when a picked dish needs ingredients not on hand (same turn as log_meal) or the user asks to add something. "remove" to drop items. "bought" when the user shopped — moves the named items (or the WHOLE list if items omitted) into the pantry and clears them from the list. "clear" wipes the list without touching the pantry.',
+      description: 'Maintain the running grocery list. "add" when a picked dish needs ingredients not on hand (same turn as log_meal) or the user asks to add something. "remove" to drop items. "bought" when the user shopped — clears the named items (or the WHOLE list if items omitted) from the list. "clear" wipes the list.',
       parameters: {
         type: 'object',
         properties: {
@@ -111,7 +111,6 @@ export const TOOLS = [
                 name: { type: 'string', description: 'Lowercase, singular item name' },
                 qty: { type: 'string', description: 'e.g. "1 lb", "2 count". Omit if unspecified.' },
                 for_dish: { type: 'string', description: 'Dish that wants it, if any.' },
-                location: { type: 'string', enum: ['freezer', 'fridge', 'shelf'], description: 'Where it will live once bought (used by "bought"/"add"). Default shelf.' },
               },
               required: ['name'],
             },
@@ -140,7 +139,7 @@ export const TOOLS = [
     type: 'function' as const,
     function: {
       name: 'mark_meal_cooked',
-      description: "Mark today's (or a given date's) planned meal as cooked. Decrements pantry inventory used by the recipe and cancels its defrost reminder. Use when the user says they made/finished the meal they had planned.",
+      description: "Mark today's (or a given date's) planned meal as cooked. Cancels its defrost reminder. Use when the user says they made/finished the meal they had planned.",
       parameters: {
         type: 'object',
         properties: {
@@ -154,40 +153,13 @@ export const TOOLS = [
     type: 'function' as const,
     function: {
       name: 'mark_meal_skipped',
-      description: "Mark a planned meal as skipped (the user didn't make it). Cancels its defrost reminder; pantry is untouched. Defaults to today.",
+      description: "Mark a planned meal as skipped (the user didn't make it). Cancels its defrost reminder. Defaults to today.",
       parameters: {
         type: 'object',
         properties: {
           date: { type: 'string', description: 'ISO date YYYY-MM-DD. Omit for today.' },
         },
         required: [],
-      },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
-      name: 'update_pantry',
-      description: 'Add or remove items from inventory. Track location (freezer/fridge/shelf) — freezer items get prioritized and can trigger defrost reminders. Capture quantities when given ("1 lb ground beef" → qty_value=1, qty_unit=lb). Use "count" for whole items ("2 chicken breasts" → qty_value=2, qty_unit=count).',
-      parameters: {
-        type: 'object',
-        properties: {
-          action: { type: 'string', enum: ['add', 'remove'] },
-          items: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                name: { type: 'string', description: 'Lowercase, singular item name' },
-                qty_value: { type: 'number', description: 'Numeric quantity (omit if user said "some" / unspecified)' },
-                qty_unit: { type: 'string', description: 'Unit: lb, oz, count, cup, etc.' },
-                location: { type: 'string', enum: ['freezer', 'fridge', 'shelf'], description: 'Where it lives. Default shelf.' },
-              },
-              required: ['name'],
-            },
-          },
-        },
-        required: ['action', 'items'],
       },
     },
   },
@@ -216,24 +188,8 @@ export const TOOLS = [
   {
     type: 'function' as const,
     function: {
-      name: 'record_preference',
-      description: 'Silently record a learned preference for future suggestions. Call whenever user feedback reveals a pattern (likes, dislikes, dietary, schedule, cadence — e.g. "rarely cooks on Fridays"). Always include rationale.',
-      parameters: {
-        type: 'object',
-        properties: {
-          insight: { type: 'string', description: 'The preference, e.g. "deprioritize curries on weeknights"' },
-          rationale: { type: 'string', description: 'Why we believe this, e.g. "user rejected curry 3 times running"' },
-          weight: { type: 'integer', minimum: 1, maximum: 10, description: 'How strong this preference is (1=hint, 10=hard rule)' },
-        },
-        required: ['insight', 'rationale', 'weight'],
-      },
-    },
-  },
-  {
-    type: 'function' as const,
-    function: {
       name: 'show_state',
-      description: "Read-only: get today's decision (if any), recent meals, and the current pantry. Use when answering \"what am I making\", \"what have I cooked lately\", \"what do I have\", etc.",
+      description: "Read-only: get today's decision (if any), recent meals, and the grocery list.",
       parameters: { type: 'object', properties: {} },
     },
   },
@@ -303,12 +259,11 @@ export interface Meal {
 }
 
 /** A grocery-list row. Items accumulate from "Need to buy" picks and chat,
- *  and move into the pantry when the user reports shopping ("bought"). */
+ *  and are cleared when the user reports shopping ("bought"). */
 export interface GroceryRow {
   name: string;
   qty: string | null;
   for_dish: string | null;
-  location: string | null;
   added_at: number;
   [key: string]: SqlStorageValue;
 }
@@ -319,15 +274,5 @@ export interface PreferenceRow {
   rationale: string;
   weight: number;
   learned_at: number;
-  [key: string]: SqlStorageValue;
-}
-
-export interface PantryItem {
-  name: string;
-  qty: string | null;
-  qty_value: number | null;
-  qty_unit: string | null;
-  location: string | null; // 'freezer' | 'fridge' | 'shelf'
-  added_at: number;
   [key: string]: SqlStorageValue;
 }

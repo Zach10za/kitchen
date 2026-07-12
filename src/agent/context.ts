@@ -4,7 +4,7 @@
  * household state — keeping the queries here means the two paths can't drift.
  */
 
-import type { GroceryRow, Meal, MealRow, PantryItem, PreferenceRow, RecipeExtras } from './tools';
+import type { GroceryRow, Meal, MealRow, RecipeExtras } from './tools';
 import { buildSystemPrompt } from './prompts';
 import { todayISO } from '../util/datetime';
 
@@ -30,8 +30,6 @@ export interface RepertoireDish {
 
 export interface AgentContext {
   today: Meal[];
-  preferences: PreferenceRow[];
-  pantry: PantryItem[];
   recentMeals: RecentMeal[];
   repertoire: RepertoireDish[];
   grocery: GroceryRow[];
@@ -88,18 +86,6 @@ export function loadDayDecision(sql: SqlStorage, dateISO: string): Meal[] {
     .map(parseMeal);
 }
 
-export function loadPreferences(sql: SqlStorage): PreferenceRow[] {
-  return sql
-    .exec<PreferenceRow>(
-      'SELECT * FROM preferences ORDER BY weight DESC, learned_at DESC LIMIT 25'
-    )
-    .toArray();
-}
-
-export function loadPantry(sql: SqlStorage): PantryItem[] {
-  return sql.exec<PantryItem>('SELECT * FROM pantry ORDER BY added_at DESC').toArray();
-}
-
 export function loadGrocery(sql: SqlStorage): GroceryRow[] {
   return sql.exec<GroceryRow>('SELECT * FROM grocery ORDER BY added_at ASC').toArray();
 }
@@ -154,9 +140,8 @@ export function loadRepertoire(sql: SqlStorage, limit = 10): RepertoireDish[] {
 
   const dishes: RepertoireDish[] = [];
   for (const { rows: cooks } of byName.values()) {
-    // cooks are date-desc; take the latest non-null rating and notes.
     const rating = cooks.find((c) => c.rating != null)?.rating ?? null;
-    if (rating == null) continue; // unrated dishes aren't repertoire yet
+    if (rating == null) continue;
     const notes = cooks.find((c) => c.cook_notes)?.cook_notes ?? null;
     const latest = cooks[0]!;
     dishes.push({
@@ -222,11 +207,9 @@ export function loadRecentPitches(sql: SqlStorage, days = 14, cap = 30): string[
   return pitches;
 }
 
-export function loadContext(sql: SqlStorage, timezone: string): AgentContext {
+export function loadContext(sql: SqlStorage): AgentContext {
   return {
-    today: loadDayDecision(sql, todayISO(timezone)),
-    preferences: loadPreferences(sql),
-    pantry: loadPantry(sql),
+    today: loadDayDecision(sql, todayISO('UTC')),
     recentMeals: loadRecentMeals(sql),
     repertoire: loadRepertoire(sql),
     grocery: loadGrocery(sql),
@@ -237,9 +220,6 @@ export function loadContext(sql: SqlStorage, timezone: string): AgentContext {
 
 const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const;
 
-/** Compute the current local time in the household's timezone, in the
- *  shape the system prompt expects. Centralized so every call site renders
- *  the same string. */
 function currentNowFor(timezone: string): { iso: string; localFormatted: string; dayKey: string } {
   const date = new Date();
   const localFormatted = date.toLocaleString('en-US', {
@@ -263,7 +243,7 @@ function currentNowFor(timezone: string): { iso: string; localFormatted: string;
 
 export function buildSystemPromptFor(sql: SqlStorage, timezone: string, dinnerHourLocal: number): string {
   return buildSystemPrompt({
-    ...loadContext(sql, timezone),
+    ...loadContext(sql),
     now: currentNowFor(timezone),
     dinnerHourLocal,
   });
