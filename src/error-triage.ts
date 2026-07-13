@@ -34,7 +34,26 @@ export async function captureError(env: Env, err: unknown, ctx: CaptureContext):
     }
 
     const title = await triageTitle(env, error, ctx);
-    await createIssue(env, { fingerprint, title, error, ctx });
+    const created = await createIssue(env, { fingerprint, title, error, ctx });
+
+    // Race-condition guard: two concurrent DO instances may both miss the
+    // findExistingIssue check and both create. After creating, re-scan for
+    // issues with the same fingerprint. If we find an older one (not ours),
+    // close the one we just created and append the occurrence to the winner.
+    const dupes = await findIssuesByFingerprint(env, fingerprint);
+    if (dupes.length > 1) {
+      dupes.sort((a, b) => a.number - b.number);
+      const winner = dupes[0]!;
+      for (const dupe of dupes) {
+        if (dupe.number !== winner.number) {
+          await closeAsDuplicate(env, dupe.number, winner.number);
+        }
+      }
+      // If we just closed our own issue, add the occurrence to the winner.
+      if (created.number !== winner.number) {
+        await appendOccurrence(env, winner.number, error, ctx);
+      }
+    }
   } catch (triageErr) {
     console.error('captureError failed', triageErr);
   }
@@ -73,15 +92,10 @@ function parseTopFrame(stack: string): { file: string; line: number } | null {
 }
 
 function computeFingerprint(error: NormalizedError, source: string): string {
-  // Normalize message: collapse hex/digit runs and UUIDs so e.g.
-  // "user 12345 not found" and "user 67890 not found" group together.
-  const normalizedMsg = error.message
-    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<uuid>')
-    .replace(/\b\d+\b/g, '<n>')
-    .slice(0, 200);
-  const frame = error.topFrame ? `${error.topFrame.file}:${error.topFrame.line}` : 'unknown';
-  const raw = `${source}|${error.name}|${normalizedMsg}|${frame}`;
-  return djb2(raw).toString(16).padStart(8, '0');
+  // Fingerprint by source only — semantically identical errors (e.g. different
+  // HTTP status codes from the same sync) group into one issue. The error
+  // message and stack frame are preserved in the issue body for diagnosis.
+  return djb2(source).toString(16).padStart(8, '0');
 }
 
 function djb2(s: string): number {
@@ -135,25 +149,16 @@ function defaultTitle(error: NormalizedError, ctx: CaptureContext): string {
 }
 
 async function findExistingIssue(env: Env, fingerprint: string): Promise<{ number: number } | null> {
+  const issues = await findIssuesByFingerprint(env, fingerprint);
+  return issues.length > 0 ? issues[0]! : null;
+}
+
+async function findIssuesByFingerprint(env: Env, fingerprint: string): Promise<Array<{ number: number }>> {
   const tag = `[fp:${fingerprint}]`;
-  // Prefer the repo-scoped issues list over /search/issues. The search API
-  // has eventual-consistency lag (seconds to minutes), so two rapid-fire
-  // errors with the same fingerprint could both miss the index and both
-  // create issues — after which dedup is permanently broken because the
-  // search returns whichever the index sees first.
-  //
-  // The list endpoint reads the live datastore; we filter the most recent
-  // 100 issues (open or closed) by title-tag match. Older recurrences
-  // beyond the 100-issue window fall through to create-new, which is
-  // acceptable: long-quiet bugs aren't ones we need perfect dedup on.
   const path = `/repos/${env.GITHUB_REPO}/issues?state=all&per_page=100&sort=updated&direction=desc`;
   const res = await ghFetch(env, path, { method: 'GET' });
   const items = (await res.json()) as Array<{ number: number; title: string; pull_request?: unknown }>;
-  for (const item of items) {
-    if (item.pull_request) continue; // /issues returns PRs too
-    if (item.title.includes(tag)) return { number: item.number };
-  }
-  return null;
+  return items.filter((item) => !item.pull_request && item.title.includes(tag));
 }
 
 async function appendOccurrence(
@@ -186,16 +191,35 @@ async function appendOccurrence(
 async function createIssue(
   env: Env,
   args: { fingerprint: string; title: string; error: NormalizedError; ctx: CaptureContext },
-): Promise<void> {
+): Promise<{ number: number }> {
   const fullTitle = `[fp:${args.fingerprint}] ${args.title}`.slice(0, 256);
   const body = renderBody(args.error, args.ctx);
-  await ghFetch(env, `/repos/${env.GITHUB_REPO}/issues`, {
+  const res = await ghFetch(env, `/repos/${env.GITHUB_REPO}/issues`, {
     method: 'POST',
     body: JSON.stringify({
       title: fullTitle,
       body,
       labels: ['auto-fix', 'bug'],
     }),
+  });
+  const json = (await res.json()) as { number: number };
+  return { number: json.number };
+}
+
+async function closeAsDuplicate(
+  env: Env,
+  dupeNumber: number,
+  winnerNumber: number,
+): Promise<void> {
+  await ghFetch(env, `/repos/${env.GITHUB_REPO}/issues/${dupeNumber}/comments`, {
+    method: 'POST',
+    body: JSON.stringify({
+      body: `Closed as a duplicate of #${winnerNumber} — both were filed simultaneously by a race condition in the error capture pipeline. The same fingerprint appears in both issues.`,
+    }),
+  });
+  await ghFetch(env, `/repos/${env.GITHUB_REPO}/issues/${dupeNumber}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ state: 'closed', state_reason: 'not_planned' }),
   });
 }
 
