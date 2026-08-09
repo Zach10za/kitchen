@@ -38,9 +38,11 @@ export async function generateThreadTitle(env: Env, message: string): Promise<st
   }
 
   try {
+    const apiKey = env.OPENROUTER_API_KEY || env.OPENAI_API_KEY;
+    const baseURL = env.OPENROUTER_BASE_URL || env.AI_GATEWAY_URL || 'https://openrouter.ai/api/v1';
     const client = new OpenAI({
-      apiKey: env.OPENAI_API_KEY,
-      baseURL: env.AI_GATEWAY_URL || undefined,
+      apiKey,
+      baseURL,
       timeout: 8_000,
       maxRetries: 0,
     });

@@ -9,7 +9,7 @@ Ask "what should I cook today?" and the bot suggests 2–3 dishes drawn from wha
 - **Cloudflare Worker** — Discord interaction webhook + cron heartbeat + admin endpoints
 - **Durable Object (`KitchenDO`)** — household state in SQLite, daily suggestion alarm, due-reminder dispatch, relay rate limiting
 - **Cloudflare Workflow (`AgentChatWorkflow`)** — runs the multi-step LLM tool-loop past the Worker CPU budget with per-step retries; one class serves every bot
-- **OpenAI via Cloudflare AI Gateway** — three model tiers (planner / extract / fast) routed through one gateway for caching + observability
+- **OpenRouter (OpenAI-compatible API)** — three model tiers (planner / extract / fast), defaulting to Deepseek v4 flash
 - **Fly.io gateway relay** (`gateway-relay/`) — tiny always-on VM holding the Discord Gateway WebSocket, so plain chat messages (no slash command) reach the Worker via signed HTTPS
 - **Auto error triage** — exceptions are fingerprinted, deduped, and filed as labeled GitHub issues; no hosted tracker
 
@@ -26,12 +26,11 @@ bun install
 
 (Bun 1.3+. Wrangler is local-installed, not global.)
 
-### 2. Create a Cloudflare AI Gateway
+### 2. Create an OpenRouter API key
 
-In the Cloudflare dashboard:
-- AI > AI Gateway > Create Gateway
-- Name: `kitchen`
-- Copy the OpenAI endpoint URL (looks like `https://gateway.ai.cloudflare.com/v1/<account>/kitchen/openai`) — this becomes `AI_GATEWAY_URL`
+In OpenRouter:
+- Create/copy your API key from https://openrouter.ai/keys — this becomes `OPENROUTER_API_KEY`
+- Optional: set `OPENROUTER_BASE_URL` if you need a non-default endpoint (default is `https://openrouter.ai/api/v1`)
 
 ### 3. Create a Discord application + bot
 
@@ -86,8 +85,8 @@ bunx wrangler secret put DISCORD_CHANNEL_ID         # channel the kitchen bot po
 bunx wrangler secret put DISCORD_FINANCE_CHANNEL_ID  # optional; enables finance bot
 bunx wrangler secret put DISCORD_TASKS_CHANNEL_ID    # optional; enables projects bot
 bunx wrangler secret put DISCORD_WORKOUT_CHANNEL_ID   # optional; enables workout bot
-bunx wrangler secret put OPENAI_API_KEY
-bunx wrangler secret put AI_GATEWAY_URL
+bunx wrangler secret put OPENROUTER_API_KEY
+bunx wrangler secret put OPENROUTER_BASE_URL   # optional
 bunx wrangler secret put RELAY_SECRET     # any long random string; share with Fly.io relay
 bunx wrangler secret put ADMIN_TOKEN      # bearer for /admin/* endpoints
 bunx wrangler secret put GITHUB_TOKEN     # fine-grained PAT, Issues:write on the repo (optional; enables auto error triage)
@@ -296,10 +295,10 @@ src/
   workflows/
     agent-chat.ts          AgentChatWorkflow: one chat tool-loop serving every bot, parameterized by botId
   runtime/
-    agent-round.ts         Shared OpenAI Responses-API tool-call loop
+    agent-round.ts         Shared OpenAI-compatible Responses-API tool-call loop
     bot-registry.ts        Channel-to-bot routing (kitchen / finance / tasks / workout)
     migrations.ts          SQLite schema migration runner
-    openai.ts              OpenAI client factory
+    openai.ts              OpenAI-compatible client factory (OpenRouter default)
     tavily.ts              Tavily search client + shared web_search tool (all bots; source-stripped)
     pricing.ts             Token cost calculator
     relay-rate-limit.ts    Per-channel rolling-window rate limit

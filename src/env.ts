@@ -30,8 +30,8 @@ export interface Env {
   GITHUB_REPO: string;
   /** Per-channel relay rate limit: max forwarded messages per hour (defaults to 30 if unset). */
   RELAY_RATE_LIMIT_PER_HOUR?: string;
-  /** OpenAI pricing in USD per million tokens / per call. Update when OpenAI
-   *  changes prices — no code deploy needed. Strings so wrangler vars work. */
+  /** LLM pricing in USD per million tokens / per call. Update when your
+   *  provider/model pricing changes — no code deploy needed. */
   PRICE_INPUT_PER_M?: string;
   PRICE_CACHED_INPUT_PER_M?: string;
   PRICE_OUTPUT_PER_M?: string;
@@ -50,8 +50,12 @@ export interface Env {
   DISCORD_TASKS_CHANNEL_ID: string;
   /** Channel ID where the WorkoutDO posts. Required for the workout bot. */
   DISCORD_WORKOUT_CHANNEL_ID: string;
-  OPENAI_API_KEY: string;
-  AI_GATEWAY_URL: string;
+  /** Preferred provider credentials/base URL (OpenRouter). */
+  OPENROUTER_API_KEY?: string;
+  OPENROUTER_BASE_URL?: string;
+  /** Back-compat for older OpenAI/AI-Gateway deployments. */
+  OPENAI_API_KEY?: string;
+  AI_GATEWAY_URL?: string;
   RELAY_SECRET: string;
   ADMIN_TOKEN: string;
   GITHUB_TOKEN: string;
