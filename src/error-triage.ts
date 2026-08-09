@@ -108,16 +108,18 @@ async function triageTitle(env: Env, error: NormalizedError, ctx: CaptureContext
   // One small LLM call to convert a raw message + stack into a clearer
   // one-liner. Falls back to the raw error message if anything goes wrong —
   // a worse title is much better than failing to file the issue.
-  if (!env.OPENAI_API_KEY) return defaultTitle(error, ctx);
+  if (!env.OPENROUTER_API_KEY && !env.OPENAI_API_KEY) return defaultTitle(error, ctx);
 
   try {
     // maxRetries: 0 is intentional. captureError runs from the top-level fetch
     // catch and from the DO's interaction handler — anything that retries here
     // will compound under load and re-fail in the same way it just failed.
     // A worse title is fine; a flapping triage path is not.
+    const apiKey = env.OPENROUTER_API_KEY || env.OPENAI_API_KEY;
+    const baseURL = env.OPENROUTER_BASE_URL || env.AI_GATEWAY_URL || 'https://openrouter.ai/api/v1';
     const client = new OpenAI({
-      apiKey: env.OPENAI_API_KEY,
-      baseURL: env.AI_GATEWAY_URL || undefined,
+      apiKey,
+      baseURL,
       timeout: 15_000,
       maxRetries: 0,
     });

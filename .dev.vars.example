@@ -6,8 +6,12 @@ DISCORD_BOT_TOKEN=
 DISCORD_APP_ID=
 DISCORD_GUILD_ID=
 DISCORD_CHANNEL_ID=
-OPENAI_API_KEY=
-AI_GATEWAY_URL=
+OPENROUTER_API_KEY=
+# Optional; defaults to https://openrouter.ai/api/v1
+# OPENROUTER_BASE_URL=
+# Back-compat fallback:
+# OPENAI_API_KEY=
+# AI_GATEWAY_URL=
 # Optional: Tavily search key (tvly-…) powering the shared web_search tool across
 # all bots. Free tier ~1k searches/mo. If unset, bots fall back to their own knowledge.
 # TAVILY_API_KEY=
