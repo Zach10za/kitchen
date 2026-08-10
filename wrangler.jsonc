@@ -79,6 +79,15 @@
     "crons": ["0 * * * *"],
   },
 
+  // R2 bucket for project files (plan images, STL files, ...). One-time setup:
+  //   bunx wrangler r2 bucket create kitchen-files
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "kitchen-files",
+    },
+  ],
+
   // AI Gateway binding (set up in Cloudflare dashboard at:
   //   AI > AI Gateway > create gateway "kitchen")
   "ai": {

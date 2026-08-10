@@ -66,12 +66,13 @@ cp .dev.vars.example .dev.vars
 bun run register-commands
 ```
 
-You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/grocery`, `/cookbook`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/projects`, `/projects-open`, `/projects-next`, `/projects-blocked`, `/projects-due`, `/workout`, `/workout-today`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
+You should see `/cook`, `/chat`, `/now`, `/pantry`, `/profile`, `/reminders`, `/grocery`, `/cookbook`, `/finance`, `/spending`, `/merchant`, `/accounts`, `/finance-sync`, `/projects`, `/projects-open`, `/projects-next`, `/projects-blocked`, `/projects-due`, `/supplies`, `/plan`, `/workout`, `/workout-today`, `/workout-last`, `/workout-prs`, `/workout-week`, `/workout-program`, `/workout-profile` registered.
 
 ### 6. Deploy the Worker
 
 ```bash
 bunx wrangler login        # interactive
+bunx wrangler r2 bucket create kitchen-files   # one-time; stores project files (plan images, STLs)
 bunx wrangler deploy
 ```
 
@@ -189,12 +190,32 @@ In your `#projects` channel:
 /projects-next           next actions — steps with no unfinished blockers
 /projects-blocked        items waiting on other steps
 /projects-due            overdue items and anything due within 7 days
+/supplies                everything still to buy, across all projects (the store-run list)
+/supplies message:got the PVC   check items off (or add: "sprinklers need 7 heads")
+/plan project:sprinkler  show a project's living plan document
 ```
 
+Complex projects get more than a step list:
+- **Living plan**: talk through the design ("the manifold needs 3 zones, 1in
+  sch-40 throughout") and the bot maintains a markdown plan doc per project —
+  design decisions, measurements, sequence — kept in sync with the steps as
+  decisions change. Current enough to follow mid-build.
+- **Supplies**: materials are tracked per project with qty + the spec that
+  matters at the store ("7× sprinkler head, adjustable 90° nozzle"). Say "got
+  the PVC" to check things off. The bot flags when a next step is blocked on
+  unbought supplies, and `/supplies` is the combined store-run list.
+- **Files**: drop an image, STL, PDF — anything — into the channel with a
+  caption and it's stored durably in R2 (Discord's own attachment links
+  expire) and filed to the project. Files show in `/plan` and `get_task`;
+  ask for one by name ("send me the manifold sketch") and the bot posts it
+  back as an attachment. Up to 25 MB stored per file; sending back is subject
+  to Discord's bot upload cap (~10 MB on non-boosted servers).
+
 The projects bot also speaks first: Monday mornings it posts a short project
-review (progress, the one next action per project, stale-project callouts),
-and on other days it posts a due-check only when something is due today or
-just went overdue. Hour is `PROJECTS_REVIEW_HOUR_LOCAL` (default 9).
+review (progress, the one next action per project, stale-project and
+supply-blocker callouts), and on other days it posts a due-check only when
+something is due today or just went overdue. Hour is
+`PROJECTS_REVIEW_HOUR_LOCAL` (default 9).
 
 In your `#workout` channel:
 

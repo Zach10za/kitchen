@@ -4,13 +4,19 @@
  * universal `/workflow/agent/exec-tool` endpoint on TasksDO.
  */
 
-import type { TaskRow } from './tools';
+import type { Env } from '../env';
+import { DiscordAPI } from '../discord/api';
+import type { FileRow, SupplyRow, TaskRow } from './tools';
 
 export interface TasksToolCtx {
   sql: SqlStorage;
   /** IANA timezone for the household. Used to convert bare YYYY-MM-DD
    *  due-dates into end-of-day in the user's local time instead of UTC. */
   timezone?: string;
+  /** Needed by the file tools (R2 access + posting attachments back). */
+  env?: Env;
+  /** The reply thread/channel — where send_file posts the attachment. */
+  replyChannelId?: string;
 }
 
 // ─── Public constants ────────────────────────────────────────────────
@@ -59,7 +65,7 @@ export const TASK_ORDER_SQL = `
 
 // ─── Tool dispatch ───────────────────────────────────────────────────
 
-export function executeTasksTool(name: string, args: any, ctx: TasksToolCtx): string {
+export async function executeTasksTool(name: string, args: any, ctx: TasksToolCtx): Promise<string> {
   try {
     switch (name) {
       case 'show_summary':      return toolShowSummary(ctx);
@@ -68,6 +74,12 @@ export function executeTasksTool(name: string, args: any, ctx: TasksToolCtx): st
       case 'get_task':          return toolGetTask(args, ctx);
       case 'add_task':          return toolAddTask(args, ctx);
       case 'update_task':       return toolUpdateTask(args, ctx);
+      case 'update_plan':       return toolUpdatePlan(args, ctx);
+      case 'update_supplies':   return toolUpdateSupplies(args, ctx);
+      case 'attach_file':       return toolAttachFile(args, ctx);
+      case 'list_files':        return toolListFiles(args, ctx);
+      case 'send_file':         return await toolSendFile(args, ctx);
+      case 'remove_file':       return await toolRemoveFile(args, ctx);
       case 'add_dependency':    return toolAddDependency(args, ctx);
       case 'remove_dependency': return toolRemoveDependency(args, ctx);
       default:                  return `Unknown tasks tool: ${name}`;
@@ -372,6 +384,28 @@ function toolGetTask(args: { id: string }, ctx: TasksToolCtx): string {
     lines.push(...subtasks.map((s) => `  ${statusIcon(s.status)} [${s.id}] ${s.title}`));
   }
 
+  if (!task.parent_id) {
+    const supplies = suppliesForProject(ctx.sql, task.id);
+    if (supplies.length > 0) {
+      const needed = supplies.filter((s) => s.status === 'needed');
+      const bought = supplies.length - needed.length;
+      lines.push('');
+      lines.push(`Supplies (${needed.length} needed${bought > 0 ? `, ${bought} bought` : ''}):`);
+      lines.push(...needed.map((s) => `  🛒 ${s.qty ? s.qty + ' ' : ''}${s.name}${s.spec ? ` — ${s.spec}` : ''}${s.notes ? ` (${s.notes})` : ''}`));
+    }
+    const files = filesForProject(ctx.sql, task.id);
+    if (files.length > 0) {
+      lines.push('');
+      lines.push('Files (send_file to share one into the conversation):');
+      lines.push(...files.map((f) => `  📎 [${f.id}] ${f.filename}${fmtSize(f.size)}${f.note ? ` — ${f.note}` : ''}`));
+    }
+    if (task.plan) {
+      lines.push('');
+      lines.push('PLAN (living document — update_plan with the full merged doc to change it):');
+      lines.push(task.plan);
+    }
+  }
+
   return lines.join('\n');
 }
 
@@ -611,6 +645,9 @@ export interface ProjectOverview {
   /** Most recent updated_at across the project and all of its steps. */
   lastActivity: number;
   stale: boolean;
+  /** Supplies still on the shopping list for this project. */
+  suppliesNeeded: number;
+  hasPlan: boolean;
 }
 
 export interface ProjectsSnapshot {
@@ -628,6 +665,12 @@ export function buildProjectsSnapshot(sql: SqlStorage): ProjectsSnapshot {
       .toArray()[0];
     const nextSteps = sql.exec<TaskRow>(SELECT_PROJECT_NEXT_STEPS, project.id).toArray();
     const lastActivity = Math.max(project.updated_at, counts?.last_step_activity ?? 0);
+    const suppliesNeeded = sql
+      .exec<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM supplies WHERE project_id = ? AND status = 'needed'",
+        project.id,
+      )
+      .toArray()[0]?.n ?? 0;
     return {
       project,
       totalSteps: counts?.total ?? 0,
@@ -635,6 +678,8 @@ export function buildProjectsSnapshot(sql: SqlStorage): ProjectsSnapshot {
       nextSteps,
       lastActivity,
       stale: now - lastActivity > STALE_PROJECT_MS,
+      suppliesNeeded,
+      hasPlan: !!project.plan,
     };
   });
   const loose = sql.exec<TaskRow>(SELECT_LOOSE_TASKS).toArray();
@@ -656,7 +701,9 @@ export function projectsOverviewText(sql: SqlStorage): string {
       const progress = p.totalSteps > 0 ? `${p.doneSteps}/${p.totalSteps} steps done` : 'no steps yet';
       const staleDays = Math.floor((Date.now() - p.lastActivity) / 86_400_000);
       const staleNote = p.stale ? ` — ⚠️ stale, no activity in ${staleDays}d` : '';
-      lines.push(`${formatTaskShort(p.project)} — ${progress}${staleNote}`);
+      const suppliesNote = p.suppliesNeeded > 0 ? ` — 🛒 ${p.suppliesNeeded} supplies needed` : '';
+      const planNote = p.hasPlan ? ' — has plan' : '';
+      lines.push(`${formatTaskShort(p.project)} — ${progress}${suppliesNote}${planNote}${staleNote}`);
       if (p.nextSteps.length > 0) {
         lines.push(...p.nextSteps.map((s) => `    ↳ next: ${formatTaskShort(s).trim()}`));
       } else if (p.totalSteps > 0 && p.doneSteps === p.totalSteps) {
@@ -670,6 +717,209 @@ export function projectsOverviewText(sql: SqlStorage): string {
     lines.push(...loose.map(formatTaskShort));
   }
   return lines.join('\n');
+}
+
+// ─── Plans + supplies ─────────────────────────────────────────────────
+
+/** Fetch a top-level project by id, or explain what went wrong. */
+function requireProject(sql: SqlStorage, projectId: string): { ok: true; project: TaskRow } | { ok: false; error: string } {
+  const task = sql.exec<TaskRow>('SELECT * FROM tasks WHERE id = ?', projectId).toArray()[0];
+  if (!task) return { ok: false, error: `No task found with id "${projectId}".` };
+  if (task.parent_id) {
+    return { ok: false, error: `[${projectId}] is a step, not a project — plans and supplies attach to the top-level project [${task.parent_id}].` };
+  }
+  return { ok: true, project: task };
+}
+
+function toolUpdatePlan(args: { project_id: string; content: string }, ctx: TasksToolCtx): string {
+  const found = requireProject(ctx.sql, args.project_id);
+  if (!found.ok) return found.error;
+  const content = args.content?.trim();
+  if (!content) return 'Plan content is empty. Pass the full merged markdown document.';
+
+  const prior = found.project.plan;
+  // Guard against accidental truncation: a much shorter rewrite usually means
+  // the model sent a delta instead of the merged document.
+  if (prior && content.length < prior.length * 0.5) {
+    return `Refused: the new plan (${content.length} chars) is less than half the current one (${prior.length} chars) — this looks like a partial update. get_task shows the current plan; merge your changes into it and resend the COMPLETE document. If the user explicitly asked to cut it down, resend with their wording in the relevant section.`;
+  }
+
+  ctx.sql.exec('UPDATE tasks SET plan = ?, updated_at = ? WHERE id = ?', content, Date.now(), args.project_id);
+  return `Plan saved for "${found.project.title}" [${args.project_id}] (${content.length} chars). The user can view it with /plan project:${found.project.title.split(' ')[0]?.toLowerCase() ?? args.project_id}.`;
+}
+
+interface SupplyItemArg {
+  name: string;
+  qty?: string;
+  spec?: string;
+  notes?: string;
+}
+
+function toolUpdateSupplies(
+  args: { project_id: string; action: 'add' | 'bought' | 'remove'; items: SupplyItemArg[] },
+  ctx: TasksToolCtx,
+): string {
+  const found = requireProject(ctx.sql, args.project_id);
+  if (!found.ok) return found.error;
+  const items = (args.items ?? []).filter((i) => i.name?.trim());
+  if (items.length === 0) return 'No items passed.';
+  const now = Date.now();
+
+  if (args.action === 'add') {
+    for (const item of items) {
+      const name = item.name.trim().toLowerCase();
+      // Re-adding an item that's already on the list updates it in place.
+      const existing = ctx.sql
+        .exec<SupplyRow>(
+          "SELECT * FROM supplies WHERE project_id = ? AND name = ? AND status = 'needed'",
+          args.project_id, name,
+        )
+        .toArray()[0];
+      if (existing) {
+        ctx.sql.exec(
+          'UPDATE supplies SET qty = COALESCE(?, qty), spec = COALESCE(?, spec), notes = COALESCE(?, notes), updated_at = ? WHERE id = ?',
+          item.qty ?? null, item.spec ?? null, item.notes ?? null, now, existing.id,
+        );
+      } else {
+        ctx.sql.exec(
+          "INSERT INTO supplies (project_id, name, qty, spec, status, notes, created_at, updated_at) VALUES (?, ?, ?, ?, 'needed', ?, ?, ?)",
+          args.project_id, name, item.qty ?? null, item.spec ?? null, item.notes ?? null, now, now,
+        );
+      }
+    }
+    const needed = suppliesForProject(ctx.sql, args.project_id).filter((s) => s.status === 'needed').length;
+    return `Added to "${found.project.title}" supplies: ${items.map((i) => i.name).join(', ')}. ${needed} item(s) still needed.`;
+  }
+
+  // bought / remove: match each named item against the project's list.
+  const all = suppliesForProject(ctx.sql, args.project_id);
+  const hits: SupplyRow[] = [];
+  const misses: string[] = [];
+  for (const item of items) {
+    const q = item.name.trim().toLowerCase();
+    const pool = args.action === 'bought' ? all.filter((s) => s.status === 'needed') : all;
+    const match = pool.find((s) => s.name === q) ?? pool.find((s) => s.name.includes(q) || q.includes(s.name));
+    if (match && !hits.some((h) => h.id === match.id)) hits.push(match);
+    else if (!match) misses.push(item.name);
+  }
+  if (hits.length === 0) {
+    return `Nothing matched (${misses.join(', ')}). Current list: ${all.map((s) => `${s.name} (${s.status})`).join(', ') || '(empty)'}.`;
+  }
+
+  for (const hit of hits) {
+    if (args.action === 'bought') {
+      ctx.sql.exec("UPDATE supplies SET status = 'bought', updated_at = ? WHERE id = ?", now, hit.id);
+    } else {
+      ctx.sql.exec('DELETE FROM supplies WHERE id = ?', hit.id);
+    }
+  }
+  const needed = suppliesForProject(ctx.sql, args.project_id).filter((s) => s.status === 'needed').length;
+  const verb = args.action === 'bought' ? 'Marked bought' : 'Removed';
+  return `${verb}: ${hits.map((h) => h.name).join(', ')}.${misses.length > 0 ? ` No match for: ${misses.join(', ')}.` : ''} ${needed} item(s) still needed for "${found.project.title}".`;
+}
+
+// ─── Project files (bytes in R2; index rows here) ─────────────────────
+
+export function filesForProject(sql: SqlStorage, projectId: string): FileRow[] {
+  return sql
+    .exec<FileRow>('SELECT * FROM project_files WHERE project_id = ? ORDER BY created_at ASC', projectId)
+    .toArray();
+}
+
+function fmtSize(size: number | null): string {
+  if (size == null || size <= 0) return '';
+  if (size < 1024 * 1024) return ` (${Math.max(1, Math.round(size / 1024))} KB)`;
+  return ` (${(size / (1024 * 1024)).toFixed(1)} MB)`;
+}
+
+function getFile(sql: SqlStorage, fileId: string): FileRow | null {
+  return sql.exec<FileRow>('SELECT * FROM project_files WHERE id = ?', fileId).toArray()[0] ?? null;
+}
+
+function toolAttachFile(args: { file_id: string; project_id: string; note?: string }, ctx: TasksToolCtx): string {
+  const file = getFile(ctx.sql, args.file_id);
+  if (!file) return `No file with id "${args.file_id}".`;
+  const found = requireProject(ctx.sql, args.project_id);
+  if (!found.ok) return found.error;
+  ctx.sql.exec(
+    'UPDATE project_files SET project_id = ?, note = COALESCE(?, note) WHERE id = ?',
+    args.project_id, args.note?.trim() || null, args.file_id,
+  );
+  return `Filed ${file.filename} [${file.id}] to "${found.project.title}"${args.note ? ` — ${args.note.trim()}` : ''}.`;
+}
+
+function toolListFiles(args: { project_id?: string }, ctx: TasksToolCtx): string {
+  if (args.project_id) {
+    const found = requireProject(ctx.sql, args.project_id);
+    if (!found.ok) return found.error;
+    const files = filesForProject(ctx.sql, args.project_id);
+    if (files.length === 0) return `No files on "${found.project.title}".`;
+    return `Files on "${found.project.title}":\n${files.map((f) => `- [${f.id}] ${f.filename}${fmtSize(f.size)}${f.note ? ` — ${f.note}` : ''}`).join('\n')}`;
+  }
+  const all = ctx.sql
+    .exec<FileRow & { project_title: string | null }>(
+      'SELECT f.*, t.title AS project_title FROM project_files f LEFT JOIN tasks t ON t.id = f.project_id ORDER BY f.created_at DESC LIMIT 50',
+    )
+    .toArray();
+  if (all.length === 0) return 'No files stored yet. The user can drop a file in the channel with a caption and it lands here.';
+  return all
+    .map((f) => `- [${f.id}] ${f.filename}${fmtSize(f.size)} — ${f.project_title ?? '📥 INBOX (not filed — attach_file it)'}${f.note ? ` — ${f.note}` : ''}`)
+    .join('\n');
+}
+
+async function toolSendFile(args: { file_id: string }, ctx: TasksToolCtx): Promise<string> {
+  const file = getFile(ctx.sql, args.file_id);
+  if (!file) return `No file with id "${args.file_id}".`;
+  if (!ctx.env || !ctx.replyChannelId) return 'File sending is unavailable in this context.';
+  const object = await ctx.env.FILES.get(file.r2_key);
+  if (!object) return `Stored bytes for ${file.filename} are missing from the bucket (key ${file.r2_key}). The index row may be stale — offer remove_file.`;
+  const data = await object.arrayBuffer();
+  await new DiscordAPI(ctx.env.DISCORD_BOT_TOKEN, ctx.env.DISCORD_APP_ID).postFile(
+    ctx.replyChannelId, file.filename, data, file.note ? `📎 ${file.filename} — ${file.note}` : `📎 ${file.filename}`,
+  );
+  return `Sent ${file.filename}${fmtSize(file.size)} into the conversation. Don't repeat its contents — the user can see the attachment.`;
+}
+
+async function toolRemoveFile(args: { file_id: string }, ctx: TasksToolCtx): Promise<string> {
+  const file = getFile(ctx.sql, args.file_id);
+  if (!file) return `No file with id "${args.file_id}".`;
+  if (ctx.env) await ctx.env.FILES.delete(file.r2_key);
+  ctx.sql.exec('DELETE FROM project_files WHERE id = ?', args.file_id);
+  return `Deleted ${file.filename} [${file.id}] permanently.`;
+}
+
+export function suppliesForProject(sql: SqlStorage, projectId: string): SupplyRow[] {
+  return sql
+    .exec<SupplyRow>(
+      "SELECT * FROM supplies WHERE project_id = ? ORDER BY (status = 'bought') ASC, created_at ASC",
+      projectId,
+    )
+    .toArray();
+}
+
+/** Everything still needed across all projects — the cross-project shopping list. */
+export function loadNeededSupplies(sql: SqlStorage): Array<SupplyRow & { project_title: string }> {
+  return sql
+    .exec<SupplyRow & { project_title: string }>(
+      `SELECT s.*, t.title AS project_title
+       FROM supplies s JOIN tasks t ON t.id = s.project_id
+       WHERE s.status = 'needed'
+       ORDER BY t.title ASC, s.created_at ASC`,
+    )
+    .toArray();
+}
+
+/** Find a project (top-level task) by name fragment; open projects win, then newest. */
+export function findProjectByName(sql: SqlStorage, query: string): TaskRow | null {
+  return sql
+    .exec<TaskRow>(
+      `SELECT t.* FROM tasks t
+       WHERE t.parent_id IS NULL AND LOWER(t.title) LIKE ?
+       ORDER BY (t.status IN ('done','cancelled')) ASC, t.updated_at DESC
+       LIMIT 1`,
+      `%${query.trim().toLowerCase()}%`,
+    )
+    .toArray()[0] ?? null;
 }
 
 export function dueNudgeTasks(sql: SqlStorage): { newlyOverdue: TaskRow[]; dueToday: TaskRow[] } {
@@ -707,7 +957,7 @@ function wouldCycle(sql: SqlStorage, taskId: string, dependsOnId: string): boole
 
 // ─── Re-exports for DO and fast-read path ────────────────────────────
 
-export type { TaskRow };
+export type { FileRow, SupplyRow, TaskRow };
 
 export interface TaskStats {
   total: number;

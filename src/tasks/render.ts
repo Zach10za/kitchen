@@ -6,7 +6,7 @@
  */
 
 import { EmbedColor, type Embed } from '../discord/types';
-import type { ProjectsSnapshot, TaskRow } from './loop';
+import type { FileRow, ProjectsSnapshot, SupplyRow, TaskRow } from './loop';
 
 const STATUS_ICON: Record<string, string> = {
   todo: '⬜',
@@ -93,7 +93,11 @@ export function projectsOverviewEmbed(snapshot: ProjectsSnapshot): Embed {
     const badge = PRIORITY_BADGE[t.priority ?? 'normal'] ?? '';
     const due = formatDueChip(t.due_at ?? null);
     const staleDays = Math.floor((Date.now() - p.lastActivity) / 86_400_000);
-    const lines = [progressBar(p.doneSteps, p.totalSteps) + due];
+    const chips = [
+      p.suppliesNeeded > 0 ? `🛒 ${p.suppliesNeeded} to buy` : null,
+      p.hasPlan ? '📐 plan' : null,
+    ].filter(Boolean).join(' · ');
+    const lines = [progressBar(p.doneSteps, p.totalSteps) + due + (chips ? ` · ${chips}` : '')];
     if (p.nextSteps.length > 0) {
       lines.push(...p.nextSteps.map((s) => `↳ ${taskLine(s)}`));
     } else if (p.totalSteps > 0 && p.doneSteps === p.totalSteps) {
@@ -141,6 +145,67 @@ export function projectsNudgeEmbed(newlyOverdue: TaskRow[], dueToday: TaskRow[])
     color: newlyOverdue.length > 0 ? EmbedColor.error : EmbedColor.inProgress,
     fields,
     footer: { text: 'Mark done or push the date — e.g. /projects message: done with the door seal' },
+  };
+}
+
+export function suppliesEmbed(items: Array<SupplyRow & { project_title: string }>): Embed {
+  if (items.length === 0) {
+    return {
+      title: '🛒 Supplies',
+      description: 'Nothing on the list. Mention what a project needs — "the sprinkler project needs 7 heads and 3 sticks of 1in PVC" — and it lands here.',
+      color: EmbedColor.archived,
+    };
+  }
+  // Group by project so a store run can be done per-project (or all at once).
+  const byProject = new Map<string, Array<SupplyRow & { project_title: string }>>();
+  for (const item of items) {
+    (byProject.get(item.project_title) ?? byProject.set(item.project_title, []).get(item.project_title)!).push(item);
+  }
+  const fields = [...byProject.entries()].slice(0, 25).map(([title, list]) => ({
+    name: `📁 ${title}`,
+    value: list
+      .map((s) => `• ${s.qty ? s.qty + ' ' : ''}${s.name}${s.spec ? ` — _${s.spec}_` : ''}${s.notes ? ` (${s.notes})` : ''}`)
+      .join('\n')
+      .slice(0, 1024),
+  }));
+  return {
+    title: `🛒 Supplies — ${items.length} item${items.length === 1 ? '' : 's'} to buy`,
+    color: EmbedColor.inProgress,
+    fields,
+    footer: { text: 'Say "got the PVC" (or "bought everything for the sprinklers") to check things off' },
+  };
+}
+
+export function planEmbed(project: TaskRow, files: FileRow[] = []): Embed {
+  const fileField = files.length > 0
+    ? [{
+        name: `📎 Files (${files.length})`,
+        value: files
+          .map((f) => `\`${f.id}\` ${f.filename}${f.note ? ` — _${f.note}_` : ''}`)
+          .join('\n')
+          .slice(0, 1024),
+      }]
+    : undefined;
+
+  if (!project.plan) {
+    return {
+      title: `📐 ${project.title}`,
+      description: 'No plan yet. Talk it through — "let\'s plan the sprinkler manifold" — and I\'ll keep a living plan doc here as decisions land.',
+      color: EmbedColor.archived,
+      fields: fileField,
+    };
+  }
+  const truncated = project.plan.length > 4096;
+  return {
+    title: `📐 ${project.title} — plan`,
+    description: truncated ? project.plan.slice(0, 4093) + '…' : project.plan,
+    color: EmbedColor.inProgress,
+    fields: fileField,
+    footer: {
+      text: truncated
+        ? 'Truncated — ask for a specific section in chat. Ask for any file by name.'
+        : 'A living doc — talk through changes and it stays current. Ask for any file by name.',
+    },
   };
 }
 

@@ -121,6 +121,20 @@ const COMMANDS = [
     name: 'projects-due',
     description: 'Show overdue items and anything due within the next 7 days',
   },
+  {
+    name: 'supplies',
+    description: 'Everything still to buy across all projects, grouped by project',
+    options: [
+      { name: 'message', description: 'Add items or check them off, e.g. "got the PVC" (omit to view)', type: STRING, required: false },
+    ],
+  },
+  {
+    name: 'plan',
+    description: "Show a project's living plan document",
+    options: [
+      { name: 'project', description: 'Project name (or part of it), e.g. "sprinkler"', type: STRING, required: true },
+    ],
+  },
   // ─── Workout bot ──────────────────────────────────────────────────
   // Lives in #workout. Shares the same Discord app + bot token.
   {
