@@ -6,7 +6,9 @@ DISCORD_BOT_TOKEN=
 DISCORD_APP_ID=
 DISCORD_GUILD_ID=
 DISCORD_CHANNEL_ID=
-OPENAI_API_KEY=
+OPENROUTER_API_KEY=
+# Optional: OpenRouter key legacy fallback while secrets are rotated
+# OPENAI_API_KEY=
 AI_GATEWAY_URL=
 # Optional: Tavily search key (tvly-…) powering the shared web_search tool across
 # all bots. Free tier ~1k searches/mo. If unset, bots fall back to their own knowledge.

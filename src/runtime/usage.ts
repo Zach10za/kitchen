@@ -4,12 +4,13 @@
  * kitchen and finance both behave the same way.
  *
  * Storage is *raw counts*, never derived dollar amounts. Cost is computed
- * on read via `computeCost(usage, env)` so when OpenAI changes pricing you
- * bump wrangler vars and every historical thread re-prices automatically.
+ * on read via `computeCost(usage, env)` so when a provider changes pricing
+ * you bump wrangler vars and every historical thread re-prices automatically.
  */
 
 import type { Env } from '../env';
 import type { RoundUsage } from './agent-round';
+import { extractUsage } from './agent-round';
 import { computeCost, formatUsd } from './pricing';
 
 export interface RecordUsageBody {
@@ -128,16 +129,8 @@ function zeroUsage(): RoundUsage {
 }
 
 /** Public helper for one-shot LLM calls outside the round runner —
- *  ApproveWorkflow's per-recipe materialization etc. */
+ *  ApproveWorkflow's per-recipe materialization etc. Tolerant of both
+ *  OpenAI-style and DeepSeek-style usage field shapes. */
 export function extractUsageFromResponse(response: any): RoundUsage {
-  const u = response?.usage ?? {};
-  const output = (response?.output as any[]) ?? [];
-  return {
-    input_tokens: u.input_tokens ?? 0,
-    cached_input_tokens: u.input_tokens_details?.cached_tokens ?? 0,
-    output_tokens: u.output_tokens ?? 0,
-    reasoning_tokens: u.output_tokens_details?.reasoning_tokens ?? 0,
-    web_search_calls: output.filter((o) => o.type === 'web_search_call').length,
-    code_interpreter_calls: output.filter((o) => o.type === 'code_interpreter_call').length,
-  };
+  return extractUsage(response);
 }

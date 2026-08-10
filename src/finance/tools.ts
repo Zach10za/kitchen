@@ -112,7 +112,7 @@ export const FINANCE_TOOLS = [
     type: 'function' as const,
     function: {
       name: 'get_transactions_raw',
-      description: 'Return raw transaction rows as a JSON array — feed these into code_interpreter when you need cadence detection, paired-flow matching (e.g. transfer detection), forecasting, clustering, or any analysis the SQL tools don\'t already provide. Returns the same fields as the database: id, account_id, posted (unix sec), amount (signed: negative=outflow), description, payee, normalized_payee, memo, pending. Default window 90d, max 5000 rows.',
+      description: 'Return raw transaction rows as a JSON array — raw row-level access for narrow windows you must inspect directly (smallest 100 charges, transfer pairing). No code execution exists, so for any aggregation prefer the SQL tools (top_merchants, period_total, merchant_history, compare_periods, unusual_transactions). Returns the same fields as the database: id, account_id, posted (unix sec), amount (signed: negative=outflow), description, payee, normalized_payee, memo, pending. Default window 90d, max 5000 rows.',
       parameters: {
         type: 'object',
         properties: {
@@ -212,9 +212,6 @@ export const FINANCE_TOOLS = [
   },
   // Shared Tavily-backed search (executed centrally in AgentDOBase).
   WEB_SEARCH_TOOL,
-  // OpenAI server-side built-in: executes on OpenAI's side, output echoed
-  // forward, no executor here. (web_search is now Tavily; code_interpreter stays.)
-  { type: 'code_interpreter' as const, container: { type: 'auto' as const } },
 ] as const;
 
 export interface AccountRow {

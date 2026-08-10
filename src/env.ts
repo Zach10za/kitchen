@@ -11,11 +11,12 @@ export interface Env {
   AGENT_CHAT_WORKFLOW: Workflow;
 
   // Vars
-  OPENAI_MODEL: string;
-  /** Cheap, fast model for one-shot title generation (error triage). */
-  OPENAI_MODEL_FAST: string;
+  /** Main agent model for every bot's tool-call loop. */
+  AGENT_MODEL: string;
+  /** Cheap, fast model for one-shot title generation (thread + error triage). */
+  FAST_MODEL: string;
   /** Cheap, fast model for pure structured extraction (pantry parse, recipe materialize). */
-  OPENAI_MODEL_EXTRACT: string;
+  EXTRACT_MODEL: string;
   /** Local hour (0-23) the daily dinner-suggestion ping fires. Defaults to 12 (noon). */
   SUGGEST_HOUR_LOCAL: string;
   /** Local dinner hour (0-23) defrost reminders are anchored to. Defaults to 18. */
@@ -30,7 +31,7 @@ export interface Env {
   GITHUB_REPO: string;
   /** Per-channel relay rate limit: max forwarded messages per hour (defaults to 30 if unset). */
   RELAY_RATE_LIMIT_PER_HOUR?: string;
-  /** OpenAI pricing in USD per million tokens / per call. Update when OpenAI
+  /** Model pricing in USD per million tokens / per call. Update when provider
    *  changes prices — no code deploy needed. Strings so wrangler vars work. */
   PRICE_INPUT_PER_M?: string;
   PRICE_CACHED_INPUT_PER_M?: string;
@@ -50,7 +51,13 @@ export interface Env {
   DISCORD_TASKS_CHANNEL_ID: string;
   /** Channel ID where the WorkoutDO posts. Required for the workout bot. */
   DISCORD_WORKOUT_CHANNEL_ID: string;
-  OPENAI_API_KEY: string;
+  OPENROUTER_API_KEY: string;
+  /** Legacy fallback while keys are rotated; retire once OPENROUTER_API_KEY
+   *  is set everywhere (makeLLMClient prefers OPENROUTER_API_KEY). */
+  OPENAI_API_KEY?: string;
+  /** AI Gateway endpoint, e.g. https://gateway.ai.cloudflare.com/v1/<acct>/kitchen/openrouter.
+   *  The final path segment selects the provider — must be `openrouter` for
+   *  OpenRouter routing. Optional; falls back to OpenRouter directly. */
   AI_GATEWAY_URL: string;
   RELAY_SECRET: string;
   ADMIN_TOKEN: string;

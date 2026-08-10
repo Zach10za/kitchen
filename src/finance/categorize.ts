@@ -13,7 +13,7 @@
  */
 
 import type { Env } from '../env';
-import { makeOpenAIClient } from '../runtime/openai';
+import { makeLLMClient, structuredExtract } from '../runtime/llm';
 
 /** Spend/income categories (no Transfer) — used by the Spend-by-Category tab. */
 export const CATEGORY_TAXONOMY = [
@@ -59,28 +59,23 @@ export async function classifyMerchants(env: Env, names: readonly string[]): Pro
   const unique = [...new Set(names.map((n) => n.trim()).filter(Boolean))];
   if (unique.length === 0) return out;
 
-  const client = makeOpenAIClient(env, { timeoutMs: 60_000 });
+  const client = makeLLMClient(env, { timeoutMs: 60_000 });
   const valid = new Set<string>(CLASSIFY_TAXONOMY);
 
   for (let i = 0; i < unique.length; i += CHUNK) {
     const chunk = unique.slice(i, i + CHUNK);
     const byLower = new Map(chunk.map((n) => [n.toLowerCase(), n]));
     try {
-      const resp = await client.responses.create({
-        model: env.OPENAI_MODEL_EXTRACT,
-        input: [
-          {
-            role: 'system',
-            content:
-              `You categorize a merchant name into exactly one category from this set: ${CLASSIFY_TAXONOMY.join(', ')}. ` +
-              `Use "Income" for paychecks, payroll, interest, dividends. Use "Transfer" for movements between someone's own accounts (transfers, credit-card payments). ` +
-              `Use "Other" only when genuinely unclear. Return one entry per input merchant, echoing the merchant string exactly.`,
-          },
-          { role: 'user', content: JSON.stringify(chunk) },
-        ],
-        text: { format: { type: 'json_schema', name: 'merchant_categories', schema: SCHEMA, strict: true } },
+      const result = await structuredExtract(client, env.EXTRACT_MODEL, {
+        name: 'merchant_categories',
+        schema: SCHEMA as Record<string, any>,
+        system:
+          `You categorize a merchant name into exactly one category from this set: ${CLASSIFY_TAXONOMY.join(', ')}. ` +
+          `Use "Income" for paychecks, payroll, interest, dividends. Use "Transfer" for movements between someone's own accounts (transfers, credit-card payments). ` +
+          `Use "Other" only when genuinely unclear. Return one entry per input merchant, echoing the merchant string exactly.`,
+        user: JSON.stringify(chunk),
       });
-      const items = (JSON.parse(resp.output_text || '{"items":[]}') as { items: { merchant: string; category: string }[] }).items ?? [];
+      const items = (JSON.parse(result.output || '{"items":[]}') as { items: { merchant: string; category: string }[] }).items ?? [];
       for (const it of items) {
         const name = byLower.get((it.merchant ?? '').trim().toLowerCase());
         const category = (it.category ?? '').trim();

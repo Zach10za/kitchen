@@ -1,19 +1,25 @@
 /**
- * One round of an OpenAI Responses-API tool-call loop, parameterized so
- * multiple bots in this repo (kitchen, finance, …) can share it.
+ * One round of a Chat-Completions tool-call loop, parameterized so multiple
+ * bots in this repo (kitchen, finance, …) can share it.
  *
- * The loop mechanics — send a request, decide final-vs-continue, append
- * function_call + function_call_output items to the running input array —
- * are bot-agnostic. Each bot supplies its own tools, executor, and (optional)
- * default-arg backfill.
+ * Transport is the OpenAI Chat Completions wire format against any
+ * provider that speaks it (OpenRouter today). The loop mechanics — send a
+ * request, decide final-vs-continue, append assistant tool_calls + role:
+ * tool outputs to the running messages array — are bot-agnostic. Each bot
+ * supplies its own tools, executor, and (optional) default-arg backfill.
+ *
+ * Reasoning-model notes (DeepSeek): reasoning content may arrive in
+ * `message.reasoning_content` (native) or `message.reasoning` (OpenRouter).
+ * When a reasoning turn is echoed back, providers reject it without the
+ * original reasoning field (DeepSeek: "reasoning_content must be included"),
+ * so `echoAssistantMessage` preserves whichever field the model emitted.
  */
 
 import type OpenAI from 'openai';
 
 export const MAX_TOOL_ROUNDS = 10;
 
-/** OpenAI Chat-Completions-style function tool. The runtime converts these
- *  into Responses-API form on the wire. */
+/** OpenAI Chat-Completions-style function tool. Passed through unchanged. */
 export interface FunctionToolDef {
   type: 'function';
   function: {
@@ -23,20 +29,11 @@ export interface FunctionToolDef {
   };
 }
 
-/** OpenAI server-side built-in tools — executed by OpenAI, not by us.
- *  Their output items appear in `response.output` alongside function calls
- *  and we echo them forward like everything else. We never call
- *  `executeTool` for them; the model gets results inline. (web_search is now
- *  a Tavily-backed function tool — see runtime/tavily.ts — so only
- *  code_interpreter remains hosted, used by the finance bot.) */
-export type BuiltinToolDef =
-  | { type: 'code_interpreter'; container: { type: 'auto' } | { type: 'static'; file_ids?: string[] } };
+export type ToolDef = FunctionToolDef;
 
-export type ToolDef = FunctionToolDef | BuiltinToolDef;
-
-/** Token + built-in-tool usage from one Responses API call. The model's
- *  `output_tokens` already includes reasoning; cached tokens are a subset of
- *  input. Built-in tool counts come from the output items, not response.usage. */
+/** Token usage from one Chat Completions call. Cached tokens are a subset of
+ *  input. Providers differ in where they report these (OpenAI-style nests
+ *  them in `*_details`, DeepSeek uses flat fields) — read both. */
 export interface RoundUsage {
   input_tokens: number;
   cached_input_tokens: number;
@@ -49,7 +46,7 @@ export interface RoundUsage {
 export interface RoundResult {
   type: 'final' | 'continue';
   finalText?: string;
-  /** Complete input array for the next round (or to persist). */
+  /** Complete messages array for the next round (or to persist). */
   newMessages: any[];
   /** Usage from this single round. Callers should accumulate across rounds. */
   usage: RoundUsage;
@@ -95,49 +92,48 @@ export interface RunRoundArgs {
   fillDefaultArgs?: (toolName: string, parsed: any) => any;
 }
 
-/**
- * Convert ToolDef into Responses API format.
- * Function tools get reshaped (Chat → Responses); built-ins pass through
- * unchanged because the API expects them in their declared form.
- */
-export function toResponsesTools(tools: readonly ToolDef[]): any[] {
-  return tools.map((t) => {
-    if (t.type === 'function') {
-      return {
-        type: 'function' as const,
-        name: t.function.name,
-        description: t.function.description,
-        parameters: t.function.parameters,
-        strict: false,
-      };
-    }
-    return t;
-  });
+/** Rebuild an assistant message for the next request. Whitelists fields so
+ *  provider-specific noise (refusal, annotations, …) can't 400 the next call,
+ *  but preserves the reasoning field for DeepSeek-style models that require
+ *  it back on continuation. */
+function echoAssistantMessage(message: any): any {
+  const echo: any = {
+    role: 'assistant',
+    content: message.content ?? null,
+  };
+  if (message.tool_calls?.length) echo.tool_calls = message.tool_calls;
+  if (typeof message.reasoning_content === 'string') echo.reasoning_content = message.reasoning_content;
+  else if (typeof message.reasoning === 'string') echo.reasoning = message.reasoning;
+  return echo;
 }
 
 export async function runAgentRound(args: RunRoundArgs): Promise<RoundResult> {
-  const response = await args.client.responses.create({
+  const response = await args.client.chat.completions.create({
     model: args.model,
-    input: args.messages,
-    tools: toResponsesTools(args.tools),
+    messages: args.messages,
+    tools: args.tools as any,
   });
 
   let usage = extractUsage(response);
-  const toolCalls = (response.output as any[]).filter((o) => o.type === 'function_call');
+  const message = response.choices[0]?.message;
 
-  if (toolCalls.length === 0) {
+  // Narrow the SDK's tool_calls union (function | custom) to function calls —
+  // this loop only declares function tools.
+  const toolCalls = (message?.tool_calls ?? []) as Array<{
+    id: string;
+    function: { name: string; arguments: string };
+  }>;
+
+  if (!message || toolCalls.length === 0) {
     return {
       type: 'final',
-      finalText: stripCitationMarkers(response.output_text) || '(no text)',
-      newMessages: [...args.messages, ...(response.output as any[])],
+      finalText: stripCitationMarkers(message?.content) || '(no text)',
+      newMessages: [...args.messages, echoAssistantMessage(message ?? { content: null })],
       usage,
     };
   }
 
-  // Echo every output item back in original order. Reasoning items (rs_...)
-  // must accompany their paired function_call items or the next request 400s
-  // with "function_call ... was provided without its required 'reasoning' item".
-  const newMessages: any[] = [...args.messages, ...(response.output as any[])];
+  const newMessages: any[] = [...args.messages, echoAssistantMessage(message)];
 
   for (const toolCall of toolCalls) {
     // Malformed JSON from the model used to throw and crash the whole round —
@@ -146,21 +142,21 @@ export async function runAgentRound(args: RunRoundArgs): Promise<RoundResult> {
     // tool output, and let the model self-correct on the next turn.
     let parsed: any;
     try {
-      parsed = JSON.parse(toolCall.arguments);
+      parsed = JSON.parse(toolCall.function.arguments);
     } catch (err) {
       const output = `Error: arguments were not valid JSON: ${(err as Error).message}. Re-issue the tool call with corrected JSON.`;
       newMessages.push({
-        type: 'function_call_output',
-        call_id: toolCall.call_id,
-        output,
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: output,
       });
       if (args.onToolCall) {
-        await args.onToolCall({ name: toolCall.name, args: {}, output });
+        await args.onToolCall({ name: toolCall.function.name, args: {}, output });
       }
       continue;
     }
-    if (args.fillDefaultArgs) parsed = args.fillDefaultArgs(toolCall.name, parsed);
-    const result = await args.executeTool(toolCall.name, parsed);
+    if (args.fillDefaultArgs) parsed = args.fillDefaultArgs(toolCall.function.name, parsed);
+    const result = await args.executeTool(toolCall.function.name, parsed);
     const output = typeof result === 'string' ? result : result.output;
     if (typeof result !== 'string' && result.usage) {
       // Tool made its own LLM calls (e.g. kitchen's generate_draft) — fold
@@ -169,12 +165,12 @@ export async function runAgentRound(args: RunRoundArgs): Promise<RoundResult> {
       usage = addUsage(usage, result.usage);
     }
     newMessages.push({
-      type: 'function_call_output',
-      call_id: toolCall.call_id,
-      output,
+      role: 'tool',
+      tool_call_id: toolCall.id,
+      content: output,
     });
     if (args.onToolCall) {
-      await args.onToolCall({ name: toolCall.name, args: parsed, output });
+      await args.onToolCall({ name: toolCall.function.name, args: parsed, output });
     }
   }
 
@@ -182,12 +178,14 @@ export async function runAgentRound(args: RunRoundArgs): Promise<RoundResult> {
 }
 
 /**
- * OpenAI's web_search embeds inline citation markers in output_text, delimited
- * by private-use-area unicode chars (U+E200 start … U+E201 end) that wrap
- * tokens like "cite…turn0search0". Discord can't render the delimiters, so they
- * surface as garbage boxes plus literal "citeturn0search0" text. Strip the
- * whole block. Marker chars are built via fromCharCode so no unprintable
- * private-use bytes live in this source file.
+ * OpenAI's hosted web_search used to embed inline citation markers in output
+ * text, delimited by private-use-area unicode chars (U+E200 start … U+E201
+ * end) that wrap tokens like "cite…turn0search0". Discord can't render the
+ * delimiters, so they surfaced as garbage boxes plus literal
+ * "citeturn0search0" text. Stripped for compat — web_search is now Tavily
+ * (plain text), but other providers may still emit markers. Marker chars are
+ * built via fromCharCode so no unprintable private-use bytes live in this
+ * source file.
  */
 const CITE_START = String.fromCharCode(0xe200);
 const CITE_END = String.fromCharCode(0xe201);
@@ -208,15 +206,17 @@ export function stripCitationMarkers(text: string | undefined | null): string {
     .trim();
 }
 
-function extractUsage(response: any): RoundUsage {
+/** Tolerant usage extraction across provider shapes (OpenAI-style *_details
+ *  nesting and DeepSeek's flat prompt_cache_hit_tokens / reasoning_tokens). */
+export function extractUsage(response: any): RoundUsage {
   const u = response?.usage ?? {};
-  const output = (response?.output as any[]) ?? [];
   return {
-    input_tokens: u.input_tokens ?? 0,
-    cached_input_tokens: u.input_tokens_details?.cached_tokens ?? 0,
-    output_tokens: u.output_tokens ?? 0,
-    reasoning_tokens: u.output_tokens_details?.reasoning_tokens ?? 0,
-    web_search_calls: output.filter((o) => o.type === 'web_search_call').length,
-    code_interpreter_calls: output.filter((o) => o.type === 'code_interpreter_call').length,
+    input_tokens: u.prompt_tokens ?? 0,
+    cached_input_tokens: u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? 0,
+    output_tokens: u.completion_tokens ?? 0,
+    reasoning_tokens: u.completion_tokens_details?.reasoning_tokens ?? u.reasoning_tokens ?? 0,
+    // OpenAI-hosted built-ins don't exist on OpenRouter/DeepSeek — always 0.
+    web_search_calls: 0,
+    code_interpreter_calls: 0,
   };
 }

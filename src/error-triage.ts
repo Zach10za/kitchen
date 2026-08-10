@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import { makeLLMClient } from './runtime/llm';
 import type { Env } from './env';
 
 /**
@@ -94,23 +94,18 @@ async function triageTitle(env: Env, error: NormalizedError, ctx: CaptureContext
   // One small LLM call to convert a raw message + stack into a clearer
   // one-liner. Falls back to the raw error message if anything goes wrong —
   // a worse title is much better than failing to file the issue.
-  if (!env.OPENAI_API_KEY) return defaultTitle(error, ctx);
+  if (!env.OPENROUTER_API_KEY && !env.OPENAI_API_KEY) return defaultTitle(error, ctx);
 
   try {
     // maxRetries: 0 is intentional. captureError runs from the top-level fetch
     // catch and from the DO's interaction handler — anything that retries here
     // will compound under load and re-fail in the same way it just failed.
     // A worse title is fine; a flapping triage path is not.
-    const client = new OpenAI({
-      apiKey: env.OPENAI_API_KEY,
-      baseURL: env.AI_GATEWAY_URL || undefined,
-      timeout: 15_000,
-      maxRetries: 0,
-    });
+    const client = makeLLMClient(env, { timeoutMs: 15_000, maxRetries: 0 });
     const top = error.stack.split('\n').slice(0, 8).join('\n');
-    const response = await client.responses.create({
-      model: env.OPENAI_MODEL_FAST,
-      input: [
+    const response = await client.chat.completions.create({
+      model: env.FAST_MODEL,
+      messages: [
         {
           role: 'system',
           content:
@@ -123,7 +118,7 @@ async function triageTitle(env: Env, error: NormalizedError, ctx: CaptureContext
         },
       ],
     });
-    const title = response.output_text?.trim().replace(/^["']|["']$/g, '');
+    const title = response.choices[0]?.message.content?.trim().replace(/^["']|["']$/g, '');
     return title && title.length > 0 ? title.slice(0, 240) : defaultTitle(error, ctx);
   } catch {
     return defaultTitle(error, ctx);

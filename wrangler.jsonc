@@ -105,13 +105,15 @@
 
   // Public env (non-secret). Secrets go via `wrangler secret put`.
   "vars": {
-    // Planner / steering model — strongest reasoning we use.
-    "OPENAI_MODEL": "gpt-5.4",
+    // Dispatcher model — strongest reasoning we use. DeepSeek V4 Pro
+    // (OpenRouter id) for the agent loop: reliable function calling on the
+    // native Chat-Completions API.
+    "AGENT_MODEL": "deepseek/deepseek-v4-pro",
     // Pure structured-output extraction (pantry parse, recipe materialize).
-    // Cheap + fast; no creativity needed.
-    "OPENAI_MODEL_EXTRACT": "gpt-5.4-nano",
+    // Cheap + fast; no creativity needed. V4 Flash 0731 is the current flash.
+    "EXTRACT_MODEL": "deepseek/deepseek-v4-flash-0731",
     // Cheap, fast model for one-shot title generation in error triage.
-    "OPENAI_MODEL_FAST": "gpt-5.4-nano",
+    "FAST_MODEL": "deepseek/deepseek-v4-flash-0731",
     // Local hour the daily dinner-suggestion ping fires (24h). Noon by default.
     "SUGGEST_HOUR_LOCAL": "12",
     // Local dinner hour defrost reminders are anchored to.
@@ -126,13 +128,15 @@
     "GITHUB_REPO": "Zach10za/kitchen",
     // Per-channel /relay/message rate limit, in messages per rolling hour.
     "RELAY_RATE_LIMIT_PER_HOUR": "30",
-    // OpenAI pricing — update when OpenAI changes prices, no code deploy needed.
-    // Defaults reflect gpt-5.4 per OpenAI's published pricing as of 2026-06;
-    // cached input is 90% off standard. Built-in tool prices are flat per-call.
-    // Override per-environment if you switch to a different model tier.
-    "PRICE_INPUT_PER_M": "2.50",
-    "PRICE_CACHED_INPUT_PER_M": "0.25",
-    "PRICE_OUTPUT_PER_M": "15.00",
+    // Model pricing — update when pricing changes, no code deploy needed.
+    // Defaults reflect DeepSeek V4 Pro on OpenRouter as of 2026-08 ($/1M
+    // tokens): input 0.435, cached-input-read 0.003625, output 0.87. V4 Flash
+    // (extract/fast tiers) is cheaper ($0.08/$0.18) — the footer prices the
+    // whole thread at the agent model's rate, which overstates flash-tier
+    // turns slightly. Override per-environment if you switch models.
+    "PRICE_INPUT_PER_M": "0.435",
+    "PRICE_CACHED_INPUT_PER_M": "0.003625",
+    "PRICE_OUTPUT_PER_M": "0.87",
     "PRICE_WEB_SEARCH_PER_CALL": "0.025",
     "PRICE_CODE_INTERPRETER_PER_CALL": "0.03",
   },
@@ -146,8 +150,9 @@
   //   DISCORD_FINANCE_CHANNEL_ID — channel the finance bot posts to
   //   DISCORD_TASKS_CHANNEL_ID   — channel the tasks bot posts to
   //   DISCORD_WORKOUT_CHANNEL_ID — channel the workout bot posts to
-  //   OPENAI_API_KEY             — your OpenAI key
-  //   AI_GATEWAY_URL             — e.g. https://gateway.ai.cloudflare.com/v1/<acct>/kitchen/openai
+  //   OPENROUTER_API_KEY          — your OpenRouter key (sk-or-…)
+  //   AI_GATEWAY_URL              — e.g. https://gateway.ai.cloudflare.com/v1/<acct>/kitchen/openrouter
+  //                                (path must end in /openrouter for OpenRouter routing)
   //   RELAY_SECRET               — shared secret with the Fly.io gateway-relay
   //   ADMIN_TOKEN                — bearer token for /admin/* endpoints
   //   GITHUB_TOKEN               — fine-grained PAT with Issues:write on this repo

@@ -449,11 +449,11 @@ function toolUnusualTransactions(
 }
 
 /**
- * Return raw transaction rows as a JSON string. Designed to feed into
- * code_interpreter — the model picks columns and runs whatever Python it
- * needs (cadence detection, paired-flow matching, clustering, forecasts).
+ * Return raw transaction rows as a JSON string — used to be a feed for
+ * OpenAI's hosted code_interpreter (removed in the OpenRouter switch), now
+ * just raw row access for narrow windows the model inspects directly.
  *
- * Output is a JSON object so code_interpreter can consume it directly:
+ * Output is a JSON object:
  *   { count, transactions: [{id, account_id, posted, amount, ...}] }
  */
 function toolGetTransactionsRaw(

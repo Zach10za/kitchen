@@ -9,7 +9,7 @@ import {
   type RoundResult,
   type RoundUsage,
 } from '../runtime/agent-round';
-import { makeOpenAIClient } from '../runtime/openai';
+import { makeLLMClient } from '../runtime/llm';
 import { computeCost, formatUsd } from '../runtime/pricing';
 import { withTypingRefresh } from '../runtime/typing';
 import type { AgentChatParams, ConversationScope } from '../runtime/bot-spec';
@@ -24,10 +24,10 @@ import { captureError } from '../error-triage';
  *   1. initial-typing       — instant feedback while load-context runs
  *   2. load-context         — system prompt + recent history from the DO
  *   3. save-user-turn       — persist the user message
- *   4. round-{N}            — one OpenAI call + tool execution, up to
+ *   4. round-{N}            — one model call + tool execution, up to
  *                             MAX_TOOL_ROUNDS. Each round is its own step with
  *                             retries:0 — tool side effects make round-level
- *                             retries unsafe; the OpenAI client retries
+ *                             retries unsafe; the LLM client retries
  *                             network errors internally.
  *   5. record-usage         — best-effort; failure never blocks delivery
  *   6. post-final           — post into the Discord thread
@@ -127,7 +127,7 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
           method: 'POST',
           body: JSON.stringify({
             thread_id: replyChannelId,
-            model: this.env.OPENAI_MODEL,
+            model: this.env.AGENT_MODEL,
             ...turnUsage,
           }),
         });
@@ -175,8 +175,8 @@ export class AgentChatWorkflow extends WorkflowEntrypoint<Env, AgentChatParams> 
     const spec = getBotSpec(botId);
     const stub = getStubFor(this.env, botId);
     return runAgentRound({
-      client: makeOpenAIClient(this.env),
-      model: this.env.OPENAI_MODEL,
+      client: makeLLMClient(this.env),
+      model: this.env.AGENT_MODEL,
       tools: spec.tools,
       messages,
       fillDefaultArgs: spec.fillDefaultArgs

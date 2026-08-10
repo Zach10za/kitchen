@@ -9,7 +9,7 @@ Ask "what should I cook today?" and the bot suggests 2–3 dishes drawn from wha
 - **Cloudflare Worker** — Discord interaction webhook + cron heartbeat + admin endpoints
 - **Durable Object (`KitchenDO`)** — household state in SQLite, daily suggestion alarm, due-reminder dispatch, relay rate limiting
 - **Cloudflare Workflow (`AgentChatWorkflow`)** — runs the multi-step LLM tool-loop past the Worker CPU budget with per-step retries; one class serves every bot
-- **OpenAI via Cloudflare AI Gateway** — three model tiers (planner / extract / fast) routed through one gateway for caching + observability
+- **OpenRouter (DeepSeek)** — three model tiers (agent / extract / fast) over the OpenAI-compatible Chat Completions API, routed through Cloudflare AI Gateway for caching + observability
 - **Fly.io gateway relay** (`gateway-relay/`) — tiny always-on VM holding the Discord Gateway WebSocket, so plain chat messages (no slash command) reach the Worker via signed HTTPS
 - **Auto error triage** — exceptions are fingerprinted, deduped, and filed as labeled GitHub issues; no hosted tracker
 
@@ -31,7 +31,7 @@ bun install
 In the Cloudflare dashboard:
 - AI > AI Gateway > Create Gateway
 - Name: `kitchen`
-- Copy the OpenAI endpoint URL (looks like `https://gateway.ai.cloudflare.com/v1/<account>/kitchen/openai`) — this becomes `AI_GATEWAY_URL`
+- Copy the OpenRouter endpoint URL (looks like `https://gateway.ai.cloudflare.com/v1/<account>/kitchen/openrouter`) — this becomes `AI_GATEWAY_URL`. The final path segment must be `openrouter`; without a gateway the worker calls https://openrouter.ai/api/v1 directly.
 
 ### 3. Create a Discord application + bot
 
@@ -296,10 +296,10 @@ src/
   workflows/
     agent-chat.ts          AgentChatWorkflow: one chat tool-loop serving every bot, parameterized by botId
   runtime/
-    agent-round.ts         Shared OpenAI Responses-API tool-call loop
+    agent-round.ts         Shared Chat-Completions tool-call loop (provider-agnostic)
     bot-registry.ts        Channel-to-bot routing (kitchen / finance / tasks / workout)
     migrations.ts          SQLite schema migration runner
-    openai.ts              OpenAI client factory
+    llm.ts                 LLM client factory (OpenRouter) + structured-extraction helper
     tavily.ts              Tavily search client + shared web_search tool (all bots; source-stripped)
     pricing.ts             Token cost calculator
     relay-rate-limit.ts    Per-channel rolling-window rate limit

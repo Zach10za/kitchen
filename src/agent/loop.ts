@@ -11,8 +11,8 @@ import { EmbedColor } from '../discord/types';
 import { loadDayDecision, loadGrocery, loadPantry, loadProfile, loadRecentMeals, parseExtras } from './context';
 import type { RoundUsage, ToolResult } from '../runtime/agent-round';
 import type { DiscordAPI } from '../discord/api';
-import { makeOpenAIClient } from '../runtime/openai';
-import { extractUsageFromResponse, recordUsage, costFooter } from '../runtime/usage';
+import { makeLLMClient, structuredExtract } from '../runtime/llm';
+import { recordUsage, costFooter } from '../runtime/usage';
 import { todayISO, localDateAtHour } from '../util/datetime';
 
 export interface ToolCtx { env: Env; sql: SqlStorage; client: OpenAI }
@@ -547,22 +547,15 @@ export async function decrementPantryForMeal(
   // Unit-mismatch reconciliation: a best estimate beats a silently wrong
   // inventory. Failure here is non-fatal — skip, like the old behavior.
   try {
-    const response = await ctx.client.responses.create({
-      model: ctx.env.OPENAI_MODEL_EXTRACT,
-      input: [
-        {
-          role: 'system',
-          content:
-            'You reconcile a kitchen pantry after cooking. For each pantry item you get what is on hand (value + unit) and what the recipe used (free text in possibly different units). Estimate the remaining quantity IN THE PANTRY\'S OWN UNIT using sensible cooking conversions (a chicken breast ≈ 0.5 lb, a medium onion ≈ 1 count ≈ 0.5 lb, 1 cup rice ≈ 0.4 lb, etc.). If the item is essentially used up (≤5% left), return null.',
-        },
-        { role: 'user', content: JSON.stringify(mismatched) },
-      ],
-      text: {
-        format: { type: 'json_schema', name: 'pantry_decrement', schema: DECREMENT_SCHEMA, strict: true },
-      },
+    const result = await structuredExtract(ctx.client, ctx.env.EXTRACT_MODEL, {
+      name: 'pantry_decrement',
+      schema: DECREMENT_SCHEMA,
+      system:
+        'You reconcile a kitchen pantry after cooking. For each pantry item you get what is on hand (value + unit) and what the recipe used (free text in possibly different units). Estimate the remaining quantity IN THE PANTRY\'S OWN UNIT using sensible cooking conversions (a chicken breast ≈ 0.5 lb, a medium onion ≈ 1 count ≈ 0.5 lb, 1 cup rice ≈ 0.4 lb, etc.). If the item is essentially used up (≤5% left), return null.',
+      user: JSON.stringify(mismatched),
     });
-    const usage = extractUsageFromResponse(response);
-    const parsed = JSON.parse(response.output_text || '{}') as {
+    const usage = result.usage;
+    const parsed = JSON.parse(result.output || '{}') as {
       updates?: Array<{ name: string; remaining_value: number | null }>;
     };
     for (const update of parsed.updates ?? []) {
@@ -657,30 +650,19 @@ export async function runPantryFlow(args: {
   userMessage: string;
 }): Promise<void> {
   const { env, sql, discord, replyChannelId, userMessage } = args;
-  const client = makeOpenAIClient(env);
+  const client = makeLLMClient(env);
 
   // Use the configured extract model — pure structured-output, no creativity needed.
-  const response = await client.responses.create({
-    model: env.OPENAI_MODEL_EXTRACT,
-    input: [
-      {
-        role: 'system',
-        content: 'You parse natural-language inventory updates into structured items. Default location is shelf unless the user mentions freezer/fridge or the item is obviously a frozen/refrigerated good. Default action is add unless the user says they used/finished/ran out (then remove). Use lowercase singular names. If quantity is unspecified, set qty_value and qty_unit to null. For "2 chicken thighs" use qty_value=2, qty_unit=count. For "1.5 lb ground beef" use qty_value=1.5, qty_unit=lb.',
-      },
-      { role: 'user', content: userMessage },
-    ],
-    text: {
-      format: {
-        type: 'json_schema',
-        name: 'pantry_update',
-        schema: PANTRY_PARSE_SCHEMA,
-        strict: true,
-      },
-    },
+  const result = await structuredExtract(client, env.EXTRACT_MODEL, {
+    name: 'pantry_update',
+    schema: PANTRY_PARSE_SCHEMA,
+    system:
+      'You parse natural-language inventory updates into structured items. Default location is shelf unless the user mentions freezer/fridge or the item is obviously a frozen/refrigerated good. Default action is add unless the user says they used/finished/ran out (then remove). Use lowercase singular names. If quantity is unspecified, set qty_value and qty_unit to null. For "2 chicken thighs" use qty_value=2, qty_unit=count. For "1.5 lb ground beef" use qty_value=1.5, qty_unit=lb.',
+    user: userMessage,
   });
 
-  const turnUsage = extractUsageFromResponse(response);
-  const content = response.output_text;
+  const turnUsage = result.usage;
+  const content = result.output;
   if (!content) {
     await discord.postMessage(replyChannelId, {
       embeds: [{
@@ -742,7 +724,7 @@ export async function runPantryFlow(args: {
   const description = fields.length === 0 ? 'No items parsed from that input.' : undefined;
   const threadTotal = recordUsage(sql, {
     thread_id: replyChannelId,
-    model: env.OPENAI_MODEL_EXTRACT,
+    model: env.EXTRACT_MODEL,
     ...turnUsage,
   });
   await discord.postMessage(replyChannelId, {

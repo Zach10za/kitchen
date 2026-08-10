@@ -16,8 +16,8 @@
  * timeout and a verbatim fallback so we never block on the LLM.
  */
 
-import OpenAI from 'openai';
 import type { Env } from '../env';
+import { makeLLMClient } from '../runtime/llm';
 import { DiscordAPI } from './api';
 
 const TITLE_FALLBACK = 'Kitchen reply';
@@ -26,7 +26,7 @@ const TITLE_MAX = 90;
 /**
  * Produce a short, human-readable thread title. Short user messages skip the
  * LLM entirely (verbatim). Anything longer or multi-line gets a one-shot
- * summarization through env.OPENAI_MODEL_FAST.
+ * summarization through env.FAST_MODEL.
  */
 export async function generateThreadTitle(env: Env, message: string): Promise<string> {
   const trimmed = message.trim();
@@ -38,15 +38,10 @@ export async function generateThreadTitle(env: Env, message: string): Promise<st
   }
 
   try {
-    const client = new OpenAI({
-      apiKey: env.OPENAI_API_KEY,
-      baseURL: env.AI_GATEWAY_URL || undefined,
-      timeout: 8_000,
-      maxRetries: 0,
-    });
-    const res = await client.responses.create({
-      model: env.OPENAI_MODEL_FAST,
-      input: [
+    const client = makeLLMClient(env, { timeoutMs: 8_000, maxRetries: 0 });
+    const res = await client.chat.completions.create({
+      model: env.FAST_MODEL,
+      messages: [
         {
           role: 'system',
           content:
@@ -55,7 +50,7 @@ export async function generateThreadTitle(env: Env, message: string): Promise<st
         { role: 'user', content: trimmed.slice(0, 1000) },
       ],
     });
-    const cleaned = (res.output_text ?? '')
+    const cleaned = (res.choices[0]?.message.content ?? '')
       .trim()
       .replace(/^["'`]+|["'`.]+$/g, '')
       .replace(/[\r\n]+/g, ' ')

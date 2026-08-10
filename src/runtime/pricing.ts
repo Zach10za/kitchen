@@ -1,10 +1,10 @@
 /**
  * Compute USD cost from accumulated usage. Prices are configurable via
  * wrangler vars (PRICE_INPUT_PER_M, PRICE_OUTPUT_PER_M, etc.) so they can
- * be updated when OpenAI changes its pricing without a code deploy.
+ * be updated when the provider changes its pricing without a code deploy.
  *
- * `output_tokens` from the Responses API already includes reasoning, so
- * don't double-count reasoning_tokens here.
+ * `output_tokens` from the provider already includes reasoning, so don't
+ * double-count reasoning_tokens here.
  *
  * Cached input tokens get the cached price; the rest of input gets the
  * normal price. cached_input_tokens is a subset of input_tokens.

@@ -45,7 +45,7 @@ import {
   countTurnsByThread,
   type RecordUsageBody,
 } from './usage';
-import { makeOpenAIClient } from './openai';
+import { makeLLMClient } from './llm';
 import { tavilySearch } from './tavily';
 import type { RoundUsage } from './agent-round';
 import type { BotSpec, ConversationScope, ToolExecCtx } from './bot-spec';
@@ -253,7 +253,7 @@ export abstract class AgentDOBase<E extends Env> extends DurableObject<E> {
         return Response.json({ error: 'exec-tool: missing/invalid scope' }, { status: 400 });
       }
       const toolName = body.name;
-      const client = makeOpenAIClient(this.env, { timeoutMs: TOOL_TIMEOUT_MS });
+      const client = makeLLMClient(this.env, { timeoutMs: TOOL_TIMEOUT_MS });
       const toolCtx: ToolExecCtx = {
         env: this.env,
         sql: this.sql,
